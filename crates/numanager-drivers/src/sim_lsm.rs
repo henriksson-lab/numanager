@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use numanager_core::*;
 
 use crate::sim_lsm_model::{
-    render_confocal_raster_for_detectors, render_line_profiles, LsmFluorescenceConfig,
+    render_confocal_raster_for_detectors, render_scan_row_profiles, LsmFluorescenceConfig,
     LsmRasterSpec,
 };
 use crate::sim_sample::SimSampleConfig;
@@ -228,13 +228,15 @@ impl SimLsmDriver {
         let mut first_sample = 0u32;
         let mut chunk_index = 0u32;
         let mut last_chunk_samples = 0u32;
+        let frame_index = self.frames.fetch_add(1, Ordering::Relaxed);
         for line in 0..lines {
-            let profiles = render_line_profiles(
+            let profiles = render_scan_row_profiles(
                 &self.model,
                 scan.spec(),
                 &request.channels,
                 samples,
-                self.frames.fetch_add(1, Ordering::Relaxed),
+                line,
+                frame_index,
             );
             let line_samples = profiles
                 .first()
@@ -384,8 +386,18 @@ impl SimLsmDriver {
             );
             while !stop.load(Ordering::Relaxed) {
                 let started = Instant::now();
-                let profiles =
-                    render_line_profiles(&model, scan.spec(), &channels, samples, line + 1);
+                // Sweep down the raster: successive lines are successive rows,
+                // so a client filling a framebuffer reconstructs the same image
+                // the capture/stream capabilities render.
+                let rows = u64::from(scan.spec().height.max(1));
+                let profiles = render_scan_row_profiles(
+                    &model,
+                    scan.spec(),
+                    &channels,
+                    samples,
+                    (line % rows) as u32,
+                    line / rows + 1,
+                );
                 let line_samples = profiles
                     .first()
                     .map(|(_, samples)| samples.as_slice())
@@ -864,7 +876,9 @@ impl RasterScan {
         let resolved = resolved_line_timing(timing, samples, 100_000.0);
         Self {
             width: samples.clamp(1, 65_536),
-            height: 1,
+            // A line request without a height is a single line at the scan
+            // centre; with one, it is a row sweep over a raster that tall.
+            height: map_i64(timing, "height").unwrap_or(1).clamp(1, 65_536) as u32,
             reconstruction_width: samples.clamp(1, 65_536),
             reconstruction_height: 1,
             pixel_size_um: map_f64(timing, "pixel_size_um").unwrap_or(0.325),

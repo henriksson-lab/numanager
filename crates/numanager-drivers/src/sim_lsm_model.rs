@@ -81,40 +81,28 @@ pub fn render_confocal_raster_for_detectors(
     detectors: &[String],
     frame_index: u64,
 ) -> LsmImage {
-    let width = spec.width.max(1);
-    let height = spec.height.max(1);
-    let pixel_um = spec.pixel_size_um.max(0.001);
-    let half_w_um = width as f64 * pixel_um / 2.0;
-    let half_h_um = height as f64 * pixel_um / 2.0;
-    let origin_x_um = spec.center_x_um - half_w_um;
-    let origin_y_um = spec.center_y_um - half_h_um;
-    let optics = EffectiveOptics::new(config, &spec);
-    let margin_um = sim_sample::MAX_CELL_RADIUS_UM + 4.0 * optics.psf_xy_um.max(pixel_um);
-    let cells = sim_sample::cells_for_rect(
-        &config.sample,
-        origin_x_um,
-        origin_y_um,
-        spec.center_x_um + half_w_um,
-        spec.center_y_um + half_h_um,
-        margin_um,
-    );
+    let geometry = ScanGeometry::new(config, &spec);
+    let cells = geometry.cells(config);
+    let width = geometry.width;
+    let height = geometry.height;
 
-    let mut data = vec![0u16; (width * height) as usize];
+    let mut data = Vec::with_capacity((width * height) as usize);
     let mut saturated = 0;
-    for y in 0..height {
-        for x in 0..width {
-            let index = (y * width + x) as usize;
-            let sample_x = origin_x_um + (x as f64 + 0.5) * pixel_um;
-            let sample_y = origin_y_um + (y as f64 + 0.5) * pixel_um;
-            let components = fluorescence_components_at_cells(
-                config, optics, &cells, sample_x, sample_y, spec.z_um,
-            );
-            let signal = detector_signal(config, components, detectors, spec.laser_power, optics);
-            let code = detector_code(config, signal, frame_index, index as u64);
-            if code == u16::MAX {
-                saturated += 1;
-            }
-            data[index] = code;
+    for row in 0..height {
+        geometry.render_row(
+            config,
+            &spec,
+            &cells,
+            detectors,
+            width,
+            row,
+            frame_index,
+            &mut data,
+        );
+    }
+    for code in &data {
+        if *code == u16::MAX {
+            saturated += 1;
         }
     }
     LsmImage {
@@ -134,27 +122,48 @@ pub fn render_line_profile(
     render_line_profile_for_detector(config, spec, "counter0", samples, frame_index)
 }
 
-pub fn render_line_profiles(
+/// Detector traces for one row of the raster described by `spec`.
+///
+/// This is the single scan primitive: [`render_confocal_raster_for_detectors`]
+/// builds its image out of exactly these rows, so scanning row `row` here
+/// reproduces row `row` of the image — same sample positions, same optics, same
+/// detector response, same quantisation. A `spec` of height 1 puts row 0 at the
+/// scan centre, which is what a single-line request asks for.
+pub fn render_scan_row_profiles(
     config: &LsmFluorescenceConfig,
     spec: LsmRasterSpec,
     detectors: &[String],
     samples: u32,
+    row: u32,
     frame_index: u64,
 ) -> Vec<(String, Vec<u16>)> {
-    if detectors.is_empty() {
-        return vec![(
-            "counter0".into(),
-            render_line_profile_for_detector(config, spec, "counter0", samples, frame_index),
-        )];
-    }
+    let geometry = ScanGeometry::new(config, &spec);
+    let cells = geometry.cells(config);
+    let samples = samples.max(1);
 
-    detectors
-        .iter()
+    let channels: Vec<String> = if detectors.is_empty() {
+        vec!["counter0".into()]
+    } else {
+        detectors.to_vec()
+    };
+
+    channels
+        .into_iter()
         .map(|detector| {
-            (
-                detector.clone(),
-                render_line_profile_for_detector(config, spec, detector, samples, frame_index),
-            )
+            let mut codes = Vec::with_capacity(samples as usize);
+            // One detector at a time: `detector_signal` over a single-channel
+            // list is the same expression the raster averages over.
+            geometry.render_row(
+                config,
+                &spec,
+                &cells,
+                std::slice::from_ref(&detector),
+                samples,
+                row,
+                frame_index,
+                &mut codes,
+            );
+            (detector, codes)
         })
         .collect()
 }
@@ -166,45 +175,108 @@ pub fn render_line_profile_for_detector(
     samples: u32,
     frame_index: u64,
 ) -> Vec<u16> {
-    let samples = samples.max(1);
-    let span_um = spec.width.max(1) as f64 * spec.pixel_size_um.max(0.001);
-    let start_x = spec.center_x_um - span_um / 2.0;
-    let end_x = spec.center_x_um + span_um / 2.0;
-    let optics = EffectiveOptics::new(config, &spec);
-    let margin_um = sim_sample::MAX_CELL_RADIUS_UM + 4.0 * optics.psf_xy_um.max(spec.pixel_size_um);
-    let cells = sim_sample::cells_for_rect(
-        &config.sample,
-        start_x,
-        spec.center_y_um,
-        end_x,
-        spec.center_y_um,
-        margin_um,
-    );
+    render_scan_row_profiles(
+        config,
+        spec,
+        std::slice::from_ref(&detector.to_owned()),
+        samples,
+        0,
+        frame_index,
+    )
+    .into_iter()
+    .next()
+    .map(|(_, codes)| codes)
+    .unwrap_or_default()
+}
 
-    (0..samples)
-        .map(|index| {
-            let t = if samples == 1 {
-                0.0
-            } else {
-                index as f64 / (samples - 1) as f64
-            };
-            let x_um = start_x + t * (end_x - start_x);
+/// Sample positions and optics for a scan, derived once and shared by every row
+/// so the raster and a line scan cannot drift apart.
+struct ScanGeometry {
+    width: u32,
+    height: u32,
+    pixel_um: f64,
+    origin_x_um: f64,
+    origin_y_um: f64,
+    max_x_um: f64,
+    max_y_um: f64,
+    optics: EffectiveOptics,
+}
+
+impl ScanGeometry {
+    fn new(config: &LsmFluorescenceConfig, spec: &LsmRasterSpec) -> Self {
+        let width = spec.width.max(1);
+        let height = spec.height.max(1);
+        let pixel_um = spec.pixel_size_um.max(0.001);
+        let half_w_um = width as f64 * pixel_um / 2.0;
+        let half_h_um = height as f64 * pixel_um / 2.0;
+        Self {
+            width,
+            height,
+            pixel_um,
+            origin_x_um: spec.center_x_um - half_w_um,
+            origin_y_um: spec.center_y_um - half_h_um,
+            max_x_um: spec.center_x_um + half_w_um,
+            max_y_um: spec.center_y_um + half_h_um,
+            optics: EffectiveOptics::new(config, spec),
+        }
+    }
+
+    /// Cells for the whole scan rectangle. A single row uses the same set as the
+    /// full frame so a line scan and the image see identical sample content.
+    fn cells(&self, config: &LsmFluorescenceConfig) -> Vec<SimCell> {
+        let margin_um =
+            sim_sample::MAX_CELL_RADIUS_UM + 4.0 * self.optics.psf_xy_um.max(self.pixel_um);
+        sim_sample::cells_for_rect(
+            &config.sample,
+            self.origin_x_um,
+            self.origin_y_um,
+            self.max_x_um,
+            self.max_y_um,
+            margin_um,
+        )
+    }
+
+    /// Pixel-centre sampling across the scan width. With `samples == width` this
+    /// is exactly the raster's pixel grid.
+    fn x_um(&self, column: u32, samples: u32) -> f64 {
+        let step = self.width as f64 * self.pixel_um / f64::from(samples.max(1));
+        self.origin_x_um + (f64::from(column) + 0.5) * step
+    }
+
+    fn y_um(&self, row: u32) -> f64 {
+        self.origin_y_um + (f64::from(row) + 0.5) * self.pixel_um
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_row(
+        &self,
+        config: &LsmFluorescenceConfig,
+        spec: &LsmRasterSpec,
+        cells: &[SimCell],
+        detectors: &[String],
+        samples: u32,
+        row: u32,
+        frame_index: u64,
+        out: &mut Vec<u16>,
+    ) {
+        let y_um = self.y_um(row);
+        for column in 0..samples {
             let components = fluorescence_components_at_cells(
                 config,
-                optics,
-                &cells,
-                x_um,
-                spec.center_y_um,
+                self.optics,
+                cells,
+                self.x_um(column, samples),
+                y_um,
                 spec.z_um,
             );
-            let response = DetectorResponse::for_channel(detector);
-            let signal = response.apply(config, components)
-                * spec.laser_power.clamp(0.0, 1.0)
-                * optics.collection_gain
-                * config.detector_gain.max(0.0);
-            detector_code(config, signal, frame_index, index as u64)
-        })
-        .collect()
+            let signal =
+                detector_signal(config, components, detectors, spec.laser_power, self.optics);
+            // Noise is seeded by the position in the frame, so a row scanned on
+            // its own carries the same realisation as that row of the image.
+            let sample_index = u64::from(row) * u64::from(samples) + u64::from(column);
+            out.push(detector_code(config, signal, frame_index, sample_index));
+        }
+    }
 }
 
 pub fn fluorescence_at(config: &LsmFluorescenceConfig, x_um: f64, y_um: f64, z_um: f64) -> f64 {

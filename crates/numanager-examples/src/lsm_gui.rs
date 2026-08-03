@@ -14,7 +14,7 @@ use slint::{
 };
 
 slint::slint! {
-import { Button, CheckBox, ComboBox, Slider, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, ScrollView, Slider, VerticalBox, HorizontalBox } from "std-widgets.slint";
 
 export component LsmWindow inherits Window {
     title: "numanager LSM";
@@ -23,6 +23,7 @@ export component LsmWindow inherits Window {
 
     in property <image> preview;
     in property <image> line-profile;
+    in property <string> histogram-path;
     in property <[string]> source-options;
     in-out property <int> selected-source;
     in-out property <float> width-value: 512;
@@ -30,7 +31,8 @@ export component LsmWindow inherits Window {
     in-out property <float> rate-value: 100;
     in-out property <float> dwell-value: 500;
     in-out property <float> chunk-value: 256;
-    in-out property <bool> overwrite: true;
+    // Display-only overlay: highlight the row the scan is currently on.
+    in-out property <bool> mark-scan-line: true;
     in-out property <bool> use-counter: true;
     in-out property <bool> use-analog: true;
     in-out property <bool> laser-gate: true;
@@ -41,17 +43,20 @@ export component LsmWindow inherits Window {
     in-out property <float> focus-z-value: 4250;
     in-out property <float> lamp-power-value: 100;
     in-out property <float> objective-position-value: 2;
-    in property <bool> live;
+    in property <bool> line-scanning;
     in property <string> status;
     in property <bool> status-error;
     in property <string> source-summary;
+    // False when the selected source reports it cannot execute a scan, so the
+    // acquisition buttons produce no data. `backend-note` carries the reason.
+    in property <bool> backend-live: true;
+    in property <string> backend-note;
     in property <string> request-summary;
     in property <string> frame-summary;
     in property <string> line-summary;
     in property <string> progress-summary;
 
     callback snapshot();
-    callback live-toggle();
     callback line-scan();
     callback source-changed(int);
 
@@ -61,22 +66,19 @@ export component LsmWindow inherits Window {
 
         VerticalBox {
             spacing: 8px;
-            width: 760px;
+            horizontal-stretch: 1;
+            min-width: 420px;
 
             HorizontalBox {
                 spacing: 8px;
                 Button {
                     text: "Snapshot";
-                    enabled: !root.live;
+                    enabled: !root.line-scanning;
                     clicked => { root.snapshot(); }
                 }
                 Button {
-                    text: root.live ? "Stop" : "Live";
-                    primary: root.live;
-                    clicked => { root.live-toggle(); }
-                }
-                Button {
-                    text: "Line";
+                    text: root.line-scanning ? "Stop" : "Line scanning";
+                    primary: root.line-scanning;
                     clicked => { root.line-scan(); }
                 }
                 Rectangle {
@@ -84,32 +86,69 @@ export component LsmWindow inherits Window {
                     height: 12px;
                     border-radius: 6px;
                     y: (parent.height - self.height) / 2;
-                    background: root.live ? #e0463c : #8d98a7;
+                    background: root.line-scanning ? #e0463c : #8d98a7;
                 }
                 Text {
-                    text: root.live ? "LIVE" : "idle";
-                    color: root.live ? #e0463c : #536170;
+                    text: root.line-scanning ? "LINE SCAN" : "idle";
+                    color: root.line-scanning ? #e0463c : #536170;
                     font-weight: 700;
                     vertical-alignment: center;
                 }
             }
 
-            Rectangle {
-                vertical-stretch: 1;
-                background: #10151b;
-                border-color: #2d3745;
+            Text {
+                text: "Snapshot: one complete image, as if the LSM were a camera. Line scanning: the same image built one scan line at a time, refreshed as the sweep goes down the frame.";
+                wrap: word-wrap;
+                color: #536170;
+            }
+
+            if !root.backend-live: Rectangle {
+                background: #fff4ed;
+                border-color: #e08a3c;
                 border-width: 1px;
-                Image {
-                    source: root.preview;
-                    image-fit: contain;
-                    image-rendering: ImageRendering.pixelated;
-                    width: parent.width;
-                    height: parent.height;
+                border-radius: 4px;
+                VerticalLayout {
+                    padding: 8px;
+                    spacing: 2px;
+                    Text {
+                        text: "This source cannot scan — Snapshot and Line scanning will produce no data.";
+                        color: #8a4b12;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+                    Text { text: root.backend-note; color: #6b4a2a; wrap: word-wrap; }
                 }
             }
 
             Rectangle {
-                height: 132px;
+                vertical-stretch: 1;
+                background: #0b0f14;
+
+                // The scan viewport keeps the configured scan aspect (square for
+                // a 512x512 raster) and is centred, rather than stretching to
+                // whatever shape the pane happens to be.
+                Rectangle {
+                    property <float> aspect: root.width-value / max(root.height-value, 1.0);
+                    width: min(parent.width, parent.height * self.aspect);
+                    height: self.width / self.aspect;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    background: #10151b;
+                    border-color: #2d3745;
+                    border-width: 1px;
+                    Image {
+                        source: root.preview;
+                        image-fit: contain;
+                        image-rendering: ImageRendering.pixelated;
+                        width: parent.width;
+                        height: parent.height;
+                    }
+                }
+            }
+
+            Text { text: "Most recent scan line — detector signal along the row being scanned"; color: #536170; }
+            Rectangle {
+                height: 110px;
                 background: #151b23;
                 border-color: #303a47;
                 border-width: 1px;
@@ -120,90 +159,132 @@ export component LsmWindow inherits Window {
                     height: parent.height;
                 }
             }
+
+            Text { text: "Intensity histogram 0 -> 255 — whole image, not just the current line"; color: #536170; }
+            Rectangle {
+                height: 110px;
+                background: #10141a;
+                border-color: #303844;
+                border-width: 1px;
+
+                Path {
+                    x: 1px;
+                    y: 1px;
+                    width: parent.width - 2px;
+                    height: parent.height - 2px;
+                    viewbox-x: 0;
+                    viewbox-y: 0;
+                    viewbox-width: 255;
+                    viewbox-height: 100;
+                    fit: fill;
+                    commands: root.histogram-path;
+                    fill: #2f80ed80;
+                    stroke: #7ab2ff;
+                    stroke-width: 1px;
+                }
+            }
         }
 
-        VerticalBox {
-            spacing: 10px;
+        // The control column is taller than the window on any realistic scan
+        // configuration, so it scrolls vertically. Pinning the viewport to the
+        // visible width keeps the word-wrapped summaries wrapping at the panel
+        // width instead of forcing a horizontal scrollbar.
+        ScrollView {
             width: 380px;
+            viewport-width: self.visible-width;
 
-            Text { text: "Source"; font-size: 16px; font-weight: 700; }
-            ComboBox {
-                model: root.source-options;
-                current-index <=> root.selected-source;
-                selected(_) => { root.source-changed(root.selected-source); }
+            VerticalBox {
+                spacing: 10px;
+                alignment: start;
+                padding-right: 14px;
+
+                Text { text: "Source"; font-size: 16px; font-weight: 700; }
+                ComboBox {
+                    model: root.source-options;
+                    current-index <=> root.selected-source;
+                    selected(_) => { root.source-changed(root.selected-source); }
+                }
+                Text { text: "Backend status"; font-weight: 700; color: #536170; }
+                Text { text: root.source-summary; wrap: word-wrap; color: #536170; }
+
+                Text { text: "Scan"; font-size: 20px; font-weight: 700; }
+
+                Text { text: "Width " + round(root.width-value); color: #536170; }
+                Slider { minimum: 64; maximum: 2048; value <=> root.width-value; }
+
+                Text { text: "Height " + round(root.height-value); color: #536170; }
+                Slider { minimum: 1; maximum: 2048; value <=> root.height-value; }
+
+                Text { text: "Rate " + round(root.rate-value) + " kHz"; color: #536170; }
+                Slider { minimum: 1; maximum: 1000; value <=> root.rate-value; }
+
+                Text { text: "Line dwell " + round(root.dwell-value) + " us"; color: #536170; }
+                Slider { minimum: 10; maximum: 5000; value <=> root.dwell-value; }
+
+                Text { text: "Chunk " + round(root.chunk-value); color: #536170; }
+                Slider { minimum: 16; maximum: 4096; value <=> root.chunk-value; }
+
+                CheckBox {
+                    text: "Mark current scan line";
+                    checked <=> root.mark-scan-line;
+                }
+
+                Text { text: "Devices"; font-size: 16px; font-weight: 700; }
+                CheckBox {
+                    text: "Laser gate do0";
+                    checked <=> root.laser-gate;
+                }
+                CheckBox {
+                    text: "Counter detector counter0";
+                    checked <=> root.use-counter;
+                }
+                CheckBox {
+                    text: "Analog monitor ai0";
+                    checked <=> root.use-analog;
+                }
+
+                Text { text: "Detector"; font-size: 16px; font-weight: 700; }
+                Text { text: "Gain " + round(root.detector-gain-value) + "%"; color: #536170; }
+                Slider { minimum: 0; maximum: 500; value <=> root.detector-gain-value; }
+
+                Text { text: "Noise " + round(root.detector-noise-value) + "%"; color: #536170; }
+                Slider { minimum: 0; maximum: 500; value <=> root.detector-noise-value; }
+
+                Text { text: "Shared Scene"; font-size: 16px; font-weight: 700; }
+                Text { text: "X " + round(root.stage-x-value) + " um"; color: #536170; }
+                Slider { minimum: -1000; maximum: 1000; value <=> root.stage-x-value; }
+
+                Text { text: "Y " + round(root.stage-y-value) + " um"; color: #536170; }
+                Slider { minimum: -1000; maximum: 1000; value <=> root.stage-y-value; }
+
+                Text { text: "Focus " + round(root.focus-z-value) + " um"; color: #536170; }
+                Slider { minimum: 0; maximum: 8500; value <=> root.focus-z-value; }
+
+                Text { text: "Lamp " + round(root.lamp-power-value) + "%"; color: #536170; }
+                Slider { minimum: 0; maximum: 100; value <=> root.lamp-power-value; }
+
+                Text { text: "Objective " + round(root.objective-position-value); color: #536170; }
+                Slider { minimum: 1; maximum: 3; value <=> root.objective-position-value; }
+
+                Rectangle { height: 1px; background: #d5dbe3; }
+
+                Text { text: "Last operation"; font-size: 16px; font-weight: 700; }
+                Text {
+                    text: "What the buttons above actually submitted to the runtime, and what came back. This example doubles as API documentation, so the typed request and the frame/stream metadata are shown verbatim.";
+                    wrap: word-wrap;
+                    color: #536170;
+                }
+
+                Text { text: "Request"; font-weight: 700; }
+                Text { text: root.request-summary; wrap: word-wrap; color: #26313d; }
+                Text { text: "Frame"; font-weight: 700; }
+                Text { text: root.frame-summary; wrap: word-wrap; color: #26313d; }
+                Text { text: "Line"; font-weight: 700; }
+                Text { text: root.line-summary; wrap: word-wrap; color: #26313d; }
+                Text { text: "Progress"; font-weight: 700; }
+                Text { text: root.progress-summary; wrap: word-wrap; color: #26313d; }
+                Text { text: root.status; wrap: word-wrap; color: root.status-error ? #b42318 : #1d6b42; }
             }
-            Text { text: root.source-summary; wrap: word-wrap; color: #536170; }
-
-            Text { text: "Scan"; font-size: 20px; font-weight: 700; }
-
-            Text { text: "Width " + round(root.width-value); color: #536170; }
-            Slider { minimum: 64; maximum: 2048; value <=> root.width-value; }
-
-            Text { text: "Height " + round(root.height-value); color: #536170; }
-            Slider { minimum: 1; maximum: 2048; value <=> root.height-value; }
-
-            Text { text: "Rate " + round(root.rate-value) + " kHz"; color: #536170; }
-            Slider { minimum: 1; maximum: 1000; value <=> root.rate-value; }
-
-            Text { text: "Line dwell " + round(root.dwell-value) + " us"; color: #536170; }
-            Slider { minimum: 10; maximum: 5000; value <=> root.dwell-value; }
-
-            Text { text: "Chunk " + round(root.chunk-value); color: #536170; }
-            Slider { minimum: 16; maximum: 4096; value <=> root.chunk-value; }
-
-            CheckBox {
-                text: "Overwrite pixels";
-                checked <=> root.overwrite;
-            }
-
-            Text { text: "Devices"; font-size: 16px; font-weight: 700; }
-            CheckBox {
-                text: "Laser gate do0";
-                checked <=> root.laser-gate;
-            }
-            CheckBox {
-                text: "Counter detector counter0";
-                checked <=> root.use-counter;
-            }
-            CheckBox {
-                text: "Analog monitor ai0";
-                checked <=> root.use-analog;
-            }
-
-            Text { text: "Detector"; font-size: 16px; font-weight: 700; }
-            Text { text: "Gain " + round(root.detector-gain-value) + "%"; color: #536170; }
-            Slider { minimum: 0; maximum: 500; value <=> root.detector-gain-value; }
-
-            Text { text: "Noise " + round(root.detector-noise-value) + "%"; color: #536170; }
-            Slider { minimum: 0; maximum: 500; value <=> root.detector-noise-value; }
-
-            Text { text: "Shared Scene"; font-size: 16px; font-weight: 700; }
-            Text { text: "X " + round(root.stage-x-value) + " um"; color: #536170; }
-            Slider { minimum: -1000; maximum: 1000; value <=> root.stage-x-value; }
-
-            Text { text: "Y " + round(root.stage-y-value) + " um"; color: #536170; }
-            Slider { minimum: -1000; maximum: 1000; value <=> root.stage-y-value; }
-
-            Text { text: "Focus " + round(root.focus-z-value) + " um"; color: #536170; }
-            Slider { minimum: 0; maximum: 8500; value <=> root.focus-z-value; }
-
-            Text { text: "Lamp " + round(root.lamp-power-value) + "%"; color: #536170; }
-            Slider { minimum: 0; maximum: 100; value <=> root.lamp-power-value; }
-
-            Text { text: "Objective " + round(root.objective-position-value); color: #536170; }
-            Slider { minimum: 1; maximum: 3; value <=> root.objective-position-value; }
-
-            Rectangle { height: 1px; background: #d5dbe3; }
-
-            Text { text: "Request"; font-size: 16px; font-weight: 700; }
-            Text { text: root.request-summary; wrap: word-wrap; color: #26313d; }
-            Text { text: "Frame"; font-size: 16px; font-weight: 700; }
-            Text { text: root.frame-summary; wrap: word-wrap; color: #26313d; }
-            Text { text: "Line"; font-size: 16px; font-weight: 700; }
-            Text { text: root.line-summary; wrap: word-wrap; color: #26313d; }
-            Text { text: "Progress"; font-size: 16px; font-weight: 700; }
-            Text { text: root.progress-summary; wrap: word-wrap; color: #26313d; }
-            Text { text: root.status; wrap: word-wrap; color: root.status-error ? #b42318 : #1d6b42; }
         }
     }
 }
@@ -223,6 +304,7 @@ pub fn run() -> Result<()> {
     let operation_events =
         runtime.subscribe(EventFilter::device(&hub).with_kind(EventKind::OperationChanged));
     let source_summary = source_summary(&hub);
+    let (backend_live, backend_note) = backend_live_state(&hub);
     let ui = LsmWindow::new().map_err(|error| Error::new(ErrorCode::Driver, error.to_string()))?;
     let app = Rc::new(RefCell::new(LsmGui {
         runtime,
@@ -230,8 +312,9 @@ pub fn run() -> Result<()> {
         frame_events,
         signal_events,
         operation_events,
-        live: false,
-        live_operation: None,
+        line_scanning: false,
+        line_operation: None,
+        line_buffer: LineFramebuffer::default(),
     }));
 
     ui.set_preview(blank_image(512, 512));
@@ -240,8 +323,10 @@ pub fn run() -> Result<()> {
     ui.set_selected_source(source_index(&source));
     ui.set_status(format!("ready: {source}").into());
     ui.set_source_summary(source_summary.into());
+    ui.set_backend_live(backend_live);
+    ui.set_backend_note(backend_note.into());
     ui.set_status_error(false);
-    ui.set_request_summary("snapshot 512x512, live dirty-region stream".into());
+    ui.set_request_summary("no request submitted yet".into());
     ui.set_frame_summary("no frame".into());
     ui.set_line_summary("counter0 + ai0, chunk 256".into());
     ui.set_progress_summary("idle".into());
@@ -269,20 +354,11 @@ pub fn run() -> Result<()> {
         let app = Rc::clone(&app);
         ui.on_line_scan(move || {
             if let Some(ui) = ui_weak.upgrade() {
-                report(&ui, app.borrow_mut().line_scan(&ui));
-            }
-        });
-    }
-    {
-        let ui_weak = ui.as_weak();
-        let app = Rc::clone(&app);
-        ui.on_live_toggle(move || {
-            if let Some(ui) = ui_weak.upgrade() {
                 let mut app = app.borrow_mut();
-                if app.live {
-                    report(&ui, app.stop_live(&ui));
+                if app.line_scanning {
+                    report(&ui, app.stop_line_scanning(&ui));
                 } else {
-                    report(&ui, app.start_live(&ui));
+                    report(&ui, app.start_line_scanning(&ui));
                 }
             }
         });
@@ -295,8 +371,8 @@ pub fn run() -> Result<()> {
         timer.start(TimerMode::Repeated, Duration::from_millis(120), move || {
             if let Some(ui) = ui_weak.upgrade() {
                 let mut app = app.borrow_mut();
-                if app.live {
-                    if let Err(error) = app.drain_live(&ui) {
+                if app.line_scanning {
+                    if let Err(error) = app.drain_line_scanning(&ui) {
                         ui.set_status(format!("error: {}", error.message).into());
                         ui.set_status_error(true);
                     }
@@ -374,8 +450,88 @@ struct LsmGui {
     frame_events: Subscription,
     signal_events: Subscription,
     operation_events: Subscription,
-    live: bool,
-    live_operation: Option<OperationId>,
+    line_scanning: bool,
+    line_operation: Option<OperationId>,
+    line_buffer: LineFramebuffer,
+}
+
+/// Framebuffer filled row by row from continuous line-scan chunks.
+///
+/// The scan sweeps down the raster, so line `n` is row `n % height` of the same
+/// image the capture and stream capabilities render. Chunks land as partial
+/// rows, and the display is rebuilt from whatever has arrived rather than
+/// waiting for a complete frame.
+#[derive(Default)]
+struct LineFramebuffer {
+    width: u32,
+    height: u32,
+    pixels: Vec<u16>,
+    lines_written: u64,
+    current_line: Option<u64>,
+    dirty: bool,
+}
+
+impl LineFramebuffer {
+    fn reset(&mut self, width: u32, height: u32) {
+        self.width = width.clamp(1, 4096);
+        self.height = height.clamp(1, 4096);
+        self.pixels = vec![0; self.width as usize * self.height as usize];
+        self.lines_written = 0;
+        self.current_line = None;
+        self.dirty = true;
+    }
+
+    /// Write one chunk of a scan line. `first_sample` is the offset within the
+    /// line, so a chunk only overwrites the columns it actually covers.
+    fn write_chunk(&mut self, line: u64, first_sample: u64, samples: &[u16]) {
+        if self.pixels.is_empty() || samples.is_empty() {
+            return;
+        }
+        if self.current_line != Some(line) {
+            self.current_line = Some(line);
+            self.lines_written = self.lines_written.saturating_add(1);
+        }
+        let row = (line % u64::from(self.height)) as usize;
+        let start = usize::try_from(first_sample).unwrap_or(usize::MAX);
+        if start >= self.width as usize {
+            return;
+        }
+        let base = row * self.width as usize + start;
+        let span = samples.len().min(self.width as usize - start);
+        self.pixels[base..base + span].copy_from_slice(&samples[..span]);
+        self.dirty = true;
+    }
+
+    /// Displayed intensity of every pixel in the framebuffer.
+    fn intensities(&self) -> impl Iterator<Item = u8> + '_ {
+        self.pixels.iter().map(|code| (code >> 8) as u8)
+    }
+
+    /// Rows sit where the scan put them, so this is the image itself, partly
+    /// refreshed wherever the sweep has reached.
+    ///
+    /// `mark_current` draws the row being scanned in white. It is an overlay
+    /// applied while rendering — the stored sample codes are never modified, so
+    /// the marker never contaminates the acquired image.
+    fn image(&self, mark_current: bool) -> Image {
+        let mut pixels = SharedPixelBuffer::<Rgb8Pixel>::new(self.width, self.height);
+        let bytes = pixels.make_mut_bytes();
+        for (pixel, code) in bytes.chunks_exact_mut(3).zip(&self.pixels) {
+            let value = (code >> 8) as u8;
+            pixel[0] = value / 3;
+            pixel[1] = value;
+            pixel[2] = value.saturating_add(30);
+        }
+        if mark_current {
+            if let Some(line) = self.current_line {
+                let row = (line % u64::from(self.height)) as usize;
+                let start = row * self.width as usize * 3;
+                let end = start + self.width as usize * 3;
+                bytes[start..end].fill(u8::MAX);
+            }
+        }
+        Image::from_rgb8(pixels)
+    }
 }
 
 const SOURCE_CHOICES: [(&str, &str); 3] = [
@@ -412,7 +568,7 @@ fn source_index(source: &str) -> i32 {
 
 impl LsmGui {
     fn set_source(&mut self, ui: &LsmWindow, index: i32) -> Result<()> {
-        self.cancel_live();
+        self.cancel_line_scanning();
         let source = source_id(index);
         let (runtime, hub) = crate::lsm_common::runtime_for_source(source)?;
         let frame_events =
@@ -426,13 +582,14 @@ impl LsmGui {
         self.frame_events = frame_events;
         self.signal_events = signal_events;
         self.operation_events = operation_events;
-        self.live = false;
-        self.live_operation = None;
-        ui.set_live(false);
+        self.clear_line_scanning(ui);
         ui.set_preview(blank_image(512, 512));
         ui.set_line_profile(blank_image(512, 96));
         ui.set_source_summary(source_summary(&self.hub).into());
-        ui.set_request_summary("snapshot 512x512, live dirty-region stream".into());
+        let (backend_live, backend_note) = backend_live_state(&self.hub);
+        ui.set_backend_live(backend_live);
+        ui.set_backend_note(backend_note.into());
+        ui.set_request_summary("no request submitted yet".into());
         ui.set_frame_summary("no frame".into());
         ui.set_line_summary("counter0 + ai0, chunk 256".into());
         ui.set_progress_summary("idle".into());
@@ -479,135 +636,15 @@ impl LsmGui {
         Ok(())
     }
 
-    fn start_live(&mut self, ui: &LsmWindow) -> Result<()> {
+    fn start_line_scanning(&mut self, ui: &LsmWindow) -> Result<()> {
         let width = scan_width(ui);
         let height = scan_height(ui);
-        self.sync_shared_scene(ui)?;
-        self.sync_detector_controls(ui)?;
-        let mut request =
-            crate::lsm_common::continuous_live_image_request(width as i64, height as i64);
-        request.overwrite_previous_pixels = ui.get_overwrite();
-        apply_scan_controls(ui, &mut request.scan);
-        request.scan.insert(
-            "laser_gate_enabled".into(),
-            Value::Bool(ui.get_laser_gate()),
-        );
-        request
-            .scan
-            .insert("detectors".into(), Value::List(detector_values(ui)));
-        let op = self.runtime.submit_request(&self.hub, request)?;
-        let has_frame = self.drain_frame(ui)?;
-        match self.runtime.wait(op.id, Duration::from_millis(10))? {
-            OperationStatus::Completed(value) => {
-                ui.set_live(false);
-                self.live = false;
-                self.live_operation = None;
-                ui.set_request_summary(
-                    format!(
-                        "live {}x{} -> {}",
-                        width,
-                        height,
-                        result_text_with_plan(&value)
-                    )
-                    .into(),
-                );
-                ui.set_status(
-                    if has_frame {
-                        "live request completed"
-                    } else {
-                        "live request completed without frame"
-                    }
-                    .into(),
-                );
-            }
-            OperationStatus::Failed(report) => {
-                self.live = false;
-                self.live_operation = None;
-                ui.set_live(false);
-                return Err(Error::new(report.code, report.message));
-            }
-            _ => {
-                self.live = true;
-                self.live_operation = Some(op.id);
-                ui.set_live(true);
-                ui.set_request_summary(
-                    format!("live {}x{} {} running", width, height, timing_summary(ui)).into(),
-                );
-                ui.set_progress_summary("live running".into());
-                ui.set_status("live stream running".into());
-            }
-        }
-        ui.set_status_error(false);
-        Ok(())
-    }
-
-    fn drain_live(&mut self, ui: &LsmWindow) -> Result<()> {
-        let has_frame = self.drain_frame(ui)?;
-        if has_frame {
-            ui.set_status("live frame received".into());
-            ui.set_status_error(false);
-        }
-        if let Some(operation) = self.live_operation {
-            if let Some(progress) = self.drain_progress(operation) {
-                ui.set_progress_summary(progress_text("live", progress).into());
-            }
-            match self.runtime.status(operation) {
-                OperationStatus::Running { .. } | OperationStatus::Queued => {}
-                OperationStatus::Completed(value) => {
-                    self.live = false;
-                    self.live_operation = None;
-                    ui.set_live(false);
-                    ui.set_request_summary(
-                        format!("live stopped -> {}", result_text_with_plan(&value)).into(),
-                    );
-                    ui.set_progress_summary("live completed".into());
-                    ui.set_status("live stream completed".into());
-                    ui.set_status_error(false);
-                }
-                OperationStatus::Failed(report) => {
-                    self.live = false;
-                    self.live_operation = None;
-                    ui.set_live(false);
-                    return Err(Error::new(report.code, report.message));
-                }
-                OperationStatus::Cancelled => {
-                    self.live = false;
-                    self.live_operation = None;
-                    ui.set_live(false);
-                    ui.set_progress_summary("live stopped".into());
-                    ui.set_status("live stopped".into());
-                    ui.set_status_error(false);
-                }
-                OperationStatus::TimedOut | OperationStatus::Unknown => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn stop_live(&mut self, ui: &LsmWindow) -> Result<()> {
-        self.cancel_live();
-        self.live = false;
-        self.live_operation = None;
-        ui.set_live(false);
-        ui.set_progress_summary("live stopped".into());
-        ui.set_status("live stopped".into());
-        ui.set_status_error(false);
-        Ok(())
-    }
-
-    fn cancel_live(&mut self) {
-        if let Some(operation) = self.live_operation.take() {
-            let _ = self.runtime.cancel(operation);
-        }
-    }
-
-    fn line_scan(&mut self, ui: &LsmWindow) -> Result<()> {
-        let width = scan_width(ui);
         let chunk = ui.get_chunk_value().round().clamp(16.0, 4096.0) as u64;
         self.sync_shared_scene(ui)?;
         self.sync_detector_controls(ui)?;
-        let mut request = crate::lsm_common::line_signal_request_channels(
+        let mut request = crate::lsm_common::continuous_raster_line_signal_request(
             width as i64,
+            height as i64,
             chunk,
             detector_names(ui),
         );
@@ -617,30 +654,134 @@ impl LsmGui {
             Value::Bool(ui.get_laser_gate()),
         );
         let operation = self.runtime.submit_request(&self.hub, request)?;
-        let value = self
-            .runtime
-            .wait_completed(operation.id, Duration::from_secs(5))?;
-        if let Some(progress) = self.drain_progress(operation.id) {
-            ui.set_progress_summary(progress_text("line", progress).into());
-        }
-        let line_chunks = self.drain_line_chunks();
-        if !line_chunks.samples.is_empty() {
-            ui.set_line_profile(line_image_from_samples(&line_chunks.samples, width));
-        }
-        let mut line_summary = format!(
-            "{} samples, chunk {}, {} -> {}",
-            width,
-            chunk,
-            timing_summary(ui),
-            result_text_with_plan(&value)
+        self.line_buffer.reset(width, height);
+        ui.set_preview(self.line_buffer.image(ui.get_mark_scan_line()));
+        ui.set_histogram_path(histogram_path(&histogram(self.line_buffer.intensities())).into());
+        self.line_scanning = true;
+        self.line_operation = Some(operation.id);
+        ui.set_line_scanning(true);
+        ui.set_request_summary(
+            format!(
+                "line scanning {} samples, chunk {}, {} running",
+                width,
+                chunk,
+                timing_summary(ui)
+            )
+            .into(),
         );
-        if let Some(first) = line_chunks.first_summary {
-            line_summary.push_str(&format!("; first=[{first}]"));
-        }
-        ui.set_line_summary(line_summary.into());
-        ui.set_status("line scan submitted".into());
+        ui.set_progress_summary("line scanning running".into());
+        ui.set_status("line scanning running".into());
         ui.set_status_error(false);
         Ok(())
+    }
+
+    /// Drain whatever chunks have arrived since the last tick into the
+    /// framebuffer, then refresh the preview if anything landed.
+    fn drain_line_scanning(&mut self, ui: &LsmWindow) -> Result<()> {
+        let mut latest_samples = Vec::new();
+        let mut first_summary = None;
+        while let Some(event) = self.signal_events.try_recv() {
+            if let Event::ScanSignalChunk(event) = event {
+                if first_summary.is_none() {
+                    first_summary = Some(signal_chunk_summary(&event));
+                }
+                // The raster capability averages the selected detectors, so the
+                // framebuffer averages the same channels to match it.
+                let traces: Vec<Vec<u16>> = event
+                    .samples
+                    .values()
+                    .map(|values| values.iter().filter_map(sample_u16).collect())
+                    .filter(|trace: &Vec<u16>| !trace.is_empty())
+                    .collect();
+                if traces.is_empty() {
+                    continue;
+                }
+                let samples: Vec<u16> = (0..traces.iter().map(Vec::len).min().unwrap_or(0))
+                    .map(|index| {
+                        let total: u32 = traces.iter().map(|trace| u32::from(trace[index])).sum();
+                        (total / traces.len() as u32) as u16
+                    })
+                    .collect();
+                self.line_buffer
+                    .write_chunk(event.line, event.first_sample, &samples);
+                latest_samples = samples;
+            }
+        }
+
+        if self.line_buffer.dirty {
+            self.line_buffer.dirty = false;
+            ui.set_preview(self.line_buffer.image(ui.get_mark_scan_line()));
+            // Whole framebuffer, so the histogram describes the image being
+            // built rather than the row that just landed.
+            ui.set_histogram_path(histogram_path(&histogram(self.line_buffer.intensities())).into());
+            ui.set_frame_summary(
+                format!(
+                    "line-scan framebuffer {}x{}, {} rows written",
+                    self.line_buffer.width, self.line_buffer.height, self.line_buffer.lines_written
+                )
+                .into(),
+            );
+        }
+        if !latest_samples.is_empty() {
+            ui.set_line_profile(line_image_from_samples(
+                &latest_samples,
+                self.line_buffer.width,
+            ));
+        }
+        if let Some(first) = first_summary {
+            ui.set_line_summary(format!("latest chunk=[{first}]").into());
+        }
+
+        if let Some(operation) = self.line_operation {
+            if let Some(progress) = self.drain_progress(operation) {
+                ui.set_progress_summary(progress_text("line scanning", progress).into());
+            }
+            match self.runtime.status(operation) {
+                OperationStatus::Running { .. } | OperationStatus::Queued => {}
+                OperationStatus::Completed(value) => {
+                    self.clear_line_scanning(ui);
+                    ui.set_request_summary(
+                        format!("line scanning stopped -> {}", result_text_with_plan(&value))
+                            .into(),
+                    );
+                    ui.set_status("line scanning completed".into());
+                    ui.set_status_error(false);
+                }
+                OperationStatus::Failed(report) => {
+                    self.clear_line_scanning(ui);
+                    return Err(Error::new(report.code, report.message));
+                }
+                OperationStatus::Cancelled => {
+                    self.clear_line_scanning(ui);
+                    ui.set_status("line scanning stopped".into());
+                    ui.set_status_error(false);
+                }
+                OperationStatus::TimedOut | OperationStatus::Unknown => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_line_scanning(&mut self, ui: &LsmWindow) -> Result<()> {
+        self.cancel_line_scanning();
+        self.clear_line_scanning(ui);
+        ui.set_progress_summary("line scanning stopped".into());
+        ui.set_status("line scanning stopped".into());
+        ui.set_status_error(false);
+        Ok(())
+    }
+
+    fn clear_line_scanning(&mut self, ui: &LsmWindow) {
+        self.line_scanning = false;
+        self.line_operation = None;
+        ui.set_line_scanning(false);
+    }
+
+    fn cancel_line_scanning(&mut self) {
+        if let Some(operation) = self.line_operation.take() {
+            let _ = self.runtime.cancel(operation);
+        }
+        self.line_scanning = false;
     }
 
     fn sync_shared_scene(&self, ui: &LsmWindow) -> Result<()> {
@@ -682,36 +823,14 @@ impl LsmGui {
         if let Some(handle) = latest {
             if let Some(frame) = self.runtime.frame(handle)? {
                 ui.set_preview(frame_image(&frame));
+                ui.set_histogram_path(
+                    histogram_path(&histogram(frame_intensities(&frame).into_iter())).into(),
+                );
                 ui.set_frame_summary(frame_summary(&frame).into());
                 return Ok(true);
             }
         }
         Ok(false)
-    }
-
-    fn drain_line_chunks(&mut self) -> LineDrain {
-        let mut samples = Vec::new();
-        let mut first_summary = None;
-        while let Some(event) = self.signal_events.try_recv() {
-            if let Event::ScanSignalChunk(event) = event {
-                if first_summary.is_none() {
-                    first_summary = Some(signal_chunk_summary(&event));
-                }
-                let preferred = event.samples.get("counter0").or_else(|| {
-                    event
-                        .channels
-                        .first()
-                        .and_then(|channel| event.samples.get(channel))
-                });
-                if let Some(values) = preferred {
-                    samples.extend(values.iter().filter_map(sample_u16));
-                }
-            }
-        }
-        LineDrain {
-            samples,
-            first_summary,
-        }
     }
 
     fn drain_progress(&mut self, operation: OperationId) -> Option<ProgressSummary> {
@@ -738,12 +857,6 @@ impl LsmGui {
         }
         summary
     }
-}
-
-#[derive(Debug, Clone)]
-struct LineDrain {
-    samples: Vec<u16>,
-    first_summary: Option<String>,
 }
 
 fn apply_shared_scene_controls(
@@ -964,6 +1077,40 @@ fn timing_summary(ui: &LsmWindow) -> String {
     )
 }
 
+const HISTOGRAM_BINS: usize = 256;
+const HISTOGRAM_SMOOTHING: usize = 2;
+
+/// Intensity histogram over every pixel of the image, binned on the same 8-bit
+/// value the preview draws. During a line scan this covers the whole
+/// framebuffer, not only the row being scanned.
+fn histogram(values: impl Iterator<Item = u8>) -> Vec<f32> {
+    let mut counts = [0u32; HISTOGRAM_BINS];
+    for value in values {
+        counts[value as usize] += 1;
+    }
+    let smoothed = (0..HISTOGRAM_BINS)
+        .map(|bin| {
+            let low = bin.saturating_sub(HISTOGRAM_SMOOTHING);
+            let high = (bin + HISTOGRAM_SMOOTHING).min(HISTOGRAM_BINS - 1);
+            let window = &counts[low..=high];
+            let mean = window.iter().sum::<u32>() as f32 / window.len() as f32;
+            mean.sqrt()
+        })
+        .collect::<Vec<_>>();
+    let max = smoothed.iter().copied().fold(0.0f32, f32::max).max(1.0);
+    smoothed.into_iter().map(|value| value / max).collect()
+}
+
+/// Emits the histogram as one continuous filled outline instead of separate bars.
+fn histogram_path(bins: &[f32]) -> String {
+    let mut path = String::from("M 0 100");
+    for (bin, value) in bins.iter().enumerate() {
+        path.push_str(&format!(" L {bin} {:.2}", 100.0 - value * 100.0));
+    }
+    path.push_str(&format!(" L {} 100 Z", bins.len().saturating_sub(1)));
+    path
+}
+
 fn frame_image(frame: &Frame) -> Image {
     let mut pixels = SharedPixelBuffer::<Rgb8Pixel>::new(frame.width, frame.height);
     let intensities = frame_intensities(frame);
@@ -1111,6 +1258,29 @@ fn result_text_with_plan(value: &Value) -> String {
         text.push_str(&plan);
     }
     text
+}
+
+/// Whether the selected source can actually execute a scan, and if not, the
+/// reason the backend gave. Sources that publish no `backend_status` metadata
+/// (the simulator) scan normally.
+fn backend_live_state(hub: &DeviceDescriptor) -> (bool, String) {
+    let Some(Value::Map(status)) = hub.metadata.get("backend_status") else {
+        return (true, String::new());
+    };
+    if map_bool(status, "live_task_execution_ready").unwrap_or(false) {
+        return (true, String::new());
+    }
+    let mut note = match map_string(status, "live_task_execution_blocker") {
+        Some(blocker) => format!("Blocked by: {blocker}."),
+        None => "The backend reports it is not ready to execute a live scan.".to_owned(),
+    };
+    if let Some(execution) = map_string(status, "execution_status") {
+        note.push_str(&format!(" Execution status: {execution}."));
+    }
+    note.push_str(
+        " The scan plan, timing and channel mapping shown on the right are still computed and validated; only frame execution is blocked.",
+    );
+    (false, note)
 }
 
 fn source_summary(hub: &DeviceDescriptor) -> String {

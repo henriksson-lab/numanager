@@ -202,6 +202,36 @@ pub fn continuous_line_signal_request(width: i64, chunk_size: u64) -> ScanSignal
     request
 }
 
+/// Continuous form of [`line_signal_request_channels`]: `lines = 0` asks the
+/// driver to keep scanning the line until the operation is cancelled, so a
+/// client can fill a framebuffer from the chunks as they arrive.
+pub fn continuous_line_signal_request_channels(
+    width: i64,
+    chunk_size: u64,
+    channels: Vec<String>,
+) -> ScanSignalStreamRequest {
+    let mut request = line_signal_request_channels(width, chunk_size, channels);
+    request.timing.insert("lines".into(), Value::I64(0));
+    request
+}
+
+/// Continuous line scan that sweeps a whole raster: successive lines are
+/// successive rows of a `width` x `height` scan, so a client can rebuild the
+/// same image the capture and stream capabilities produce, row by row.
+pub fn continuous_raster_line_signal_request(
+    width: i64,
+    height: i64,
+    chunk_size: u64,
+    channels: Vec<String>,
+) -> ScanSignalStreamRequest {
+    let mut request = continuous_line_signal_request_channels(width, chunk_size, channels);
+    request.timing.insert(
+        "height".into(),
+        Value::PixelCount(PixelCount::new(pixel_count(height))),
+    );
+    request
+}
+
 pub fn line_signal_request_channels(
     width: i64,
     chunk_size: u64,
