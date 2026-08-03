@@ -13,8 +13,6 @@ optional ImSwitch DAQmx backend.
 | Installation layout | |
 | License / redistribution boundary | |
 | Supported SDK target | Linux or Windows; other targets require separate NI SDK/runtime evidence |
-| Evidence-input audit command | `scripts/audit-ni-daqmx-evidence-inputs.sh` |
-| Evidence-input audit output | |
 | External-gates audit command | `scripts/audit-ni-daqmx-external-gates.sh` |
 | External-gates audit output | |
 | Package input inventory command | `scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>` |
@@ -44,16 +42,14 @@ optional ImSwitch DAQmx backend.
 Paste the output of:
 
 ```sh
-scripts/audit-ni-daqmx-evidence-inputs.sh
+scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>
+scripts/audit-ni-daqmx-sdk-headers.sh <header-file-or-directory>
+scripts/audit-ni-daqmx-sys-source.sh <ni-daqmx-sys-repo>
 ```
 
-The aggregate audit runs package-input, SDK-header, and FFI-source inventory
-scripts over configured local paths. Override the defaults with
-`NUMANAGER_DAQMX_PACKAGE_INPUTS`, `NUMANAGER_DAQMX_HEADER_ROOT`, and
-`NUMANAGER_DAQMX_SYS_REPO` when the bench host uses different paths. It records
-intake/source markers only; it does not load the NI-DAQmx runtime, create
-NI-DAQmx tasks, write outputs, read inputs, execute scans, establish
-redistribution permission, or provide hardware evidence.
+These record intake and source markers only; they do not load the NI-DAQmx
+runtime, create NI-DAQmx tasks, write outputs, read inputs, execute scans,
+establish redistribution permission, or provide hardware evidence.
 
 ## External Gates Audit
 

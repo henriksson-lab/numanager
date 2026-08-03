@@ -59,8 +59,6 @@ link the completed note from `imswitch-daqmx.md`, `evidence.md`, and
 
 | Artifact | Path or value |
 | --- | --- |
-| Evidence-input audit command | `scripts/audit-ni-daqmx-evidence-inputs.sh` |
-| Evidence-input audit output |  |
 | External-gates audit command | `scripts/audit-ni-daqmx-external-gates.sh` |
 | External-gates audit output |  |
 | Package input inventory command | `scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>` |
@@ -113,7 +111,6 @@ recorded revision updated before treating that exact source state as pinned.
 
 | Step | Command or action | Expected evidence | Result |
 | --- | --- | --- | --- |
-| Evidence-input audit | `scripts/audit-ni-daqmx-evidence-inputs.sh` | Package-input, installed-header, and FFI-source inventory markers for configured local paths; no runtime loading, task calls, I/O, redistribution, or hardware claims | Pass/Fail/Unknown |
 | External-gates audit | `scripts/audit-ni-daqmx-external-gates.sh` | Confirms license/legal review, installed package/header review, NI-PAL/device inventory, bench safety preconditions, runtime publication, and live task execution remain explicit external gates; no runtime loading, task calls, I/O, legal conclusion, safety approval, or hardware claims | Pass/Fail/Unknown |
 | Package input inventory | `scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>` | Installer/package file identity, byte counts, file types, and archive entries where applicable; no header/runtime/task claims | Pass/Fail/Unknown |
 | Header inventory | `scripts/audit-ni-daqmx-sdk-headers.sh <header-file-or-directory>` | Non-zero exit if `NIDAQmx.h` is absent; otherwise `NIDAQmx.h` count/path, header identity, digest, title/copyright banner, required symbols, runtime-version property/getter symbols, and literal package-version macro status; no runtime/task claims | Pass/Fail/Unknown |

@@ -202,6 +202,7 @@ pub fn continuous_line_signal_request(width: i64, chunk_size: u64) -> ScanSignal
     request
 }
 
+#[cfg(feature = "gui")]
 /// Continuous form of [`line_signal_request_channels`]: `lines = 0` asks the
 /// driver to keep scanning the line until the operation is cancelled, so a
 /// client can fill a framebuffer from the chunks as they arrive.
@@ -215,6 +216,7 @@ pub fn continuous_line_signal_request_channels(
     request
 }
 
+#[cfg(feature = "gui")]
 /// Continuous line scan that sweeps a whole raster: successive lines are
 /// successive rows of a `width` x `height` scan, so a client can rebuild the
 /// same image the capture and stream capabilities produce, row by row.
@@ -979,3 +981,438 @@ fn value_brief(value: &Value) -> String {
 fn pixel_count(value: i64) -> u32 {
     value.clamp(1, u32::MAX as i64) as u32
 }
+
+/// Scanning-instrument verification used by the software GUI's `--smoke`
+/// path, which is the only caller, so it follows the same feature gate.
+#[cfg(feature = "gui")]
+mod scanning_smoke {
+    use super::*;
+    use numanager_core::runtime::Subscription;
+    use numanager_core::{
+        Command, EventFilter, EventKind, FilterSelectRequest, Position, Ratio, StateSet, StateWrite,
+    };
+
+    /// Headless verification of the scanning workflows: shared-scene and detector
+    /// controls, then a snapshot, a live image and a line-signal stream, printing
+    /// the frame, chunk and progress metadata each one produced.
+    pub fn smoke(source: &str) -> Result<()> {
+        let (runtime, hub) = runtime_for_source(source)?;
+        let frame_events =
+            runtime.subscribe(EventFilter::device(&hub).with_kind(EventKind::FrameReady));
+        let signal_events =
+            runtime.subscribe(EventFilter::device(&hub).with_kind(EventKind::ScanSignalChunk));
+        let operation_events =
+            runtime.subscribe(EventFilter::device(&hub).with_kind(EventKind::OperationChanged));
+        let scene_controls =
+            apply_shared_scene_controls(&runtime, 180.0, -120.0, 4_252.0, 65.0, true)?;
+        let objective_control = apply_objective_control(&runtime, 3)?;
+        let detector_controls = apply_detector_controls(&runtime, &hub, 110.0, 90.0)?;
+
+        let snapshot = run_request(&runtime, &hub, snapshot_request(128, 128))?;
+        let snapshot_frame = drain_smoke_frames(&runtime, &frame_events)?;
+
+        let live_op = runtime.submit_request(&hub, live_image_request(128, 128))?;
+        let live = runtime.wait_completed(live_op.id, Duration::from_secs(5))?;
+        let live_progress = drain_operation_progress(&operation_events, live_op.id);
+        let live_frames = drain_smoke_frames(&runtime, &frame_events)?;
+
+        let line_op = runtime.submit_request(&hub, line_signal_request(256, 64))?;
+        let line = runtime.wait_completed(line_op.id, Duration::from_secs(5))?;
+        let line_progress = drain_operation_progress(&operation_events, line_op.id);
+        let chunks = drain_smoke_chunks(&signal_events);
+
+        println!("source: {source}");
+        println!("hub: {}", hub.label);
+        println!("source_summary: {}", source_summary(&hub));
+        if let Some(scene) = scene_controls {
+            println!("{scene}");
+        }
+        if let Some(objective) = objective_control {
+            println!("{objective}");
+        }
+        if let Some((gain, noise)) = detector_controls {
+            println!("detector_controls: gain={gain:.3}, noise={noise:.3}");
+        }
+        println!("snapshot: {}", result_text_with_plan(&snapshot));
+        println!("snapshot_frames: {}", snapshot_frame);
+        println!("live: {}", result_text_with_plan(&live));
+        println!("live_progress: {}", smoke_progress_text(live_progress));
+        println!("live_frames: {}", live_frames);
+        println!("line: {}", result_text_with_plan(&line));
+        println!("line_progress: {}", smoke_progress_text(line_progress));
+        println!("line_chunks: {chunks}");
+        Ok(())
+    }
+
+    fn apply_shared_scene_controls(
+        runtime: &LocalRuntime,
+        x_um: f64,
+        y_um: f64,
+        z_um: f64,
+        lamp_power_percent: f64,
+        lamp_enabled: bool,
+    ) -> Result<Option<String>> {
+        let xy = device_with_writable_properties(runtime, &["stage.xy"], &["x", "y"]);
+        let z = device_with_writable_properties(runtime, &["stage.z"], &["z"]);
+        let lamp =
+            device_with_writable_properties(runtime, &["light.source"], &["enabled", "power"]);
+        let (Some(xy), Some(z), Some(lamp)) = (xy, z, lamp) else {
+            return Ok(None);
+        };
+        let x_um = x_um.clamp(-1000.0, 1000.0);
+        let y_um = y_um.clamp(-1000.0, 1000.0);
+        let z_um = z_um.clamp(0.0, 8500.0);
+        let lamp_power_percent = lamp_power_percent.clamp(0.0, 100.0);
+        let state = StateSet::immediate("lsm gui shared simulator scene").with_writes([
+            StateWrite::new(
+                xy.id,
+                "x",
+                Value::Position(Position::from_micrometers(x_um)),
+            ),
+            StateWrite::new(
+                xy.id,
+                "y",
+                Value::Position(Position::from_micrometers(y_um)),
+            ),
+            StateWrite::new(z.id, "z", Value::Position(Position::from_micrometers(z_um))),
+            StateWrite::new(lamp.id, "enabled", Value::Bool(lamp_enabled)),
+            StateWrite::new(
+                lamp.id,
+                "power",
+                Value::Ratio(Ratio::from_percent(lamp_power_percent)),
+            ),
+        ]);
+        runtime.execute(state.into_command(), Duration::from_secs(1))?;
+        Ok(Some(format!(
+            "scene_controls: stage_um=({x_um:.3},{y_um:.3},{z_um:.3}), lamp_power={:.3}, lamp_enabled={lamp_enabled}",
+            lamp_power_percent / 100.0
+        )))
+    }
+
+    fn apply_objective_control(runtime: &LocalRuntime, position: i64) -> Result<Option<String>> {
+        let Some(turret) =
+            device_with_writable_properties(runtime, &["objective.turret"], &["position"])
+        else {
+            return Ok(None);
+        };
+        let position = position.clamp(1, 3);
+        let selects_by_capability = runtime
+            .capabilities(turret.id)?
+            .iter()
+            .any(|capability| capability.kind == CapabilityKind::FilterSelect);
+        if selects_by_capability {
+            runtime.execute_request(
+                turret.id,
+                FilterSelectRequest::position(position as u8),
+                Duration::from_secs(10),
+            )?;
+        } else {
+            runtime.execute(
+                Command::write_property(turret.id, "position", Value::I64(position)),
+                Duration::from_secs(10),
+            )?;
+        }
+        let magnification = runtime.execute(
+            Command::read_property(turret.id, "magnification"),
+            Duration::from_secs(1),
+        )?;
+        let numerical_aperture = runtime.execute(
+            Command::read_property(turret.id, "numerical_aperture"),
+            Duration::from_secs(1),
+        )?;
+        Ok(Some(format!(
+            "objective_control: position={position}, magnification={:.1}, numerical_aperture={:.2}",
+            f64_value(&magnification).unwrap_or_default(),
+            numerical_aperture_value(&numerical_aperture).unwrap_or_default()
+        )))
+    }
+
+    fn apply_detector_controls(
+        runtime: &LocalRuntime,
+        hub: &DeviceDescriptor,
+        gain_percent: f64,
+        noise_percent: f64,
+    ) -> Result<Option<(f64, f64)>> {
+        if !supports_writable_property(hub, "detector_gain")
+            || !supports_writable_property(hub, "detector_noise")
+        {
+            return Ok(None);
+        }
+        let gain = runtime.execute(
+            Command::write_property(
+                hub.id,
+                "detector_gain",
+                Value::Ratio(Ratio::from_percent(gain_percent)),
+            ),
+            Duration::from_secs(1),
+        )?;
+        let noise = runtime.execute(
+            Command::write_property(
+                hub.id,
+                "detector_noise",
+                Value::Ratio(Ratio::from_percent(noise_percent)),
+            ),
+            Duration::from_secs(1),
+        )?;
+        Ok(Some((
+            ratio_value(&gain).unwrap_or(gain_percent / 100.0),
+            ratio_value(&noise).unwrap_or(noise_percent / 100.0),
+        )))
+    }
+
+    fn supports_writable_property(hub: &DeviceDescriptor, key: &str) -> bool {
+        hub.properties
+            .iter()
+            .any(|property| property.key == key && property.writable)
+    }
+
+    fn device_with_writable_properties<'a>(
+        runtime: &'a LocalRuntime,
+        kinds: &[&str],
+        keys: &[&str],
+    ) -> Option<&'a DeviceDescriptor> {
+        runtime.devices().into_iter().find(|device| {
+            device.has_kinds(kinds)
+                && keys
+                    .iter()
+                    .all(|key| supports_writable_property(device, key))
+        })
+    }
+
+    fn ratio_value(value: &Value) -> Option<f64> {
+        match value {
+            Value::Ratio(value) => Some(value.fraction()),
+            _ => None,
+        }
+    }
+
+    fn f64_value(value: &Value) -> Option<f64> {
+        match value {
+            Value::F64(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn numerical_aperture_value(value: &Value) -> Option<f64> {
+        match value {
+            Value::NumericalAperture(value) => Some(value.value()),
+            _ => None,
+        }
+    }
+
+    fn drain_smoke_frames(runtime: &LocalRuntime, events: &Subscription) -> Result<String> {
+        let mut frames = 0u64;
+        let mut latest = None;
+        while let Some(event) = events.recv_timeout(Duration::from_millis(100)) {
+            if let Event::FrameReady(event) = event {
+                frames += 1;
+                latest = runtime.frame(event.handle)?;
+            }
+        }
+        Ok(match latest {
+            Some(frame) => {
+                let mut summary = format!(
+                    "observed={} latest={}x{} {}",
+                    frames, frame.width, frame.height, frame.pixel_format
+                );
+                if let Some(metadata) = frame_scan_metadata_summary(&frame) {
+                    summary.push_str(&format!(" metadata=[{metadata}]"));
+                }
+                if let Some(scene) = scene_metadata_summary(&frame.metadata) {
+                    summary.push_str(&format!(" scene=[{scene}]"));
+                }
+                summary
+            }
+            None => "observed=0".into(),
+        })
+    }
+
+    fn drain_smoke_chunks(events: &Subscription) -> String {
+        let mut chunks = 0u64;
+        let mut samples = 0u64;
+        let mut channels = 0usize;
+        let mut first = None;
+        while let Some(event) = events.recv_timeout(Duration::from_millis(100)) {
+            if let Event::ScanSignalChunk(event) = event {
+                if first.is_none() {
+                    first = Some(smoke_chunk_summary(&event));
+                }
+                chunks += 1;
+                samples += event.sample_count;
+                channels = event.channels.len();
+            }
+        }
+        let mut summary = format!("observed={chunks} samples={samples} channels={channels}");
+        if let Some(first) = first {
+            summary.push_str(&format!(" first=[{first}]"));
+        }
+        summary
+    }
+
+    fn smoke_progress_text(progress: Option<ProgressSummary>) -> String {
+        match progress {
+            Some(progress) if progress.total > 0.0 => format!(
+                "updates={} last={:.0}/{:.0}",
+                progress.updates, progress.completed, progress.total
+            ),
+            Some(progress) => format!(
+                "updates={} completed={:.0}",
+                progress.updates, progress.completed
+            ),
+            None => "none".into(),
+        }
+    }
+
+    fn smoke_chunk_summary(event: &numanager_core::ScanSignalChunkEvent) -> String {
+        signal_chunk_summary(event)
+    }
+
+    fn source_summary(hub: &DeviceDescriptor) -> String {
+        let mut parts = Vec::new();
+        if let Some(Value::Map(status)) = hub.metadata.get("backend_status") {
+            if let Some(execution) = map_string(status, "execution_status") {
+                parts.push(format!("backend={execution}"));
+            }
+            if let Some(ready) = map_bool(status, "live_task_execution_ready") {
+                parts.push(format!("live_ready={ready}"));
+            }
+            if let Some(requested) = map_bool(status, "live_task_execution_requested") {
+                parts.push(format!("live_requested={requested}"));
+            }
+            if let Some(blocker) = map_string(status, "live_task_execution_blocker") {
+                parts.push(format!("blocker={blocker}"));
+            }
+            if let Some(summary) = promotion_gate_statuses_summary(status) {
+                parts.push(format!("promotion_gate_statuses=[{summary}]"));
+            }
+        }
+        if let Some(roles) = physical_roles_summary(hub.metadata.get("lsm_role_channels")) {
+            parts.push(format!("roles=[{roles}]"));
+        }
+        if parts.is_empty() {
+            format!("source kinds: {}", hub.kinds.join(", "))
+        } else {
+            parts.join("; ")
+        }
+    }
+
+    fn physical_roles_summary(value: Option<&Value>) -> Option<String> {
+        let Some(Value::Map(roles)) = value else {
+            return None;
+        };
+        let mut parts = Vec::new();
+        for role in [
+            "x_galvo",
+            "y_galvo",
+            "laser_gate",
+            "detector",
+            "sample_clock",
+        ] {
+            let Some(Value::Map(channel)) = roles.get(role) else {
+                continue;
+            };
+            let physical = map_string(channel, "physical")?;
+            parts.push(format!("{role}={physical}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(","))
+    }
+
+    fn promotion_gate_statuses_summary(status: &BTreeMap<String, Value>) -> Option<String> {
+        let Some(Value::Map(statuses)) = status.get("external_promotion_gate_statuses") else {
+            return None;
+        };
+        let mut counts = BTreeMap::<String, usize>::new();
+        for status in statuses.values() {
+            let Value::Map(status) = status else {
+                continue;
+            };
+            if let Some(status) = map_string(status, "status") {
+                *counts.entry(status).or_default() += 1;
+            }
+        }
+        (!counts.is_empty()).then(|| {
+            counts
+                .into_iter()
+                .map(|(status, count)| format!("{status}={count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    }
+
+    fn map_string(map: &BTreeMap<String, Value>, key: &str) -> Option<String> {
+        match map.get(key) {
+            Some(Value::String(value)) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    fn map_bool(map: &BTreeMap<String, Value>, key: &str) -> Option<bool> {
+        match map.get(key) {
+            Some(Value::Bool(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn result_text(value: &Value) -> String {
+        api_result(value)
+    }
+
+    fn result_text_with_plan(value: &Value) -> String {
+        let mut text = result_text(value);
+        if let Some(plan) = daqmx_task_plan_summary(value) {
+            text.push_str(" | ");
+            text.push_str(&plan);
+        }
+        text
+    }
+
+    fn signal_chunk_summary(event: &numanager_core::ScanSignalChunkEvent) -> String {
+        let channels = if event.channels.is_empty() {
+            "none".into()
+        } else {
+            event.channels.join("+")
+        };
+        let dropped_chunks = i64_metadata(&event.metadata, "dropped_chunks").unwrap_or(0);
+        let dropped_samples = i64_metadata(&event.metadata, "dropped_samples").unwrap_or(0);
+        let overflowed = bool_metadata(&event.metadata, "overflowed").unwrap_or(false);
+        let detector_gain = ratio_metadata(&event.metadata, "detector_gain").unwrap_or(1.0);
+        let detector_noise = ratio_metadata(&event.metadata, "detector_noise").unwrap_or(1.0);
+        let mut summary = format!(
+            "channels={channels}, line={}, chunk={}, first_sample={}, sample_rate_hz={:.0}, sample_period_s={:.9}, detector_gain={detector_gain:.3}, detector_noise={detector_noise:.3}, dropped_chunks={dropped_chunks}, dropped_samples={dropped_samples}, overflowed={overflowed}",
+            event.line,
+            event.chunk,
+            event.first_sample,
+            event.sample_rate.hertz(),
+            event.sample_period.seconds(),
+        );
+        if let Some(scene) = scene_metadata_summary(&event.metadata) {
+            summary.push_str(&format!(", scene=[{scene}]"));
+        }
+        summary
+    }
+
+    fn bool_metadata(metadata: &BTreeMap<String, Value>, key: &str) -> Option<bool> {
+        match metadata.get(key) {
+            Some(Value::Bool(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn i64_metadata(metadata: &BTreeMap<String, Value>, key: &str) -> Option<i64> {
+        match metadata.get(key) {
+            Some(Value::I64(value)) => Some(*value),
+            Some(Value::PixelCount(value)) => Some(i64::from(value.0)),
+            _ => None,
+        }
+    }
+
+    fn ratio_metadata(metadata: &BTreeMap<String, Value>, key: &str) -> Option<f64> {
+        match metadata.get(key) {
+            Some(Value::Ratio(value)) => Some(value.fraction()),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "gui")]
+pub use scanning_smoke::smoke;

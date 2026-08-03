@@ -78,7 +78,7 @@ require_line "$composed" 'confocal capture scene: stage_um=(320.000,-180.000,425
 require_line "$composed" 'scan signal scene: stage_um=(320.000,-180.000,4252.000)' 'composed signal scene metadata'
 require_line "$composed" 'detector_gain=1.250, detector_noise=0.800' 'composed detector gain/noise metadata'
 
-gui=$(run_gui_example lsm_gui_smoke lsm_gui sim-lsm --smoke)
+gui=$(run_gui_example lsm_gui_smoke software_gui sim-lsm --smoke)
 require_line "$gui" 'source_summary: source kinds: hub, lsm, camera, simulator' 'GUI source metadata'
 require_line "$gui" 'detector_controls: gain=1.100, noise=0.900' 'GUI detector gain/noise public property write/readback'
 require_line "$gui" 'snapshot_frames: observed=1 latest=128x128 Mono16' 'GUI snapshot frame'
@@ -87,7 +87,7 @@ require_line "$gui" 'live_progress: updates=4 last=4/4' 'GUI live progress'
 require_line "$gui" 'line_chunks: observed=4 samples=256 channels=2' 'GUI line chunk summary'
 require_line "$gui" 'first=[channels=counter0+ai0, line=0, chunk=0, first_sample=0, sample_rate_hz=100000, sample_period_s=0.000010000, detector_gain=1.100, detector_noise=0.900, dropped_chunks=0, dropped_samples=0, overflowed=false' 'GUI first chunk timing/drop metadata'
 
-gui_composed=$(run_gui_example lsm_gui_composed_smoke lsm_gui sim-composed --smoke)
+gui_composed=$(run_gui_example lsm_gui_composed_smoke software_gui sim-composed --smoke)
 require_line "$gui_composed" 'source: sim-composed' 'composed GUI smoke source'
 require_line "$gui_composed" 'scene_controls: stage_um=(180.000,-120.000,4252.000), lamp_power=0.650, lamp_enabled=true' 'composed GUI shared scene public state write'
 require_line "$gui_composed" 'objective_control: position=3, magnification=60.0, numerical_aperture=0.90' 'composed GUI objective public capability selection'

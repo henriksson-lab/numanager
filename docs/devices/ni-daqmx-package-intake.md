@@ -9,7 +9,7 @@ hardware completion semantics.
 
 | Item | Value |
 | --- | --- |
-| Intake directory | `/home/mahogny/github/claude/reveng-dll/nidaq/` |
+| Intake directory | `$NUMANAGER_DAQMX_PACKAGE_INPUTS` — user-provided; the package is never vendored in this repo |
 | Linux driver archive | `NILinux2026Q3DeviceDrivers.zip` |
 | Linux archive SHA-256 | `89c4a38fe6019e0791597646d060d66b492dd64cfd3fa3a1f6ff9eb5b8806296` |
 | Linux archive bytes | 460773 |
@@ -20,7 +20,7 @@ hardware completion semantics.
 
 ## Linux Archive Contents
 
-`unzip -l /home/mahogny/github/claude/reveng-dll/nidaq/NILinux2026Q3DeviceDrivers.zip`
+`unzip -l "$NUMANAGER_DAQMX_PACKAGE_INPUTS"/NILinux2026Q3DeviceDrivers.zip`
 reported these package entries:
 
 | Bytes | Package |
@@ -174,10 +174,10 @@ Do not infer Windows ABI compatibility from the Linux-generated bindings.
 ## Commands Used
 
 ```sh
-scripts/audit-ni-daqmx-package-inputs.sh /home/mahogny/github/claude/reveng-dll/nidaq
-sha256sum /home/mahogny/github/claude/reveng-dll/nidaq/NILinux2026Q3DeviceDrivers.zip /home/mahogny/github/claude/reveng-dll/nidaq/ni-daqmx_26.5_online.exe
-file /home/mahogny/github/claude/reveng-dll/nidaq/NILinux2026Q3DeviceDrivers.zip /home/mahogny/github/claude/reveng-dll/nidaq/ni-daqmx_26.5_online.exe
-unzip -l /home/mahogny/github/claude/reveng-dll/nidaq/NILinux2026Q3DeviceDrivers.zip
+scripts/audit-ni-daqmx-package-inputs.sh "$NUMANAGER_DAQMX_PACKAGE_INPUTS"
+sha256sum "$NUMANAGER_DAQMX_PACKAGE_INPUTS"/NILinux2026Q3DeviceDrivers.zip "$NUMANAGER_DAQMX_PACKAGE_INPUTS"/ni-daqmx_26.5_online.exe
+file "$NUMANAGER_DAQMX_PACKAGE_INPUTS"/NILinux2026Q3DeviceDrivers.zip "$NUMANAGER_DAQMX_PACKAGE_INPUTS"/ni-daqmx_26.5_online.exe
+unzip -l "$NUMANAGER_DAQMX_PACKAGE_INPUTS"/NILinux2026Q3DeviceDrivers.zip
 ```
 
 The audit script is the preferred repeatable intake command for installer files
@@ -202,16 +202,16 @@ hardware validation.
   `scripts/audit-ni-daqmx-sdk-headers.sh <installed-header-path-or-directory>`,
   regenerate the `ni-daqmx-sys` fork with its bindgen script for the target
   platform, push the fork, and then run
-  `scripts/audit-ni-daqmx-sys-source.sh /home/mahogny/github/claude/ni-daqmx-sys`
+  `scripts/audit-ni-daqmx-sys-source.sh "$NUMANAGER_DAQMX_SYS_REPO"`
   before updating numanager's git dependency revision. The scripts prefer an
   installed `bindgen` CLI and can fall back to the fork-local Cargo generator
   when the CLI is not installed.
 - Re-run
-  `scripts/audit-ni-daqmx-package-inputs.sh /home/mahogny/github/claude/reveng-dll/nidaq`
+  `scripts/audit-ni-daqmx-package-inputs.sh "$NUMANAGER_DAQMX_PACKAGE_INPUTS"`
   whenever package files are added, removed, or replaced, then update this note
   with the new package identities.
 - Re-run
-  `scripts/audit-ni-daqmx-sys-source.sh /home/mahogny/github/claude/ni-daqmx-sys`
+  `scripts/audit-ni-daqmx-sys-source.sh "$NUMANAGER_DAQMX_SYS_REPO"`
   after any bindgen regeneration and update
   [`ni-daqmx-sdk-api-audit.md`](ni-daqmx-sdk-api-audit.md) with the new fork
   revision and generated source hashes.

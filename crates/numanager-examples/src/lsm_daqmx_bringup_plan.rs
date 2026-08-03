@@ -41,7 +41,6 @@ pub fn run() -> numanager_core::Result<()> {
     }
 
     println!("bench_evidence_commands:");
-    println!("scripts/audit-ni-daqmx-evidence-inputs.sh");
     println!("scripts/audit-ni-daqmx-external-gates.sh");
     println!("scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>");
     println!("scripts/audit-ni-daqmx-sdk-headers.sh <header-file-or-directory>");

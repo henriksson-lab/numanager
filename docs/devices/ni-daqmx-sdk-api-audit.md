@@ -22,7 +22,7 @@ buffer behavior, or hardware completion semantics are correct on a real device.
 | Header copyright line | `/*    Copyright (c) National Instruments 2003-2026.  All Rights Reserved.     */` |
 | Literal package-version macro in header | none found by `scripts/audit-ni-daqmx-sdk-headers.sh` |
 | FFI source | `https://github.com/mahogny/ni-daqmx-sys` fork regenerated from the Linux header with bindgen scripts |
-| FFI source path | Git dependency `https://github.com/mahogny/ni-daqmx-sys`; audited local checkout `/home/mahogny/github/claude/ni-daqmx-sys` |
+| FFI source path | Git dependency `https://github.com/mahogny/ni-daqmx-sys`; audited from a local checkout of that repository given by `$NUMANAGER_DAQMX_SYS_REPO` |
 | FFI package version | `26.3.1` |
 | FFI package edition | `2024` |
 | FFI package license | `MIT` |
@@ -70,20 +70,10 @@ been committed. Commit the fork change and update this revision/status row when
 the `numanager-imswitch-daqmx` dependency or feature behavior is pinned to that
 source state.
 
-Reproduce the aggregate local evidence-input and FFI source inventories with:
+Reproduce the FFI source inventory with:
 
 ```sh
-scripts/audit-ni-daqmx-evidence-inputs.sh
-```
-
-That aggregate audit runs the package-input, installed-header, and FFI-source
-inventory scripts against configured local paths and checks stable markers
-without loading the runtime or making task/hardware claims. Override
-`NUMANAGER_DAQMX_PACKAGE_INPUTS`, `NUMANAGER_DAQMX_HEADER_ROOT`, and
-`NUMANAGER_DAQMX_SYS_REPO` when the inputs or fork checkout live elsewhere.
-
-```sh
-scripts/audit-ni-daqmx-sys-source.sh /home/mahogny/github/claude/ni-daqmx-sys
+scripts/audit-ni-daqmx-sys-source.sh <ni-daqmx-sys-repo>
 ```
 
 That audit now checks the source revision, worktree cleanliness, package

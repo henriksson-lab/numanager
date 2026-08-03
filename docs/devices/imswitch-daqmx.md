@@ -58,7 +58,7 @@
 | `cargo run -p numanager-examples -- lsm_signal_stream` | Public `ScanSignalStreamRequest` for one line of raw counter/analog samples |
 | `cargo run -p numanager-examples -- lsm_daqmx_bringup_plan` | Public LSM requests plus role-matched DAQmx helper commands for bench validation |
 | `cargo run -p numanager-examples -- lsm_daqmx_validation_note` | Markdown bench-validation scaffold generated from public non-live task plans, including command-output rows for bench artifacts |
-| `cargo run -p numanager-examples --features gui -- lsm_gui imswitch` | Snapshot/line-scan GUI against the configured descriptor, with backend readiness and role-channel display |
+| `cargo run -p numanager-examples --features gui -- software_gui imswitch` | Snapshot/line-scan GUI against the configured descriptor, with backend readiness and role-channel display |
 | `cargo run -p numanager-examples --features ni-daqmx-sdk -- daqmx_runtime_probe` | Public configured discovery with `connect=true`; verifies vendor-runtime linkage and reports `backend_status` |
 
 ## Config
@@ -99,17 +99,6 @@
 
 Inventory the user-provided NI-DAQmx installer or package inputs before
 recording runtime/header evidence:
-
-```sh
-scripts/audit-ni-daqmx-evidence-inputs.sh
-```
-
-This aggregate audit checks local package-input, installed-header, and
-`ni-daqmx-sys` FFI-source inventory markers for the configured paths. Override
-`NUMANAGER_DAQMX_PACKAGE_INPUTS`, `NUMANAGER_DAQMX_HEADER_ROOT`, and
-`NUMANAGER_DAQMX_SYS_REPO` when the bench host differs from the default local
-paths. It does not load the NI runtime, create tasks, touch I/O, establish
-redistribution permission, or provide hardware evidence.
 
 ```sh
 scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>
@@ -314,7 +303,7 @@ The `lsm_daqmx_validation_note` example expands `external_promotion_gates` into 
 so bench notes can track the required legal, installed header, NI-PAL,
 bench-safety, task-behavior, runtime-publication, and hardware-note inputs
 without inferring them from the compact backend-status list.
-The `lsm_gui imswitch` source summary also displays the compact
+The `software_gui imswitch` source summary also displays the compact
 `promotion_gate_statuses=[pending=9]` count from the same backend metadata.
 `bringup_helpers_compiled` reports whether the inventory, task-lifecycle,
 channel-setup, plan-setup, and I/O smoke helper binaries are available in the

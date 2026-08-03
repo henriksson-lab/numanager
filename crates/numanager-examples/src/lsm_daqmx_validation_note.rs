@@ -605,11 +605,6 @@ fn print_required_artifacts() {
     println!("| --- | --- |");
     for (artifact, value) in [
         (
-            "Evidence-input audit command",
-            "`scripts/audit-ni-daqmx-evidence-inputs.sh`",
-        ),
-        ("Evidence-input audit output", ""),
-        (
             "External-gates audit command",
             "`scripts/audit-ni-daqmx-external-gates.sh`",
         ),
@@ -901,7 +896,6 @@ fn print_lsm_task_execution_gate() {
 fn required_commands(capture: &Value, signal: &Value) -> Vec<String> {
     let lsm_env_prefix = crate::lsm_daqmx_commands::daqmx_lsm_env_prefix();
     let mut commands = vec![
-        "scripts/audit-ni-daqmx-evidence-inputs.sh".into(),
         "scripts/audit-ni-daqmx-external-gates.sh".into(),
         "scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>".into(),
         "scripts/audit-ni-daqmx-sdk-headers.sh <header-file-or-directory>".into(),

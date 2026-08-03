@@ -7,7 +7,7 @@ microscopy APIs:
 - `ConfocalImageStream`
 - `ScanSignalStream`
 
-The immediate examples and `lsm_gui` exercise these public APIs, but the current
+The immediate examples and `software_gui` exercise these public APIs, but the current
 ImSwitch DAQmx crate returns configured API summaries only. The long-term goal is
 to move from GUI-local preview graphics to runtime-produced simulated data, then
 to a validated optional NI-DAQmx backend.
@@ -114,7 +114,7 @@ metadata should include:
 - first sample index
 - timestamps or timing origin
 
-## 6. Refactor `lsm_gui` To Consume Runtime Data
+## 6. Refactor `software_gui` To Consume Runtime Data
 
 The GUI should remain a public runtime client:
 
@@ -213,9 +213,9 @@ Current SDK/runtime intake notes:
   instead of inferred from the header alone. The header audit exits non-zero if
   `NIDAQmx.h` is absent from the supplied file/directory.
 - The `ni-daqmx-sys` fork at `https://github.com/mahogny/ni-daqmx-sys` is the
-  numanager dependency; the local checkout at
-  `/home/mahogny/github/claude/ni-daqmx-sys` has been regenerated with the
-  bindgen scripts from the Linux header and compiles/tests on Linux. The scripts
+  numanager dependency; a checkout of it, given by `$NUMANAGER_DAQMX_SYS_REPO`,
+  has been regenerated with the bindgen scripts from the Linux header and
+  compiles/tests on Linux. The scripts
   prefer an installed bindgen CLI and fall back to the fork-local Cargo
   generator when the CLI is not installed. The source
   audit records package metadata, bindgen dependency/version, generated-source
@@ -286,7 +286,7 @@ Current SDK/runtime intake notes:
   driver still does not expose live task execution until a safe
   isolation/readiness strategy is validated.
 - Latest installer inputs found in
-  `/home/mahogny/github/claude/reveng-dll/nidaq/` are
+  `$NUMANAGER_DAQMX_PACKAGE_INPUTS/` are
   `NILinux2026Q3DeviceDrivers.zip` and `ni-daqmx_26.5_online.exe`; file
   identities and archive contents are recorded in
   `docs/devices/ni-daqmx-package-intake.md` using
@@ -473,10 +473,10 @@ Current SDK/runtime intake notes:
   dropping that positive case; the current 26.5 online-installer payload still
   reports no standalone license, EULA, or copyright files at the inspected
   first-level payload.
-- `scripts/audit-ni-daqmx-evidence-inputs.sh` now runs package-input,
-  installed-header, and FFI-source inventory scripts over configured local
-  paths and checks stable markers without loading the NI runtime or making
-  task, I/O, scan, redistribution, or hardware claims.
+- The package-input, installed-header, and FFI-source inventory scripts are run
+  individually against explicit paths and record intake or source identity
+  without loading the NI runtime or making task, I/O, scan, redistribution, or
+  hardware claims.
 - `scripts/audit-ni-daqmx-external-gates.sh` now checks that legal review,
   installed Windows package/license review, installed Linux/Windows 26.5 header
   audit, NI-PAL/device inventory, bench safety preconditions, runtime
@@ -560,12 +560,11 @@ Current SDK/runtime intake notes:
   `promotion_gate_statuses=[pending=9]` output from the public backend-status
   property, so bench logs capture the current live-task gate state before helper
   commands.
-- `scripts/audit-lsm-daqmx-plan-nonhardware.sh` now aggregates the simulator
-  workflow audit, repository reverse-evidence boundary audit, and DAQmx
-  non-hardware evidence-input, external-gates, target-scope, helper,
-  plan-validation, live-gate, runtime-probe, and docs-sync audits. It is the
-  current plan-level implementation gate for non-hardware work and still leaves
-  live NI-DAQmx task execution behind bench validation.
+- The non-hardware gate is the set of audits run individually: the simulator
+  workflow audit, the repository reverse-evidence boundary audit, and the DAQmx
+  external-gates, target-scope, helper, plan-validation, live-gate,
+  runtime-probe, and docs-sync audits. They leave live NI-DAQmx task execution
+  behind bench validation.
 - The DAQmx validation note also prefixes its generated `lsm_daqmx_bringup_plan`
   command with the current LSM mapping, route, signal-channel, timeout,
   helper-timeout, and live-task-intent variables so the public task-plan command
@@ -668,7 +667,7 @@ simulator.
 3. Add fluorescence/confocal sampling helpers.
 4. Add `sim_lsm` with `ConfocalImageCapture`.
 5. Add synthetic `ScanSignalStream` chunk output.
-6. Refactor `lsm_gui` to consume runtime output.
+6. Refactor `software_gui` to consume runtime output.
 7. Add combined camera+LSM simulator over one specimen.
 8. Validate GUI workflows against simulator output.
 9. Document simulator workflows and recorded example outputs.
@@ -684,22 +683,22 @@ simulator.
 | 3. Confocal sampling | Done | `crates/numanager-drivers/src/sim_lsm_model.rs` renders confocal raster frames and line profiles from the shared specimen, including separate cytoplasm/nucleus/background contributions, named synthetic detector responses, Gaussian excitation PSF, pinhole-style axial rejection for confocal contrast, deterministic low-count Poisson photon sampling, high-count shot-noise approximation, read noise, saturation, clipping, and public `detector_gain` / `detector_noise` simulator properties |
 | 4. `sim_lsm` driver | Done for the three public LSM APIs | `crates/numanager-drivers/src/sim_lsm.rs` exposes `ConfocalImageCapture`, `ConfocalImageStream`, and `ScanSignalStream` |
 | 5. Runtime output shape | Done for current core events | Capture/stream use `FrameReady` with simulated `Mono16` confocal frames by default and optional `Mono8` reconstruction, honor requested reconstruction dimensions for frame payloads while preserving scan dimensions and reconstructed pixel size in metadata, include typed scan/reconstruction/timing metadata, detector gain/noise metadata, horizontal-strip dirty-region metadata over full-frame payloads, and stream progress through `OperationChanged`; signal completion maps include channel names and counts; signal chunks use first-class `ScanSignalChunk` events with stream id, channels, timing origin, line/chunk/sample indices, chunk size, sample rate, sample period, per-channel simulated sample data, metadata, and operation progress; chunk metadata also repeats channels, line, chunk index, first sample, timing origin, typed scene/scan fields including detectors, laser-gate state, detector gain/noise, and simulated `dropped_chunks`, `dropped_samples`, and `overflowed` fields for clients that consume metadata maps; simulator `ScanSignalStream` supports a continuous mode via `lines <= 0` and public runtime cancellation, with the public cancellation example reporting first-chunk timing/drop/scene metadata before cancellation |
-| 6. `lsm_gui` runtime consumption | Done for simulator and configured DAQmx descriptor sources | `lsm_gui` submits public runtime requests with typed width, height, sample-rate, line-dwell, detector, laser-gate, chunk-size, and overwrite controls; has source selection for `sim-lsm`, `sim-composed`, and configured `imswitch`; writes public simulator `detector_gain` and `detector_noise` properties when the selected source exposes them; writes composed-simulator XY/Z/lamp state through public `StateSet` APIs and selects the objective through public `FilterSelect` or property APIs when those devices are present; displays public source metadata including DAQmx backend readiness, live-execution blocker, and resolved role channels; uses public submit/cancel for continuous simulator live streams; converts runtime `Mono8`/`Mono16` frames, `ScanSignalChunk` events, and `OperationChanged` progress into preview images, line plots, and progress readouts; interactive frame and line summaries include public scan, scene, dirty-region, and first-chunk metadata; and its smoke paths record detector gain/noise write/readback, composed shared-scene/objective write/readback, latest frame metadata summaries, and first chunk timing/channel metadata consumed for snapshot/live/line views |
+| 6. `software_gui` runtime consumption | Done for simulator and configured DAQmx descriptor sources | `software_gui` submits public runtime requests with typed width, height, sample-rate, line-dwell, detector, laser-gate, chunk-size, and overwrite controls; has source selection for `sim-lsm`, `sim-composed`, and configured `imswitch`; writes public simulator `detector_gain` and `detector_noise` properties when the selected source exposes them; writes composed-simulator XY/Z/lamp state through public `StateSet` APIs and selects the objective through public `FilterSelect` or property APIs when those devices are present; displays public source metadata including DAQmx backend readiness, live-execution blocker, and resolved role channels; uses public submit/cancel for continuous simulator live streams; converts runtime `Mono8`/`Mono16` frames, `ScanSignalChunk` events, and `OperationChanged` progress into preview images, line plots, and progress readouts; interactive frame and line summaries include public scan, scene, dirty-region, and first-chunk metadata; and its smoke paths record detector gain/noise write/readback, composed shared-scene/objective write/readback, latest frame metadata summaries, and first chunk timing/channel metadata consumed for snapshot/live/line views |
 | 7. Shared camera+LSM simulator | Done for one composed driver | `crates/numanager-drivers/src/sim_microscope_lsm.rs` exposes brightfield camera, XY/Z stages, objective, lamp, and LSM APIs in one driver lane, with the LSM simulator constructed from the microscope sample configuration |
-| 8. Stage/focus/optics integration | Done for simulator path | Composed LSM requests inherit stage position, focus, sample pixel size, lamp power, lamp enabled state as the simulated laser gate, magnification, and numerical aperture; confocal capture frame metadata, confocal stream frame metadata, and `ScanSignalChunk` metadata all expose the inherited scene values plus detector gain/noise values; standalone and composed LSM requests honor typed sample-rate, line-dwell-derived timing, laser-gate, and detector-list fields, while public `detector_gain` and `detector_noise` hub properties control simulator gain/noise; `lsm_gui sim-composed --smoke` now writes shared XY/Z/lamp state, selects the 60x/0.90 NA objective through public APIs, and verifies those values in LSM frame/chunk scene metadata; NA/magnification tune the LSM PSF and collection gain; `lsm_gui --smoke` and `scripts/audit-lsm-simulator-workflows.sh` validate snapshot, live-image, line-signal, cancellation, timing, and composed-state workflows against simulator runtime output without opening a window |
-| 9. Simulator workflow docs | Done for current simulator workflows | `sim-microscope`, `sim-lsm`, `sim-microscope-lsm`, run examples, recorded outputs, and `scripts/audit-lsm-simulator-workflows.sh` cover current simulator paths, including `Mono8` resized capture, resized confocal stream dirty-region output, cancellation with first-chunk timing/drop/scene metadata, line-dwell timing, composed camera+LSM state sharing, `lsm_gui sim-lsm --smoke`, and `lsm_gui sim-composed --smoke`; NI-DAQmx hardware workflow docs remain tied to backend validation |
+| 8. Stage/focus/optics integration | Done for simulator path | Composed LSM requests inherit stage position, focus, sample pixel size, lamp power, lamp enabled state as the simulated laser gate, magnification, and numerical aperture; confocal capture frame metadata, confocal stream frame metadata, and `ScanSignalChunk` metadata all expose the inherited scene values plus detector gain/noise values; standalone and composed LSM requests honor typed sample-rate, line-dwell-derived timing, laser-gate, and detector-list fields, while public `detector_gain` and `detector_noise` hub properties control simulator gain/noise; `software_gui sim-composed --smoke` now writes shared XY/Z/lamp state, selects the 60x/0.90 NA objective through public APIs, and verifies those values in LSM frame/chunk scene metadata; NA/magnification tune the LSM PSF and collection gain; `software_gui --smoke` and `scripts/audit-lsm-simulator-workflows.sh` validate snapshot, live-image, line-signal, cancellation, timing, and composed-state workflows against simulator runtime output without opening a window |
+| 9. Simulator workflow docs | Done for current simulator workflows | `sim-microscope`, `sim-lsm`, `sim-microscope-lsm`, run examples, recorded outputs, and `scripts/audit-lsm-simulator-workflows.sh` cover current simulator paths, including `Mono8` resized capture, resized confocal stream dirty-region output, cancellation with first-chunk timing/drop/scene metadata, line-dwell timing, composed camera+LSM state sharing, `software_gui sim-lsm --smoke`, and `software_gui sim-composed --smoke`; NI-DAQmx hardware workflow docs remain tied to backend validation |
 | 10. Optional NI-DAQmx backend | No-hardware backend scaffold implemented; task execution awaiting hardware validation | Runtime probing with configured-vs-detected version comparison blockers, Linux/Windows target scoping, package/header/FFI audits, configured task planning with derived counter-output sample-clock routes, structured runtime-sequence/completion/execution-contract/live-executor/reconstruction/publication/cancel plan metadata, per-task timing, finite preflight runtime sequence/completion/live-executor/reconstruction/publication rows, raster/signal timing, and AO/DO waveform preview rows, helper binaries, dry-run/preflight/simulated-cleanup paths including plan-setup partial-failure cleanup rehearsal, I/O smoke safe-final-state planning, invalid numeric/range/transfer/raster/signal guards, bring-up examples, validation-note scaffold, task-plan live-readiness metadata, structured external-promotion-gate metadata including bench safety preconditions, live-gate metadata, GUI readiness display, split runtime-publication evidence rows for capture, live-image streaming, and signal streaming, and bench checklist are implemented. Live task execution and LSM scans remain configured/API summaries until legal review, installed Windows package/header review, installed 26.5 header audits, confirmed runtime-version match when a version is configured, NI-PAL/device inventory, bench safety preconditions, task ordering, routing, reconstruction, completion, cleanup, per-API runtime publication, and hardware validation notes are recorded. |
 
 Current non-hardware plan gate:
 
-- `scripts/audit-lsm-daqmx-plan-nonhardware.sh` is the aggregate status check
-  for milestones 1-10 before real DAQmx task execution. It runs the LSM
-  simulator workflow audit, repository reverse-evidence boundary audit,
-  NI-DAQmx evidence-input audit, external-gates audit, target-scope audit,
-  no-hardware helper audit, plan-validation audit, live-gate audit,
-  runtime-probe audit, and DAQmx example-output sync audit.
-- Passing this aggregate audit means the simulator/API/documentation and
-  no-hardware DAQmx gates are aligned. It does not complete legal review,
+- The status check for milestones 1-10 before real DAQmx task execution is the
+  LSM simulator workflow audit, repository reverse-evidence boundary audit,
+  external-gates audit, target-scope audit, no-hardware helper audit,
+  plan-validation audit, live-gate audit, runtime-probe audit, and DAQmx
+  example-output sync audit, each run on its own. The helper and runtime-probe
+  audits require a Linux or Windows target.
+- Passing them all means the simulator/API/documentation and no-hardware DAQmx
+  gates are aligned. It does not complete legal review,
   installed Windows package/header review, NI-PAL readiness, device inventory,
   bench safety approval, live task execution, or hardware validation.
 

@@ -61,7 +61,7 @@ require_line "$signal" 'execution=not_live_task_execution' 'signal non-live exec
 require_line "$signal" 'result=raw_signal_stream_pending' 'signal pending result'
 require_absent "$signal" 'chunks: observed=' 'signal hardware chunk count'
 
-gui=$(run_live_request lsm_gui cargo run -p numanager-examples --features gui -- lsm_gui imswitch --smoke)
+gui=$(run_live_request lsm_gui cargo run -p numanager-examples --features gui -- software_gui imswitch --smoke)
 require_line "$gui" 'source_summary: backend=not_live_backend; live_ready=false; live_requested=true;' 'GUI live gate summary'
 require_line "$gui" 'promotion_gate_statuses=[pending=9]' 'GUI promotion gate status summary'
 require_line "$gui" 'snapshot_frames: observed=0' 'GUI no snapshot frames'

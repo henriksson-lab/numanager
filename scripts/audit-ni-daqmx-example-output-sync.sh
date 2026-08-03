@@ -39,7 +39,6 @@ do
 done
 
 for command in \
-  'scripts/audit-ni-daqmx-evidence-inputs.sh' \
   'scripts/audit-ni-daqmx-external-gates.sh' \
   'scripts/audit-ni-daqmx-target-scope.sh' \
   'scripts/audit-ni-daqmx-no-hardware-helpers.sh' \

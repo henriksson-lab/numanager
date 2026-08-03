@@ -18,8 +18,6 @@ documentation and hardware validation notes, not in user examples.
 | LSM line-dwell timing | `cargo run -p numanager-examples -- lsm_line_dwell_timing` ([output](example_outputs.md#lsm-line-dwell-timing)) |
 | LSM signal stream cancellation | `cargo run -p numanager-examples -- lsm_signal_cancel [sim-lsm\|sim-composed]` ([output](example_outputs.md#lsm-signal-stream-cancellation)) |
 | LSM simulator workflow audit | `scripts/audit-lsm-simulator-workflows.sh` ([output](example_outputs.md#lsm-simulator-workflow-audit)) |
-| LSM/DAQmx plan non-hardware audit | `scripts/audit-lsm-daqmx-plan-nonhardware.sh` ([output](example_outputs.md#lsmdaqmx-plan-non-hardware-audit)) |
-| NI-DAQmx evidence-input audit | `scripts/audit-ni-daqmx-evidence-inputs.sh` ([output](example_outputs.md#ni-daqmx-evidence-input-audit)) |
 | NI-DAQmx external-gates audit | `scripts/audit-ni-daqmx-external-gates.sh` ([output](example_outputs.md#ni-daqmx-external-gates-audit)) |
 | NI-DAQmx target-scope audit | `scripts/audit-ni-daqmx-target-scope.sh` ([output](example_outputs.md#ni-daqmx-target-scope-audit)) |
 | NI-DAQmx no-hardware helper audit | `scripts/audit-ni-daqmx-no-hardware-helpers.sh` ([output](example_outputs.md#ni-daqmx-no-hardware-helper-audit)) |
@@ -72,10 +70,11 @@ The FFI-source audit output is recorded in
 [`example_outputs.md`](example_outputs.md#ni-daqmx-ffi-source-inventory) as a
 source-boundary inventory only; it must stay separate from runtime or hardware
 behavior evidence.
-`scripts/audit-ni-daqmx-evidence-inputs.sh` runs the package-input,
-SDK-header, and FFI-source inventory scripts against the configured local paths
-and checks stable intake/source markers without loading the NI runtime or
-claiming task behavior.
+The package-input, SDK-header, and FFI-source inventory scripts are run
+individually against explicit paths — `scripts/audit-ni-daqmx-package-inputs.sh`,
+`scripts/audit-ni-daqmx-sdk-headers.sh`, and
+`scripts/audit-ni-daqmx-sys-source.sh` — each of which records intake or source
+identity without loading the NI runtime or claiming task behavior.
 `scripts/audit-ni-daqmx-external-gates.sh` checks that license/legal review,
 installed 26.5 header audit, NI-PAL/device inventory, bench safety
 preconditions, runtime publication, and live task execution remain explicit
@@ -159,8 +158,8 @@ so custom bench channel maps are preserved in the generated note. The note also
 prefixes its generated
 `lsm_daqmx_bringup_plan` command with the currently set LSM mapping, route,
 signal-channel, timeout, helper-timeout, and live-task-intent variables.
-`lsm_gui imswitch --smoke` prints the same plan-aware result summaries that the
-interactive GUI displays after snapshot, live, and line requests.
+`software_gui imswitch --smoke` prints the same plan-aware result summaries that
+the interactive GUI displays after snapshot, live, and line requests.
 Simulator LSM signal examples print a first-chunk sample preview; analog-style
 `ai*` detector labels are reported as voltage values, while counter-style labels
 remain integer counts.
@@ -169,11 +168,17 @@ smoke set through public runtime examples, including capture, resized `Mono8`
 capture, live-image streaming, raw signal chunks, line-dwell timing,
 cancellation, composed simulator state sharing, and GUI smoke output. It checks
 for public runtime markers only and is not NI-DAQmx or hardware evidence.
-`scripts/audit-lsm-daqmx-plan-nonhardware.sh` aggregates the simulator workflow
-audit, repository reverse-evidence boundary audit, and DAQmx non-hardware
-safety/documentation audits for the saved LSM/DAQmx plan. It is a
-plan-implementation boundary check only; live NI-DAQmx task execution still
-requires the bench checklist evidence.
+The DAQmx non-hardware audits are run individually rather than through an
+aggregate wrapper: `scripts/audit-ni-daqmx-external-gates.sh`,
+`scripts/audit-ni-daqmx-target-scope.sh`,
+`scripts/audit-ni-daqmx-no-hardware-helpers.sh`,
+`scripts/audit-ni-daqmx-plan-validation.sh`,
+`scripts/audit-ni-daqmx-live-gate.sh`,
+`scripts/audit-ni-daqmx-runtime-probe.sh`, and
+`scripts/audit-ni-daqmx-example-output-sync.sh`. They are plan-implementation
+boundary checks only; live NI-DAQmx task execution still requires the bench
+checklist evidence. The helper and runtime-probe audits need a Linux or Windows
+target.
 
 The `daqmx_runtime_probe` example loads the user-installed NI-DAQmx runtime only
 when built with `--features ni-daqmx-sdk`. It includes the audited local
@@ -284,13 +289,13 @@ The ImSwitch source displays public backend readiness and configured DAQmx
 role-channel mapping, while leaving live task execution gated:
 
 ```sh
-cargo run --release -p numanager-examples --features gui -- lsm_gui [sim-lsm|sim-composed|imswitch]
+cargo run --release -p numanager-examples --features gui -- software_gui [sim-lsm|sim-composed|imswitch]
 ```
 
 For terminal validation without opening a window:
 
 ```sh
-cargo run -p numanager-examples --features gui -- lsm_gui [sim-lsm|sim-composed|imswitch] --smoke
+cargo run -p numanager-examples --features gui -- software_gui [sim-lsm|sim-composed|imswitch] --smoke
 ```
 
 Recorded smoke output is in [`example_outputs.md`](example_outputs.md#lsm-gui-smoke).

@@ -66,7 +66,7 @@ only.
 The `lsm_composed_workflow` example prints the inherited scene summary for
 confocal capture, confocal stream, and scan-signal output, making spatial
 agreement visible through public runtime events.
-The `lsm_gui sim-composed --smoke` path writes XY, Z focus, lamp power, and lamp
+The `software_gui sim-composed --smoke` path writes XY, Z focus, lamp power, and lamp
 enabled state through public state APIs, then selects the objective through the
 public turret API before submitting LSM snapshot, live, and line-scan requests.
 It prints the inherited scene and optics metadata consumed from the resulting

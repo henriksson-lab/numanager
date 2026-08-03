@@ -82,6 +82,14 @@ export component MainWindow inherits Window {
     in property <string> pan-hint;
     in property <bool> streaming;
     in property <bool> stream-supported;
+    // Scanning instruments only: acquisition is driven one line at a time, and
+    // the scan grid is chosen here rather than read from a sensor.
+    in property <bool> line-scan-supported;
+    in property <bool> line-scanning;
+    in-out property <float> scan-width: 512;
+    in-out property <float> scan-height: 512;
+    // Display-only overlay marking the row the scan is currently on.
+    in-out property <bool> mark-scan-line: true;
     in property <bool> has-pan-stage;
     in property <[string]> focus-stages;
     in-out property <int> selected-focus-stage;
@@ -95,6 +103,7 @@ export component MainWindow inherits Window {
     callback capture();
     callback start-stream();
     callback stop-stream();
+    callback line-scan();
     callback property-edited(string, string, string);
     callback property-slider(string, string, float);
     callback pan(float, float);
@@ -112,22 +121,22 @@ export component MainWindow inherits Window {
             HorizontalBox {
                 spacing: 8px;
                 alignment: start;
-                Text { text: "Camera"; vertical-alignment: center; }
+                Text { text: "Imager"; vertical-alignment: center; }
                 ComboBox {
                     model: root.camera-sources;
                     current-index <=> root.selected-camera;
-                    enabled: !root.streaming;
+                    enabled: !root.streaming && !root.line-scanning;
                     width: 240px;
                 }
                 Button {
                     text: "Capture";
-                    enabled: !root.streaming;
+                    enabled: !root.streaming && !root.line-scanning;
                     clicked => { root.capture(); }
                 }
                 Button {
                     text: root.streaming ? "Stop streaming" : "Start streaming";
                     primary: root.streaming;
-                    enabled: root.stream-supported;
+                    enabled: root.stream-supported && !root.line-scanning;
                     width: 150px;
                     clicked => {
                         if root.streaming {
@@ -137,17 +146,24 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
+                if root.line-scan-supported: Button {
+                    text: root.line-scanning ? "Stop" : "Line scanning";
+                    primary: root.line-scanning;
+                    enabled: !root.streaming;
+                    width: 150px;
+                    clicked => { root.line-scan(); }
+                }
                 Rectangle {
                     width: 14px;
                     height: 14px;
                     border-radius: 7px;
                     y: (parent.height - self.height) / 2;
-                    background: root.streaming ? #e0463c : #c3cad4;
+                    background: (root.streaming || root.line-scanning) ? #e0463c : #c3cad4;
                     animate background { duration: 150ms; }
                 }
                 Text {
-                    text: root.streaming ? "LIVE" : "idle";
-                    color: root.streaming ? #e0463c : #8b95a3;
+                    text: root.streaming ? "LIVE" : root.line-scanning ? "LINE SCAN" : "idle";
+                    color: (root.streaming || root.line-scanning) ? #e0463c : #8b95a3;
                     font-weight: 700;
                     vertical-alignment: center;
                 }
@@ -156,8 +172,8 @@ export component MainWindow inherits Window {
             frame := Rectangle {
                 vertical-stretch: 1;
                 background: #12161c;
-                border-color: root.streaming ? #e0463c : #303844;
-                border-width: root.streaming ? 2px : 1px;
+                border-color: (root.streaming || root.line-scanning) ? #e0463c : #303844;
+                border-width: (root.streaming || root.line-scanning) ? 2px : 1px;
 
                 // Last reported drag position: the stage moves by the step since
                 // the previous event, not by the whole offset from the press.
@@ -259,6 +275,34 @@ export component MainWindow inherits Window {
 
             Text { text: root.xy-readout; color: #1d2733; wrap: word-wrap; }
             Text { text: root.pan-hint; color: #6b7787; wrap: word-wrap; }
+
+            if root.line-scan-supported: HorizontalBox {
+                spacing: 8px;
+                alignment: start;
+                Text {
+                    text: "Scan " + round(root.scan-width) + " x " + round(root.scan-height);
+                    color: #536070;
+                    vertical-alignment: center;
+                }
+                Slider {
+                    minimum: 64;
+                    maximum: 2048;
+                    value <=> root.scan-width;
+                    enabled: !root.line-scanning;
+                    width: 150px;
+                }
+                Slider {
+                    minimum: 1;
+                    maximum: 2048;
+                    value <=> root.scan-height;
+                    enabled: !root.line-scanning;
+                    width: 150px;
+                }
+                CheckBox {
+                    text: "Mark current scan line";
+                    checked <=> root.mark-scan-line;
+                }
+            }
 
             HorizontalBox {
                 spacing: 8px;
@@ -440,6 +484,24 @@ fn load_drivers(source: &str) -> Result<Vec<Box<dyn Driver>>> {
     }
 }
 
+/// Sources whose runtime is assembled by [`crate::lsm_common`] rather than from
+/// a plain driver list, because they are configured topologies rather than a
+/// single simulated instrument.
+fn is_scanning_source(source: &str) -> bool {
+    matches!(
+        source,
+        "sim-lsm"
+            | "sim_lsm"
+            | "sim"
+            | "sim-composed"
+            | "sim_microscope_lsm"
+            | "sim-microscope-lsm"
+            | "imswitch"
+            | "imswitch-daqmx"
+            | "daqmx"
+    )
+}
+
 /// First positional argument after the example name, ignoring flags such as
 /// `--smoke`.
 fn driver_choice() -> String {
@@ -451,7 +513,13 @@ fn driver_choice() -> String {
 
 pub fn run() -> Result<()> {
     if std::env::args().any(|arg| arg == "--smoke") {
-        let mut app = GuiApp::new(&driver_choice())?;
+        let source = driver_choice();
+        // A scanning instrument is exercised through its own acquisition
+        // workflows; the device/property survey below does not cover them.
+        if is_scanning_source(&source) {
+            return crate::lsm_common::smoke(&source);
+        }
+        let mut app = GuiApp::new(&source)?;
         app.print_smoke_output()?;
         return Ok(());
     }
@@ -478,6 +546,16 @@ pub fn run() -> Result<()> {
         ui.on_start_stream(move || {
             if let Some(ui) = ui_weak.upgrade() {
                 let result = app.borrow_mut().start_stream(&ui);
+                report(&ui, result);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let app = Rc::clone(&app);
+        ui.on_line_scan(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let result = app.borrow_mut().toggle_line_scan(&ui);
                 report(&ui, result);
             }
         });
@@ -572,7 +650,7 @@ fn report(ui: &MainWindow, result: Result<()>) {
 struct GuiApp {
     runtime: LocalRuntime,
     devices: Vec<DeviceDescriptor>,
-    cameras: Vec<CameraSource>,
+    imagers: Vec<ImagingSource>,
     pan_stages: Vec<DeviceDescriptor>,
     focus_stages: Vec<DeviceDescriptor>,
     events: numanager_core::runtime::Subscription,
@@ -581,11 +659,105 @@ struct GuiApp {
     row_keys: Vec<(DeviceId, String)>,
     stream: Option<StreamSession>,
     last_frame: Option<Frame>,
+    /// Raw detector samples, subscribed only so a scanning instrument can be
+    /// driven a line at a time. Cameras never publish these.
+    signal_events: numanager_core::runtime::Subscription,
+    line_scan: Option<OperationId>,
+    line_buffer: LineFramebuffer,
 }
 
-struct CameraSource {
+/// Framebuffer filled row by row from continuous line-scan chunks.
+///
+/// The scan sweeps down the raster, so line `n` is row `n % height` of the same
+/// image the capture capability renders. Chunks land as partial rows and the
+/// display is rebuilt from whatever has arrived, rather than waiting for a
+/// complete frame.
+#[derive(Default)]
+struct LineFramebuffer {
+    width: u32,
+    height: u32,
+    pixels: Vec<u16>,
+    rows_written: u64,
+    current_line: Option<u64>,
+    dirty: bool,
+}
+
+impl LineFramebuffer {
+    fn reset(&mut self, width: u32, height: u32) {
+        self.width = width.clamp(1, 4096);
+        self.height = height.clamp(1, 4096);
+        self.pixels = vec![0; self.width as usize * self.height as usize];
+        self.rows_written = 0;
+        self.current_line = None;
+        self.dirty = true;
+    }
+
+    /// Write one chunk of a scan line. `first_sample` is the offset within the
+    /// line, so a chunk only overwrites the columns it actually covers.
+    fn write_chunk(&mut self, line: u64, first_sample: u64, samples: &[u16]) {
+        if self.pixels.is_empty() || samples.is_empty() {
+            return;
+        }
+        if self.current_line != Some(line) {
+            self.current_line = Some(line);
+            self.rows_written = self.rows_written.saturating_add(1);
+        }
+        let row = (line % u64::from(self.height)) as usize;
+        let start = usize::try_from(first_sample).unwrap_or(usize::MAX);
+        if start >= self.width as usize {
+            return;
+        }
+        let base = row * self.width as usize + start;
+        let span = samples.len().min(self.width as usize - start);
+        self.pixels[base..base + span].copy_from_slice(&samples[..span]);
+        self.dirty = true;
+    }
+
+    /// Mono8 view of the framebuffer, shaped like a camera frame so the rest of
+    /// the GUI — preview, histogram, saturation marking — treats it identically.
+    ///
+    /// `mark_current` draws the row being scanned in white. It is applied to the
+    /// copy handed to the display, so the stored sample codes are never
+    /// modified and the marker cannot contaminate the acquired image.
+    fn frame(&self, device: DeviceId, mark_current: bool) -> Frame {
+        let mut data: Vec<u8> = self.pixels.iter().map(|code| (code >> 8) as u8).collect();
+        if mark_current {
+            if let Some(line) = self.current_line {
+                let row = (line % u64::from(self.height)) as usize;
+                let start = row * self.width as usize;
+                data[start..start + self.width as usize].fill(u8::MAX);
+            }
+        }
+        Frame {
+            handle: FrameHandle {
+                stream: StreamId(0),
+                frame: FrameId(self.rows_written),
+            },
+            device,
+            width: self.width,
+            height: self.height,
+            pixel_format: "Mono8".into(),
+            data,
+            metadata: BTreeMap::new(),
+            buffer: FrameBufferSpec::default(),
+        }
+    }
+}
+
+/// A device that can produce images, and the capabilities it offers to do so.
+///
+/// A camera advertises `CameraCapture` and usually `CameraStream`. A laser
+/// scanning microscope advertises `ConfocalImageCapture`, and when it can also
+/// publish raw detector samples it advertises `ScanSignalStream`, which is what
+/// makes line-by-line acquisition possible.
+struct ImagingSource {
     device: DeviceDescriptor,
-    streamable: bool,
+    /// Capability used for a single image.
+    capture: CapabilityKind,
+    /// Capability used for continuous whole images, when one is advertised.
+    stream: Option<CapabilityKind>,
+    /// True when the device can be driven one scan line at a time.
+    line_scan: bool,
     /// Objective in this camera's light path, resolved from the device graph at
     /// startup. Absent when the instrument does not publish one.
     objective: Option<DeviceDescriptor>,
@@ -607,42 +779,65 @@ struct Optics {
 
 impl GuiApp {
     fn new(source: &str) -> Result<Self> {
-        let drivers = load_drivers(source)?;
-
-        // The device graph is only reachable through the drivers themselves, so
-        // the optical dependency of each camera is resolved before the runtime
-        // takes ownership of them.
-        let providers = capability_providers(
-            drivers.iter().map(|driver| driver.as_ref()),
-            CapabilityKind::CameraCapture,
-        );
+        // Scanning topologies come pre-assembled; a driver-list source is built
+        // here so the device graph can be inspected before the runtime takes
+        // ownership of the drivers.
+        let (runtime, providers) = if is_scanning_source(source) {
+            let (runtime, _) = crate::lsm_common::runtime_for_source(source)?;
+            (runtime, Vec::new())
+        } else {
+            let drivers = load_drivers(source)?;
+            let providers = capability_providers(
+                drivers.iter().map(|driver| driver.as_ref()),
+                CapabilityKind::CameraCapture,
+            );
+            let mut runtime = LocalRuntime::new();
+            for driver in drivers {
+                runtime.add_driver(driver)?;
+            }
+            (runtime, providers)
+        };
         let objective_role = Role::Custom(OBJECTIVE_ROLE.into());
 
-        let mut runtime = LocalRuntime::new();
-        for driver in drivers {
-            runtime.add_driver(driver)?;
-        }
         let devices = runtime
             .devices()
             .into_iter()
             .cloned()
             .collect::<Vec<DeviceDescriptor>>();
 
-        let streamable = runtime
-            .devices_by_capability(CapabilityKind::CameraStream)
-            .into_iter()
-            .map(|device| device.id)
-            .collect::<Vec<_>>();
+        let ids_with = |kind| {
+            runtime
+                .devices_by_capability(kind)
+                .into_iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>()
+        };
+        let camera_streams = ids_with(CapabilityKind::CameraStream);
+        let confocal_streams = ids_with(CapabilityKind::ConfocalImageStream);
+        let line_scanners = ids_with(CapabilityKind::ScanSignalStream);
         let turrets = devices
             .iter()
             .filter(|device| device.has_kind("objective.turret"))
             .cloned()
             .collect::<Vec<_>>();
-        let cameras = runtime
-            .devices_by_capability(CapabilityKind::CameraCapture)
+        // Both kinds of imager are collected the same way; only the capability
+        // used to acquire differs, so the rest of the GUI does not care which
+        // one the instrument turned out to be.
+        let capture_kinds = [
+            CapabilityKind::CameraCapture,
+            CapabilityKind::ConfocalImageCapture,
+        ];
+        let imagers = capture_kinds
             .into_iter()
-            .cloned()
-            .map(|device| {
+            .flat_map(|capture| {
+                runtime
+                    .devices_by_capability(capture.clone())
+                    .into_iter()
+                    .cloned()
+                    .map(move |device| (capture.clone(), device))
+                    .collect::<Vec<_>>()
+            })
+            .map(|(capture, device)| {
                 let objective = providers
                     .iter()
                     .find(|provider| provider.device.id == device.id)
@@ -660,17 +855,28 @@ impl GuiApp {
                             .cloned()
                     })
                     .or_else(|| turrets.first().filter(|_| turrets.len() == 1).cloned());
-                CameraSource {
-                    streamable: streamable.contains(&device.id),
+                let stream = if capture == CapabilityKind::CameraCapture {
+                    camera_streams
+                        .contains(&device.id)
+                        .then_some(CapabilityKind::CameraStream)
+                } else {
+                    confocal_streams
+                        .contains(&device.id)
+                        .then_some(CapabilityKind::ConfocalImageStream)
+                };
+                ImagingSource {
+                    capture,
+                    stream,
+                    line_scan: line_scanners.contains(&device.id),
                     objective,
                     device,
                 }
             })
             .collect::<Vec<_>>();
-        if cameras.is_empty() {
+        if imagers.is_empty() {
             return Err(Error::new(
                 ErrorCode::InvalidCommand,
-                "no device advertises CameraCapture",
+                "no device advertises CameraCapture or ConfocalImageCapture",
             ));
         }
         let pan_stages = runtime
@@ -688,11 +894,12 @@ impl GuiApp {
             EventKind::FrameReady,
             EventKind::PropertyChanged,
         ]));
+        let signal_events = runtime.subscribe(EventFilter::kinds([EventKind::ScanSignalChunk]));
 
         let mut app = Self {
             runtime,
             devices,
-            cameras,
+            imagers,
             pan_stages,
             focus_stages,
             events,
@@ -701,6 +908,9 @@ impl GuiApp {
             row_keys: Vec::new(),
             stream: None,
             last_frame: None,
+            signal_events,
+            line_scan: None,
+            line_buffer: LineFramebuffer::default(),
         };
         app.seed_properties();
         Ok(app)
@@ -759,7 +969,7 @@ impl GuiApp {
 
     fn refresh_ui(&mut self, ui: &MainWindow) -> Result<()> {
         ui.set_camera_sources(ModelRc::new(VecModel::from(
-            self.cameras
+            self.imagers
                 .iter()
                 .map(|camera| SharedString::from(camera.device.label.as_str()))
                 .collect::<Vec<_>>(),
@@ -779,8 +989,8 @@ impl GuiApp {
         ui.set_has_pan_stage(!self.pan_stages.is_empty());
         ui.set_has_focus_stage(!self.focus_stages.is_empty());
         ui.set_stream_supported(
-            self.selected_camera(ui)
-                .is_ok_and(|camera| camera.streamable),
+            self.selected_imager(ui)
+                .is_ok_and(|camera| camera.stream.is_some()),
         );
         self.build_property_model(ui);
         self.set_safety_model(ui)?;
@@ -793,13 +1003,13 @@ impl GuiApp {
 
     fn print_smoke_output(&mut self) -> Result<()> {
         println!("software gui smoke");
-        println!("cameras:");
-        for camera in &self.cameras {
+        println!("imagers:");
+        for camera in &self.imagers {
             println!(
                 "  {} [{}] stream={}",
                 camera.device.label,
                 public_kind_summary(&camera.device),
-                camera.streamable
+                camera.stream.is_some()
             );
         }
         println!("pan stages:");
@@ -811,7 +1021,7 @@ impl GuiApp {
             println!("  {} [{}]", stage.label, public_kind_summary(stage));
         }
         println!("objectives:");
-        for camera in &self.cameras {
+        for camera in &self.imagers {
             match &camera.objective {
                 Some(objective) => println!(
                     "  {} -> {} [{}]",
@@ -822,7 +1032,7 @@ impl GuiApp {
                 None => println!("  {} -> none", camera.device.label),
             }
         }
-        let camera = self.cameras[0].device.id;
+        let camera = self.imagers[0].device.id;
         println!("optics: {}", self.optics(camera).summary());
 
         println!("properties:");
@@ -862,7 +1072,7 @@ impl GuiApp {
         // the GUI knowing anything about the instrument behind it. Where the
         // turret advertises FilterSelect the operation waits out the rotation,
         // so no polling is needed.
-        if let Some(objective) = self.cameras[0].objective.clone() {
+        if let Some(objective) = self.imagers[0].objective.clone() {
             let selects_by_capability = self
                 .runtime
                 .capabilities(objective.id)?
@@ -976,15 +1186,28 @@ impl GuiApp {
                 "camera is streaming; stop the stream before a single capture",
             ));
         }
-        let camera = self.selected_camera(ui)?.device.id;
-        self.runtime.execute_request(
-            camera,
-            CameraCaptureRequest {
-                encoding: Some(ImageEncoding::Mono8),
-                buffer: Some(FrameBufferSpec::default()),
-            },
-            Duration::from_secs(10),
-        )?;
+        let imager = self.selected_imager(ui)?;
+        let device = imager.device.id;
+        // One image, through whichever capability this instrument offers.
+        if imager.capture == CapabilityKind::CameraCapture {
+            self.runtime.execute_request(
+                device,
+                CameraCaptureRequest {
+                    encoding: Some(ImageEncoding::Mono8),
+                    buffer: Some(FrameBufferSpec::default()),
+                },
+                Duration::from_secs(10),
+            )?;
+        } else {
+            let width = ui.get_scan_width().round().clamp(64.0, 2048.0) as i64;
+            let height = ui.get_scan_height().round().clamp(1.0, 2048.0) as i64;
+            self.runtime.execute_request(
+                device,
+                crate::lsm_common::snapshot_request(width, height),
+                Duration::from_secs(30),
+            )?;
+        }
+        let camera = device;
         let (frame, _) = self.drain_last_frame(camera)?;
         if let Some(frame) = frame {
             self.show_frame(ui, frame);
@@ -999,25 +1222,34 @@ impl GuiApp {
         if self.stream.is_some() {
             return Ok(());
         }
-        let camera = self.selected_camera(ui)?;
-        if !camera.streamable {
+        let imager = self.selected_imager(ui)?;
+        let Some(stream_kind) = imager.stream.clone() else {
             return Err(Error::new(
                 ErrorCode::Unsupported,
-                "camera does not advertise CameraStream",
+                "device does not advertise a stream capability",
             ));
-        }
-        let camera = camera.device.id;
-        let operation = self.runtime.submit_request(
-            camera,
-            CameraStreamRequest {
-                encoding: Some(ImageEncoding::Mono8),
-                frame_count: None,
-                buffer: FrameBufferSpec {
-                    capacity_frames: 8,
-                    overflow: OverflowPolicy::DropOldest,
+        };
+        let camera = imager.device.id;
+        let operation = if stream_kind == CapabilityKind::CameraStream {
+            self.runtime.submit_request(
+                camera,
+                CameraStreamRequest {
+                    encoding: Some(ImageEncoding::Mono8),
+                    frame_count: None,
+                    buffer: FrameBufferSpec {
+                        capacity_frames: 8,
+                        overflow: OverflowPolicy::DropOldest,
+                    },
                 },
-            },
-        )?;
+            )?
+        } else {
+            let width = ui.get_scan_width().round().clamp(64.0, 2048.0) as i64;
+            let height = ui.get_scan_height().round().clamp(1.0, 2048.0) as i64;
+            self.runtime.submit_request(
+                camera,
+                crate::lsm_common::continuous_live_image_request(width, height),
+            )?
+        };
         self.stream = Some(StreamSession {
             operation: operation.id,
             device: camera,
@@ -1054,10 +1286,115 @@ impl GuiApp {
     /// Polled from the UI event loop: moves newly published frames into the
     /// image view, folds property changes into the cached values, and reflects
     /// the live operation status in the controls.
+    /// Starts or stops line-by-line acquisition on a scanning instrument.
+    fn toggle_line_scan(&mut self, ui: &MainWindow) -> Result<()> {
+        if self.line_scan.is_some() {
+            return self.stop_line_scan(ui);
+        }
+        let imager = self.selected_imager(ui)?;
+        if !imager.line_scan {
+            return Err(Error::new(
+                ErrorCode::Unsupported,
+                "device does not advertise ScanSignalStream",
+            ));
+        }
+        let device = imager.device.id;
+        let width = ui.get_scan_width().round().clamp(64.0, 2048.0) as u32;
+        let height = ui.get_scan_height().round().clamp(1.0, 2048.0) as u32;
+        let request = crate::lsm_common::continuous_raster_line_signal_request(
+            i64::from(width),
+            i64::from(height),
+            256,
+            Vec::new(),
+        );
+        let operation = self.runtime.submit_request(device, request)?;
+        self.line_buffer.reset(width, height);
+        self.draw_line_buffer(ui, device);
+        self.line_scan = Some(operation.id);
+        ui.set_line_scanning(true);
+        ui.set_status("line scanning — building image row by row".into());
+        Ok(())
+    }
+
+    fn stop_line_scan(&mut self, ui: &MainWindow) -> Result<()> {
+        if let Some(operation) = self.line_scan.take() {
+            let _ = self.runtime.cancel(operation);
+        }
+        ui.set_line_scanning(false);
+        ui.set_status(
+            format!(
+                "line scanning stopped after {} rows",
+                self.line_buffer.rows_written
+            )
+            .into(),
+        );
+        Ok(())
+    }
+
+    /// Drains whatever chunks arrived since the last tick into the framebuffer.
+    fn drain_line_scan(&mut self, ui: &MainWindow, device: DeviceId) -> Result<()> {
+        while let Some(event) = self.signal_events.try_recv() {
+            let Event::ScanSignalChunk(event) = event else {
+                continue;
+            };
+            // The raster averages the detectors it was given, so the
+            // framebuffer averages the channels the chunk carries.
+            let traces: Vec<Vec<u16>> = event
+                .samples
+                .values()
+                .map(|values| values.iter().filter_map(sample_u16).collect())
+                .filter(|trace: &Vec<u16>| !trace.is_empty())
+                .collect();
+            if traces.is_empty() {
+                continue;
+            }
+            let samples: Vec<u16> = (0..traces.iter().map(Vec::len).min().unwrap_or(0))
+                .map(|index| {
+                    let total: u32 = traces.iter().map(|trace| u32::from(trace[index])).sum();
+                    (total / traces.len() as u32) as u16
+                })
+                .collect();
+            self.line_buffer
+                .write_chunk(event.line, event.first_sample, &samples);
+        }
+
+        if self.line_buffer.dirty {
+            self.line_buffer.dirty = false;
+            self.draw_line_buffer(ui, device);
+        }
+
+        if let Some(operation) = self.line_scan {
+            match self.runtime.status(operation) {
+                OperationStatus::Queued | OperationStatus::Running { .. } => {
+                    ui.set_status(
+                        format!(
+                            "line scanning — {} rows written",
+                            self.line_buffer.rows_written
+                        )
+                        .into(),
+                    );
+                }
+                _ => {
+                    self.line_scan = None;
+                    ui.set_line_scanning(false);
+                    ui.set_status("line scanning ended".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Publishes the framebuffer as if it were a captured frame, so preview,
+    /// histogram and saturation marking all work unchanged.
+    fn draw_line_buffer(&mut self, ui: &MainWindow, device: DeviceId) {
+        let frame = self.line_buffer.frame(device, ui.get_mark_scan_line());
+        self.show_frame(ui, frame);
+    }
+
     fn tick(&mut self, ui: &MainWindow) -> Result<()> {
         let device = match &self.stream {
             Some(session) => session.device,
-            None => self.selected_camera(ui)?.device.id,
+            None => self.selected_imager(ui)?.device.id,
         };
         let (frame, count, changed) = self.drain_events(device)?;
         if let Some(frame) = frame {
@@ -1068,9 +1405,17 @@ impl GuiApp {
             self.refresh_optics(ui);
         }
         ui.set_stream_supported(
-            self.selected_camera(ui)
-                .is_ok_and(|camera| camera.streamable),
+            self.selected_imager(ui)
+                .is_ok_and(|camera| camera.stream.is_some()),
         );
+        ui.set_line_scan_supported(
+            self.selected_imager(ui)
+                .is_ok_and(|imager| imager.line_scan),
+        );
+        if self.line_scan.is_some() {
+            let scanner = self.selected_imager(ui)?.device.id;
+            self.drain_line_scan(ui, scanner)?;
+        }
         let Some(session) = self.stream.as_mut() else {
             return Ok(());
         };
@@ -1195,7 +1540,7 @@ impl GuiApp {
         let Some(stage) = self.selected_pan_stage(ui).cloned() else {
             return Ok(());
         };
-        let camera = self.selected_camera(ui)?.device.id;
+        let camera = self.selected_imager(ui)?.device.id;
         let step = self.optics(camera).um_per_image_px;
         let x_key = (stage.id, "x".to_string());
         let y_key = (stage.id, "y".to_string());
@@ -1283,7 +1628,7 @@ impl GuiApp {
         let pitch = value_as_f64(self.properties.get(&(camera, "pixel_pitch".into())));
         let binning = binning_factor(self.properties.get(&(camera, "binning".into())));
         let objective = self
-            .cameras
+            .imagers
             .iter()
             .find(|source| source.device.id == camera)
             .and_then(|source| source.objective.as_ref());
@@ -1343,7 +1688,7 @@ impl GuiApp {
     }
 
     fn refresh_optics(&self, ui: &MainWindow) {
-        let Ok(camera) = self.selected_camera(ui) else {
+        let Ok(camera) = self.selected_imager(ui) else {
             return;
         };
         let optics = self.optics(camera.device.id);
@@ -1390,18 +1735,18 @@ impl GuiApp {
         ui.set_scale_bar_label(format!("{} um", format_scalar(length_um)).into());
     }
 
-    fn drain_last_frame(&mut self, selected_camera: DeviceId) -> Result<(Option<Frame>, usize)> {
-        let (frame, count, _) = self.drain_events(selected_camera)?;
+    fn drain_last_frame(&mut self, selected_imager: DeviceId) -> Result<(Option<Frame>, usize)> {
+        let (frame, count, _) = self.drain_events(selected_imager)?;
         Ok((frame, count))
     }
 
-    fn drain_events(&mut self, selected_camera: DeviceId) -> Result<(Option<Frame>, usize, bool)> {
+    fn drain_events(&mut self, selected_imager: DeviceId) -> Result<(Option<Frame>, usize, bool)> {
         let mut last = None;
         let mut count = 0;
         let mut changed = false;
         while let Some(event) = self.events.try_recv() {
             match event {
-                Event::FrameReady(event) if event.device == selected_camera => {
+                Event::FrameReady(event) if event.device == selected_imager => {
                     last = Some(event.handle);
                     count += 1;
                 }
@@ -1540,11 +1885,11 @@ impl GuiApp {
         value_as_f64(self.properties.get(&(stage.id, key.to_string()))).unwrap_or(0.0)
     }
 
-    fn selected_camera(&self, ui: &MainWindow) -> Result<&CameraSource> {
+    fn selected_imager(&self, ui: &MainWindow) -> Result<&ImagingSource> {
         usize::try_from(ui.get_selected_camera())
             .ok()
-            .and_then(|index| self.cameras.get(index))
-            .or_else(|| self.cameras.first())
+            .and_then(|index| self.imagers.get(index))
+            .or_else(|| self.imagers.first())
             .ok_or_else(|| Error::new(ErrorCode::InvalidCommand, "invalid camera selection"))
     }
 
@@ -2170,6 +2515,19 @@ fn frame_smoke_summary(frame: Option<&Frame>) -> String {
 
 /// One bin per Mono8 code, lightly smoothed and square-root scaled so the
 /// background peak does not flatten everything else.
+/// Detector samples arrive as counts or volts depending on the channel; both
+/// are mapped onto the same 16-bit code the raster reconstruction uses.
+fn sample_u16(value: &Value) -> Option<u16> {
+    match value {
+        Value::I64(value) => Some((*value).clamp(0, u16::MAX as i64) as u16),
+        Value::F64(value) => Some(value.round().clamp(0.0, u16::MAX as f64) as u16),
+        Value::Voltage(value) => {
+            Some(((value.volts() / 5.0) * u16::MAX as f64).clamp(0.0, u16::MAX as f64) as u16)
+        }
+        _ => None,
+    }
+}
+
 fn histogram(frame: &Frame) -> Vec<f32> {
     let mut counts = [0u32; HISTOGRAM_BINS];
     for value in &frame.data {

@@ -56,11 +56,10 @@ exclusive resource and runs blocking calls away from callers.
 A hub is a driver that owns one or more resources and can offer logical devices.
 Examples:
 
-- ASI Tiger controller offering XY, Z, wheels, TTL, and scanners.
-- Spark Cyto mainboard offering plate motion, readers, gas, temperature, and
-  CAN modules.
-- Toupcam USB camera exposing camera, stream, trigger, and raw-register
-  capabilities.
+- a motion controller offering XY, Z, filter wheels, TTL lines, and scanners.
+- a plate-reader mainboard offering plate motion, detectors, gas, temperature,
+  and bus modules.
+- a USB camera exposing camera, stream, trigger, and raw-register capabilities.
 
 Hubs do not expose children by sharing mutable references. They expose
 descriptors and accept command batches addressed to logical endpoints.
@@ -98,11 +97,11 @@ Capabilities are preferable to deep inheritance. A client asks whether a device
 has `CameraCapture`, `AxisMove`, `TriggerSink`, `WaveformUpload`, or
 `AutofocusSearch` and receives typed metadata.
 
-Autofocus is a general device/capability pair, not a Squid-specific laser pin
-or light-gate device. Squid may provide one concrete autofocus endpoint, but
-the endpoint is an implementation of the shared autofocus model rather than a
-Squid API surface. A hardware controller may offer autofocus directly, as ASI
-does through CRISP or Squid does through its firmware-controlled focus gate. A
+Autofocus is a general device/capability pair, not a controller-specific laser
+pin or light-gate device. A controller may provide one concrete autofocus
+endpoint, but the endpoint is an implementation of the shared autofocus model
+rather than that controller's API surface. Hardware may offer autofocus
+directly, through a dedicated focus module or a firmware-controlled focus gate. A
 software autofocus service may offer the same `CapabilityKind::Autofocus` while
 using graph edges to depend on a camera, Z stage, and optional light or laser
 device. Clients select autofocus providers by `CapabilityKind::Autofocus` and
@@ -120,8 +119,8 @@ The public autofocus contract should stay provider-neutral:
 - dependencies: `UsesDevice` graph edges with roles such as `ZStage`, `Camera`,
   and `LightSource`
 
-Provider-specific controls, such as a Squid firmware pin number or an ASI CRISP
-axis parameter, belong in metadata or provider-specific diagnostic properties.
+Provider-specific controls, such as a firmware pin number or a focus-module axis
+parameter, belong in metadata or provider-specific diagnostic properties.
 They must not define the core autofocus API.
 
 ### Property
@@ -282,10 +281,10 @@ pub trait Driver {
 The transport owns bytes. The session owns protocol sequencing and response
 matching. The driver owns logical devices and remultiplexing.
 
-This mirrors the useful pattern in the Spark Cyto driver: whole-frame transport,
-sequence-number session, then command/engine logic. It also fits Toupcam: USB
-control/bulk transport, camera register/stream session, then logical camera
-capabilities.
+This mirrors the useful pattern in a framed-protocol instrument driver:
+whole-frame transport, sequence-number session, then command/engine logic. It
+also fits a USB camera: control/bulk transport, camera register/stream session,
+then logical camera capabilities.
 
 ## Runtime Lanes
 
@@ -448,59 +447,29 @@ The runtime validates and executes primitive timing operations. Higher-level
 experiment software decides whether a plan is a z-stack, time series, FRAP,
 confocal raster, plate scan, or autofocus loop.
 
-## First Driver Targets
+## Driver Shapes The Model Must Absorb
 
-### Toupcam Camera
+Two hardware shapes drove the graph and command models, and both must work
+without special cases.
 
-Source reference: `/home/mahogny/github/claude/opengel/src/camera`.
+A single USB camera still needs more than one lane: a control path for register
+and property traffic, and a bulk path for frame streaming. A vendor protocol may
+obfuscate register writes and require a captured initialisation sequence, so the
+model needs `RawRegisterAccess` alongside typed properties. Acquisition must
+submit an operation and report `FrameReady` or a failure event rather than block
+until a full frame has been read.
 
-Initial device:
+A benchtop analyser is the opposite shape: one controller and one session behind
+which many logical devices live — plate transport, detectors, optics,
+environment, and bus modules — reached over a framed transport with
+sequence-numbered responses. Its imaging camera can be physically independent of
+that controller while semantically depending on the imaging module it is bound
+to.
 
-- one hub-like USB camera driver owning the claimed interface
-- one `camera` device
-- properties: exposure, gain, resolution, pixel format, trigger mode
-- capabilities: `CameraCapture`, `CameraStream`, `TriggerSink`,
-  `RawRegisterAccess`
-- separate control lane and bulk stream lane
-
-Important implementation details from the existing driver:
-
-- device discovery by Toupcam/ToupTek/Cypress vendor IDs
-- captured initialization replay
-- `0x0b` obfuscated register writes for exposure/gain
-- queued bulk-IN reads for frame streaming
-- RAW8 frame path with later debayer support
-
-The current `capture()` call blocks while reading a full frame. In `numanager`,
-capture should submit an operation and report `FrameReady` or failure events.
-
-### Spark Cyto
-
-Source reference: `/home/mahogny/github/claude/sparkcyto`.
-
-Initial shape:
-
-- Spark mainboard hub owns the TDCL transport/session
-- the hub offers plate transport, absorbance, fluorescence, luminescence,
-  temperature, gas, imaging head, objective changer, LEDs, and camera binding
-  descriptors when discovered
-- TDCL command/data channels are resources
-- CAN modules are logical children behind the mainboard hub
-- IDS/uEye camera is a separate physical camera resource but depends on CELL or
-  FIM imaging head metadata
-
-Important implementation details from the existing driver:
-
-- whole-TDCL-frame transport
-- `Busy -> Ready/Error` session state machine
-- sequence-number response matching
-- module topology from `ScanModules` XML and `StringDescriptor3`
-- command builder for Symbio ASCII payloads
-- simulator as reference firmware
-
-Spark is a strong test case for the DAG: the camera is physically independent,
-but semantically depends on the imaging module; plate motion, optics, detector,
-and environment devices all share one controller/session.
+That combination is why the model is a DAG rather than a device list. Ownership
+and dependency are different edges, one physical controller routinely fronts
+many logical endpoints, and a device may depend on a sibling it does not belong
+to.
 
 ## Simulators
 
@@ -509,8 +478,8 @@ Simulators should exist at three levels.
 ### Protocol Simulators
 
 Protocol simulators emulate transport/session behavior byte-for-byte enough to
-develop and debug drivers without hardware. Spark's loopback TDCL simulator is
-the model.
+develop and debug drivers without hardware. A loopback simulator for a framed
+session protocol is the model.
 
 ### Instrument Simulators
 
@@ -526,38 +495,21 @@ well-plate kinetics, noisy sensors, saturated images, and bad calibrations.
 
 The simulator API should use the same driver/runtime interfaces as hardware.
 
-## Proposed Crate Layout
+## Crate Layout
 
 ```text
 crates/
   numanager-core/        graph, descriptors, schemas, enum-backed capabilities,
-                         commands, events,
-                         runtime lanes, scheduler, config, discovery locks
-  numanager-sim/         reusable simulator primitives
-  drivers/
-    toupcam/
-    spark-cyto/
-    sim-microscope/
-    sim-plate-reader/
+                         commands, events, runtime lanes, scheduler, config,
+                         discovery locks
+  numanager-drivers/     every device family, one module per family
+  numanager-spectra/     filter and fluorophore spectra; independent of the
+                         device runtime
+  numanager-examples/    executable API documentation
 ```
 
-Keep driver crates small and protocol-oriented. Shared abstractions, scheduling,
-and configuration live in `numanager-core` so driver authors depend on one API
-crate.
-
-## Implementation Order
-
-1. Create `numanager-core` descriptor, property, command, event, and graph
-   types.
-2. Create a simple thread/channel runtime with operation handles and event
-   subscriptions.
-3. Port the Toupcam camera as a driver with one camera device and two lanes.
-4. Port Spark TDCL transport/session and expose the mainboard hub descriptors.
-5. Add state-set batching and hub remultiplexing.
-6. Add config load/save and discovery locking.
-7. Add Spark instrument simulator and generic microscope simulator.
-8. Add timing plan primitives.
-9. Add composed software autofocus using camera + z-stage dependencies.
-10. Add more hardware families.
-
-Tests are intentionally not included in this design pass.
+Drivers live in one consolidated crate with a module per family, not one crate
+per driver. Shared abstractions, scheduling, and configuration live in
+`numanager-core` so driver authors depend on a single API crate. Optional
+platform or vendor-SDK backends that cannot be built everywhere are the
+exception, and are kept in their own crates behind feature flags.

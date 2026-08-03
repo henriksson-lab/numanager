@@ -197,7 +197,7 @@ Recorded output:
 
 ```text
 software gui smoke
-cameras:
+imagers:
   sim-microscope-camera [camera, simulator] stream=true
 pan stages:
   sim-microscope-xy [stage.xy, axis.xy, simulator]
@@ -390,35 +390,6 @@ event: operation on [coolled-pe300-hub] running
 event: operation on [coolled-pe300-hub] completed map keys=[armed, route_count, routed_channels, running, sequence_count, starts, stops]
 ```
 
-## NI-DAQmx Evidence Input Audit
-
-Command:
-
-```sh
-scripts/audit-ni-daqmx-evidence-inputs.sh
-```
-
-Recorded output excerpt:
-
-```text
-# NI-DAQmx Evidence Input Audit
-
-| Input | Path |
-| --- | --- |
-| Package inputs | `/home/mahogny/github/claude/reveng-dll/nidaq` |
-| Header root | `/usr/include/NIDAQmx.h` |
-| ni-daqmx-sys repo | `/home/mahogny/github/claude/ni-daqmx-sys` |
-
-| Workflow | Status |
-| --- | --- |
-| Package input inventory markers | ok |
-| Installed SDK header inventory markers | ok |
-| FFI source inventory markers | ok |
-
-This audit runs package-input, SDK-header, and FFI-source inventory scripts over the configured local paths. It records intake/source markers only; it does not load the NI-DAQmx runtime, create NI-DAQmx tasks, write outputs, read inputs, execute scans, establish redistribution permission, or provide hardware evidence.
-
-```
-
 ## NI-DAQmx External Gates Audit
 
 Command:
@@ -597,7 +568,6 @@ backend_readiness: execution=not_live_backend; live_ready=false; live_requested=
 capture_plan: execution=not_live_task_execution, blocker=feature_ni_daqmx_sdk, readiness=[ready=false;blocker=feature_ni_daqmx_sdk;missing=runtime_package+runtime_version+runtime_platform+runtime_license+sdk_header_path+sdk_header_sha256+feature_ni_daqmx_sdk+api_audit_and_hardware_validation;hardware=pending], routing=pending_hardware_validation, roles=[x_galvo=Dev1/ao0,y_galvo=Dev1/ao1,laser_gate=Dev1/port0/line0,detector=Dev1/ctr0,sample_clock=Dev1/ctr2], clock=/Dev1/Ctr2InternalOutput, buffers=[scan=512x512x1:262144 samples;tasks=ao_scan:write:f64_volts:2chx262144|do_laser_gate:write:u8_line_state:1chx262144|ci_detector:read:u32_counts:1chx262144|co_sample_clock:generate:counter_pulse_train:1chx262144], cleanup_timeout_s=10.000, waveforms=[ao_scan:x_fast_sawtooth_y_slow_step:pending_hardware_validation|do_laser_gate:high_during_active_pixels:pending_hardware_validation], routes=[clock:/Dev1/Ctr2InternalOutput:co_sample_clock->ci_detector+ao_scan+do_laser_gate;trigger:none->ci_detector+ao_scan+do_laser_gate], sequence=[setup:ao_scan>do_laser_gate>ci_detector>co_sample_clock;write:ao_scan>do_laser_gate;start:ci_detector>ao_scan>do_laser_gate>co_sample_clock;read:ci_detector;wait:co_sample_clock;stop:co_sample_clock>do_laser_gate>ao_scan>ci_detector;clear:co_sample_clock>ci_detector>do_laser_gate>ao_scan], completion=[mode=finite;samples=262144;timeout_s=10.000;evidence=pending_hardware_validation], contract=[mode=raster_finite;write=ao_scan>do_laser_gate;read=ci_detector;wait=co_sample_clock;auto_start=false;timeout_s=10.000;evidence=pending_hardware_validation], executor=[mode=raster_finite;status=not_enabled_pending_hardware_validation;backend=ni_daqmx_sdk_task_wrapper;phases=validate_readiness>setup>write>start>read>wait>publish>cleanup>clear;evidence=pending_hardware_validation], reconstruction=[mode=one_detector_sample_per_pixel;input=ci_detector;scan=512x512;recon=512x512;pixel_format=Mono16;evidence=pending_hardware_validation], publication=[FrameReady:final_reconstructed_frame:scan=512x512:recon=512x512:Mono16:pending_hardware_validation], cancel=[strategy=request_stop_then_clear_created_tasks;stop=co_sample_clock>do_laser_gate>ao_scan>ci_detector;clear=co_sample_clock>ci_detector>do_laser_gate>ao_scan;evidence=pending_hardware_validation], start=[ci_detector>ao_scan>do_laser_gate>co_sample_clock], read=[ci_detector], clear=[co_sample_clock>ci_detector>do_laser_gate>ao_scan], cleanup=stop_started_tasks_then_clear_all_created_tasks
 signal_plan: execution=not_live_task_execution, blocker=feature_ni_daqmx_sdk, readiness=[ready=false;blocker=feature_ni_daqmx_sdk;missing=runtime_package+runtime_version+runtime_platform+runtime_license+sdk_header_path+sdk_header_sha256+feature_ni_daqmx_sdk+api_audit_and_hardware_validation;hardware=pending], routing=pending_hardware_validation, buffers=[signal=1024x1:1024 samples chunk=256;tasks=ci_signal:read:u32_counts:1chx1024|ai_signal:read:f64_volts:1chx1024], cleanup_timeout_s=10.000, routes=[clock:unspecified:none->ci_signal+ai_signal;trigger:none->ci_signal+ai_signal], sequence=[setup:ci_signal>ai_signal;start:ci_signal>ai_signal;read:ci_signal>ai_signal;stop:ai_signal>ci_signal;clear:ai_signal>ci_signal], completion=[mode=finite;samples=1024;timeout_s=10.000;evidence=pending_hardware_validation], contract=[mode=signal_finite;write=none;read=ci_signal>ai_signal;wait=none;auto_start=false;timeout_s=10.000;evidence=pending_hardware_validation], executor=[mode=signal_finite;status=not_enabled_pending_hardware_validation;backend=ni_daqmx_sdk_task_wrapper;phases=validate_readiness>setup>write>start>read>wait>publish>cleanup>clear;evidence=pending_hardware_validation], publication=[ScanSignalChunk:raw_signal_chunks:channels=2:chunk=256:pending_hardware_validation], cancel=[strategy=request_stop_then_clear_created_tasks;stop=ai_signal>ci_signal;clear=ai_signal>ci_signal;evidence=pending_hardware_validation], start=[ci_signal>ai_signal], read=[ci_signal,ai_signal], clear=[ai_signal>ci_signal], cleanup=stop_started_tasks_then_clear_all_created_tasks
 bench_evidence_commands:
-scripts/audit-ni-daqmx-evidence-inputs.sh
 scripts/audit-ni-daqmx-external-gates.sh
 scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>
 scripts/audit-ni-daqmx-sdk-headers.sh <header-file-or-directory>
@@ -843,8 +813,6 @@ It does not create NI tasks, write outputs, read inputs, or claim hardware suppo
 
 | Artifact | Path or value |
 | --- | --- |
-| Evidence-input audit command | `scripts/audit-ni-daqmx-evidence-inputs.sh` |
-| Evidence-input audit output |  |
 | External-gates audit command | `scripts/audit-ni-daqmx-external-gates.sh` |
 | External-gates audit output |  |
 | Package input inventory command | `scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>` |
@@ -1050,7 +1018,6 @@ Do not expose live `ConfocalImageCapture`, `ConfocalImageStream`, or `ScanSignal
 Set `NUMANAGER_DAQMX_DEVICE_NAME`, `NUMANAGER_DAQMX_LSM_X_GALVO`, `NUMANAGER_DAQMX_LSM_Y_GALVO`, `NUMANAGER_DAQMX_LSM_LASER_GATE`, `NUMANAGER_DAQMX_LSM_DETECTOR`, `NUMANAGER_DAQMX_LSM_SAMPLE_CLOCK`, `NUMANAGER_DAQMX_LSM_SAMPLE_CLOCK_SOURCE`, `NUMANAGER_DAQMX_LSM_START_TRIGGER_SOURCE`, `NUMANAGER_DAQMX_SIGNAL_AI`, `NUMANAGER_DAQMX_SIGNAL_CHANNELS`, `NUMANAGER_DAQMX_TIMEOUT_SECONDS`, and `NUMANAGER_DAQMX_HELPER_TIMEOUT_SECONDS` before generating this note when the bench mapping, DAQmx timeout, or helper supervision timeout differs from the defaults.
 
 ```sh
-scripts/audit-ni-daqmx-evidence-inputs.sh
 scripts/audit-ni-daqmx-external-gates.sh
 scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>
 scripts/audit-ni-daqmx-sdk-headers.sh <header-file-or-directory>
@@ -1180,7 +1147,6 @@ Commands containing `--simulate-error-after-start` without `--execute` are no-DA
 
 | Command | Exit status | Stdout/stderr artifact | Result | Notes |
 | --- | --- | --- | --- | --- |
-| `scripts/audit-ni-daqmx-evidence-inputs.sh` |  |  | Unknown |  |
 | `scripts/audit-ni-daqmx-external-gates.sh` |  |  | Unknown |  |
 | `scripts/audit-ni-daqmx-package-inputs.sh <installer-file-or-directory>` |  |  | Unknown |  |
 | `scripts/audit-ni-daqmx-sdk-headers.sh <header-file-or-directory>` |  |  | Unknown |  |
@@ -1570,31 +1536,6 @@ Recorded output excerpt:
 
 This audit compares public DAQmx scaffold example output against recorded documentation markers. It does not create NI-DAQmx tasks, write outputs, read inputs, execute scans, or provide hardware evidence.
 
-```
-
-## LSM/DAQmx Plan Non-Hardware Audit
-
-Command:
-
-```sh
-scripts/audit-lsm-daqmx-plan-nonhardware.sh
-```
-
-Recorded output excerpt:
-
-```text
-# LSM/DAQmx Plan Non-Hardware Audit
-
-| Boundary | Status |
-| --- | --- |
-| Shared specimen, simulator drivers, GUI source, and simulator docs exist | ok |
-| Public LSM examples and DAQmx bring-up examples are registered | ok |
-| Simulator workflow audit passes | ok |
-| Repository reverse-evidence boundary audit passes | ok |
-| DAQmx evidence-input, external-gates, target-scope, helper, plan-validation, live-gate, runtime-probe, and docs-sync audits pass | ok |
-| Saved plan records live NI-DAQmx task execution as awaiting hardware validation | ok |
-
-This aggregate audit checks the implemented non-hardware LSM simulator workflow and DAQmx safety/documentation gates from `docs/planning/lsm-simulation-and-daqmx-plan.md`. It does not create NI-DAQmx tasks, write outputs, read inputs, execute scans on hardware, or provide hardware validation evidence.
 ```
 
 ## LSM Simulator Workflow Audit

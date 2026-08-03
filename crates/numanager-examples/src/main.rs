@@ -20,8 +20,6 @@ mod lsm_daqmx_bringup_plan;
 mod lsm_daqmx_commands;
 mod lsm_daqmx_plan_validation;
 mod lsm_daqmx_validation_note;
-#[cfg(feature = "gui")]
-mod lsm_gui;
 mod lsm_line_dwell_timing;
 mod lsm_live_cancel;
 mod lsm_signal_cancel;
@@ -57,7 +55,6 @@ const EXAMPLES: &[&str] = &[
     "lsm_daqmx_bringup_plan",
     "lsm_daqmx_plan_validation",
     "lsm_daqmx_validation_note",
-    "lsm_gui",
     "lsm_line_dwell_timing",
     "lsm_live_cancel",
     "lsm_signal_cancel",
@@ -99,7 +96,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "lsm_daqmx_bringup_plan" => lsm_daqmx_bringup_plan::run()?,
         "lsm_daqmx_plan_validation" => lsm_daqmx_plan_validation::run()?,
         "lsm_daqmx_validation_note" => lsm_daqmx_validation_note::run()?,
-        "lsm_gui" => run_lsm_gui()?,
         "lsm_line_dwell_timing" => lsm_line_dwell_timing::run()?,
         "lsm_live_cancel" => lsm_live_cancel::run()?,
         "lsm_signal_cancel" => lsm_signal_cancel::run()?,
@@ -120,17 +116,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-#[cfg(feature = "gui")]
-fn run_lsm_gui() -> Result<(), Box<dyn std::error::Error>> {
-    lsm_gui::run()?;
-    Ok(())
-}
-
-#[cfg(not(feature = "gui"))]
-fn run_lsm_gui() -> Result<(), Box<dyn std::error::Error>> {
-    Err("lsm_gui requires --features gui".into())
 }
 
 #[cfg(feature = "gui")]
