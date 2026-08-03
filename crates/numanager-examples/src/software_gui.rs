@@ -514,13 +514,32 @@ fn driver_choice() -> String {
 pub fn run() -> Result<()> {
     if std::env::args().any(|arg| arg == "--smoke") {
         let source = driver_choice();
-        // A scanning instrument is exercised through its own acquisition
-        // workflows; the device/property survey below does not cover them.
+        // The device survey lists every imager the source offers, which is how a
+        // combined camera + scanning instrument shows up as two entries. A
+        // source whose runtime cannot be surveyed still reports its acquisition
+        // workflows below rather than failing outright.
+        match GuiApp::new(&source) {
+            Ok(mut app) => {
+                if let Err(error) = app.print_smoke_output() {
+                    // A scanning instrument still reports its acquisition
+                    // workflows below, so an incomplete survey is noted rather
+                    // than swallowing the rest of the output.
+                    if !is_scanning_source(&source) {
+                        return Err(error);
+                    }
+                    println!("device survey incomplete: {}", error.message);
+                }
+            }
+            Err(error) if is_scanning_source(&source) => {
+                println!("device survey unavailable: {}", error.message);
+            }
+            Err(error) => return Err(error),
+        }
+        // A scanning instrument is additionally exercised through its own
+        // acquisition workflows, which the survey does not cover.
         if is_scanning_source(&source) {
             return crate::lsm_common::smoke(&source);
         }
-        let mut app = GuiApp::new(&source)?;
-        app.print_smoke_output()?;
         return Ok(());
     }
 
@@ -1004,12 +1023,17 @@ impl GuiApp {
     fn print_smoke_output(&mut self) -> Result<()> {
         println!("software gui smoke");
         println!("imagers:");
-        for camera in &self.imagers {
+        for imager in &self.imagers {
+            // capture/stream/line_scan are the acquisition modes the GUI offers
+            // for this device, so a combined instrument shows a camera and a
+            // scanner side by side with different modes each.
             println!(
-                "  {} [{}] stream={}",
-                camera.device.label,
-                public_kind_summary(&camera.device),
-                camera.stream.is_some()
+                "  {} [{}] capture={} stream={} line_scan={}",
+                imager.device.label,
+                public_kind_summary(&imager.device),
+                imager.capture.name(),
+                imager.stream.is_some(),
+                imager.line_scan
             );
         }
         println!("pan stages:");
@@ -1032,7 +1056,15 @@ impl GuiApp {
                 None => println!("  {} -> none", camera.device.label),
             }
         }
-        let camera = self.imagers[0].device.id;
+        // The camera acquisition survey below speaks CameraCapture, so it runs
+        // against the first camera. An instrument with only a scanner has its
+        // acquisition covered by the scanning workflows instead.
+        let camera_imager = self
+            .imagers
+            .iter()
+            .find(|imager| imager.capture == CapabilityKind::CameraCapture)
+            .map(|imager| imager.device.id);
+        let camera = camera_imager.unwrap_or(self.imagers[0].device.id);
         println!("optics: {}", self.optics(camera).summary());
 
         println!("properties:");
@@ -1129,6 +1161,11 @@ impl GuiApp {
                     );
                 }
             }
+        }
+
+        if camera_imager.is_none() {
+            println!("capture: skipped, no imager advertises CameraCapture");
+            return Ok(());
         }
 
         let capture = self.runtime.execute_request(
@@ -1301,11 +1338,13 @@ impl GuiApp {
         let device = imager.device.id;
         let width = ui.get_scan_width().round().clamp(64.0, 2048.0) as u32;
         let height = ui.get_scan_height().round().clamp(1.0, 2048.0) as u32;
+        // Without detector channels the scan publishes chunks carrying no
+        // samples, so the framebuffer would stay empty.
         let request = crate::lsm_common::continuous_raster_line_signal_request(
             i64::from(width),
             i64::from(height),
             256,
-            Vec::new(),
+            crate::lsm_common::signal_channels(),
         );
         let operation = self.runtime.submit_request(device, request)?;
         self.line_buffer.reset(width, height);

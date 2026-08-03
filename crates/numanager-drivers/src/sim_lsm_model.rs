@@ -491,9 +491,16 @@ fn detector_code(
 ) -> u16 {
     let photons = signal.max(0.0) * config.photon_scale.max(1.0);
     let hash = sim_sample::mix3(config.sample.seed, frame_index, sample_index);
-    let detected = poisson_photons(photons, hash);
+
+    // `detector_noise` multiplies the detector's total noise, shot noise
+    // included, the way a detector's excess noise does. Scaling the deviation
+    // from the expected photon count rather than the count itself leaves the
+    // mean signal untouched, so the control changes noise and nothing else. A
+    // factor of 1 leaves plain photon statistics.
+    let noise = config.detector_noise.max(0.0);
+    let detected = (photons + (poisson_photons(photons, hash) - photons) * noise).max(0.0);
     let read = config.read_noise.max(0.0)
-        * config.detector_noise.max(0.0)
+        * noise
         * sim_sample::normal_deviate(sim_sample::mix64(hash ^ 0x1A5E_2D17));
     ((detected + read) / config.photon_scale.max(1.0) * f64::from(u16::MAX))
         .round()

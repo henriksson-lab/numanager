@@ -41,7 +41,7 @@
 | `model` | Hub | `String` | none | R | none | No | Simulation identity |
 | `sample_seed` | Hub | `I64` | none | R | none | No | Shared specimen model seed |
 | `detector_gain` | Hub | `Ratio` | percent | R/W | 0-500% | No | Scales simulated fluorescence signal before photon/readout conversion |
-| `detector_noise` | Hub | `Ratio` | percent | R/W | 0-500% | No | Scales simulated read-noise contribution relative to the default detector model |
+| `detector_noise` | Hub | `Ratio` | percent | R/W | 0-500% | No | Multiplies the simulated detector's total noise, shot noise included, leaving the mean signal unchanged; 100% is plain photon statistics |
 
 ## Image Model
 
@@ -53,8 +53,12 @@ deterministic Poisson photon sampling for low expected photon counts with a
 normal approximation for high-count shot noise; read noise; laser power; and
 saturated pixels.
 The `detector_gain` and `detector_noise` properties provide public simulator
-controls for signal scaling and read-noise scaling without changing hardware
-evidence claims.
+controls without changing hardware evidence claims. `detector_gain` scales the
+signal before photon conversion, so raising it adds photons and improves
+signal-to-noise. `detector_noise` scales the deviation from the expected photon
+count and the read-noise term together, so it changes noise alone: the mean
+image is unaffected while the per-pixel spread grows with the setting. Both
+apply to a stream already running, from the next frame or line onward.
 Standard LSM requests publish little-endian `Mono16` frames; `Mono8` remains
 accepted as a lower-depth reconstruction format for simple consumers.
 

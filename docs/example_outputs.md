@@ -198,7 +198,7 @@ Recorded output:
 ```text
 software gui smoke
 imagers:
-  sim-microscope-camera [camera, simulator] stream=true
+  sim-microscope-camera [camera, simulator] capture=CameraCapture stream=true line_scan=false
 pan stages:
   sim-microscope-xy [stage.xy, axis.xy, simulator]
 focus stages:

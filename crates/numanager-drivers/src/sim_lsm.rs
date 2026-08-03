@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,10 @@ pub struct SimLsmDriver {
     id: DriverId,
     resource: ResourceId,
     hub: DeviceId,
-    model: LsmFluorescenceConfig,
+    /// Shared so a running stream picks up live property writes such as
+    /// detector gain and noise, instead of rendering from a snapshot taken
+    /// when the stream started.
+    model: Arc<Mutex<LsmFluorescenceConfig>>,
     next_token: u64,
     frames: AtomicU64,
     events: VecDeque<DriverEvent>,
@@ -34,7 +37,25 @@ pub struct SimLsmDriver {
     worker_rx: Receiver<DriverEvent>,
 }
 
+/// Copy of the shared model. Rendering runs on the copy so the lock is never
+/// held across a frame or a line.
+fn snapshot_model(model: &Arc<Mutex<LsmFluorescenceConfig>>) -> LsmFluorescenceConfig {
+    *model
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl SimLsmDriver {
+    fn model_snapshot(&self) -> LsmFluorescenceConfig {
+        snapshot_model(&self.model)
+    }
+
+    fn model_lock(&self) -> MutexGuard<'_, LsmFluorescenceConfig> {
+        self.model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn simulated(id: DriverId) -> Self {
         Self::with_model(id, LsmFluorescenceConfig::default())
     }
@@ -51,7 +72,7 @@ impl SimLsmDriver {
             id,
             resource: ResourceId(NodeId(id.0 * 1000 + RESOURCE_OFFSET)),
             hub: DeviceId(NodeId(id.0 * 1000 + HUB_OFFSET)),
-            model,
+            model: Arc::new(Mutex::new(model)),
             next_token: 1,
             frames: AtomicU64::new(1),
             events: VecDeque::new(),
@@ -157,7 +178,7 @@ impl SimLsmDriver {
         let stop = Arc::new(AtomicBool::new(false));
         self.streams.insert(token, Arc::clone(&stop));
         let tx = self.worker_tx.clone();
-        let model = self.model;
+        let model = Arc::clone(&self.model);
         let device = self.hub;
         let update_policy = request
             .update_policy
@@ -173,8 +194,10 @@ impl SimLsmDriver {
             while !stop.load(Ordering::Relaxed) {
                 let started = Instant::now();
                 let frame_index = sequence + 1;
+                // Re-read per frame so detector changes apply to the next frame.
+                let snapshot = snapshot_model(&model);
                 let frame = lsm_frame(
-                    &model,
+                    &snapshot,
                     &scan,
                     "image_stream",
                     device,
@@ -231,7 +254,7 @@ impl SimLsmDriver {
         let frame_index = self.frames.fetch_add(1, Ordering::Relaxed);
         for line in 0..lines {
             let profiles = render_scan_row_profiles(
-                &self.model,
+                &self.model_snapshot(),
                 scan.spec(),
                 &request.channels,
                 samples,
@@ -247,7 +270,7 @@ impl SimLsmDriver {
                 let sample_count = chunk.len() as u64;
                 last_chunk_samples = chunk.len() as u32;
                 let mut metadata = scan_metadata(&scan);
-                metadata.extend(detector_metadata(&self.model));
+                metadata.extend(detector_metadata(&self.model_snapshot()));
                 metadata.extend([
                     ("source".into(), Value::String("sim_lsm".into())),
                     ("mode".into(), Value::String("line_scan".into())),
@@ -374,7 +397,7 @@ impl SimLsmDriver {
         let stop = Arc::new(AtomicBool::new(false));
         self.streams.insert(token, Arc::clone(&stop));
         let tx = self.worker_tx.clone();
-        let model = self.model;
+        let model = Arc::clone(&self.model);
         let device = self.hub;
         thread::spawn(move || {
             let mut line = 0u64;
@@ -390,8 +413,10 @@ impl SimLsmDriver {
                 // so a client filling a framebuffer reconstructs the same image
                 // the capture/stream capabilities render.
                 let rows = u64::from(scan.spec().height.max(1));
+                // Re-read per line so detector changes apply to the next line.
+                let snapshot = snapshot_model(&model);
                 let profiles = render_scan_row_profiles(
-                    &model,
+                    &snapshot,
                     scan.spec(),
                     &channels,
                     samples,
@@ -409,7 +434,7 @@ impl SimLsmDriver {
                     }
                     let chunk_start = first_sample as usize;
                     let mut metadata = scan_metadata(&scan);
-                    metadata.extend(detector_metadata(&model));
+                    metadata.extend(detector_metadata(&snapshot));
                     metadata.extend([
                         ("source".into(), Value::String("sim_lsm".into())),
                         ("mode".into(), Value::String("continuous_line_scan".into())),
@@ -513,7 +538,7 @@ impl SimLsmDriver {
             frame: FrameId(frame_index),
         };
         self.events.push_back(DriverEvent::FrameReady(lsm_frame(
-            &self.model,
+            &self.model_snapshot(),
             scan,
             mode,
             self.hub,
@@ -558,15 +583,15 @@ impl Driver for SimLsmDriver {
                 ),
                 (
                     "sample_seed".into(),
-                    Value::I64(self.model.sample.seed as i64),
+                    Value::I64(self.model_snapshot().sample.seed as i64),
                 ),
                 (
                     "detector_gain".into(),
-                    Value::Ratio(Ratio::from_fraction(self.model.detector_gain)),
+                    Value::Ratio(Ratio::from_fraction(self.model_snapshot().detector_gain)),
                 ),
                 (
                     "detector_noise".into(),
-                    Value::Ratio(Ratio::from_fraction(self.model.detector_noise)),
+                    Value::Ratio(Ratio::from_fraction(self.model_snapshot().detector_noise)),
                 ),
             ]),
         }]
@@ -585,7 +610,7 @@ impl Driver for SimLsmDriver {
                 ),
                 (
                     "sample_seed".into(),
-                    Value::I64(self.model.sample.seed as i64),
+                    Value::I64(self.model_snapshot().sample.seed as i64),
                 ),
             ]),
         }]
@@ -757,10 +782,12 @@ impl SimLsmDriver {
             "model" => Ok(Value::String(
                 "confocal scan over shared cell-culture model".into(),
             )),
-            "sample_seed" => Ok(Value::I64(self.model.sample.seed as i64)),
-            "detector_gain" => Ok(Value::Ratio(Ratio::from_fraction(self.model.detector_gain))),
+            "sample_seed" => Ok(Value::I64(self.model_snapshot().sample.seed as i64)),
+            "detector_gain" => Ok(Value::Ratio(Ratio::from_fraction(
+                self.model_snapshot().detector_gain,
+            ))),
             "detector_noise" => Ok(Value::Ratio(Ratio::from_fraction(
-                self.model.detector_noise,
+                self.model_snapshot().detector_noise,
             ))),
             other => Err(Error::new(
                 ErrorCode::InvalidProperty,
@@ -772,8 +799,8 @@ impl SimLsmDriver {
     fn write_property(&mut self, key: &str, value: Value) -> Result<Value> {
         let ratio = self.validate_write_property(key, &value)?;
         match key {
-            "detector_gain" => self.model.detector_gain = ratio,
-            "detector_noise" => self.model.detector_noise = ratio,
+            "detector_gain" => self.model_lock().detector_gain = ratio,
+            "detector_noise" => self.model_lock().detector_noise = ratio,
             _ => unreachable!("validate_write_property accepted an unsupported key"),
         }
         self.read_property(key)

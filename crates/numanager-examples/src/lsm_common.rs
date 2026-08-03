@@ -830,7 +830,7 @@ fn raster_scan(width: i64, height: i64, frames: i64) -> BTreeMap<String, Value> 
     ])
 }
 
-fn signal_channels() -> Vec<String> {
+pub fn signal_channels() -> Vec<String> {
     if let Ok(channels) = std::env::var("NUMANAGER_DAQMX_SIGNAL_CHANNELS") {
         let values = channels
             .split(',')
