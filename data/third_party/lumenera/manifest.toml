@@ -1,0 +1,26 @@
+# Lumenera Lu130 firmware image manifest.
+# Third-party data — see README.md.
+
+[[file]]
+name = "lumenera_fw_img00.hex"
+platform = "cypress-ez-usb/lu130"
+sha256 = "dc63db124daeccdf224e43a8cd9290f3c9a558b73efbf086e8ebb71030af5e6d"
+size_bytes = 24992
+selector = "0"
+license_note = "third-party data; not covered by repo MIT/Apache-2.0"
+
+[[file]]
+name = "lumenera_fw_img01.hex"
+platform = "cypress-ez-usb/lu130"
+sha256 = "02253fc014e68030ee33a425a0e4dca31785ea8a09593a307c8c3e1d4289c124"
+size_bytes = 25219
+selector = "1"
+license_note = "third-party data; not covered by repo MIT/Apache-2.0"
+
+[[file]]
+name = "lumenera_fw_img16.hex"
+platform = "cypress-ez-usb/lu130"
+sha256 = "8d781d1264a1cd1ae02c8ea22f016813830c2f5bbfb3acc7500348b2e43063bb"
+size_bytes = 36628
+selector = ">=2 (catch-all)"
+license_note = "third-party data; not covered by repo MIT/Apache-2.0"

@@ -1,0 +1,43 @@
+[package]
+name = "numanager-imswitch-daqmx"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+autobins = false
+
+[dependencies]
+numanager-core = { path = "../numanager-core" }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+ni-daqmx-sys = { path = "/home/mahogny/github/claude/ni-daqmx-sys", optional = true }
+
+[features]
+default = []
+ni-daqmx-sdk = ["dep:ni-daqmx-sys"]
+
+[[bin]]
+name = "numanager-daqmx-inventory-helper"
+path = "src/bin/daqmx_inventory_helper.rs"
+required-features = ["ni-daqmx-sdk"]
+
+[[bin]]
+name = "numanager-daqmx-task-lifecycle-helper"
+path = "src/bin/daqmx_task_lifecycle_helper.rs"
+required-features = ["ni-daqmx-sdk"]
+
+[[bin]]
+name = "numanager-daqmx-channel-setup-helper"
+path = "src/bin/daqmx_channel_setup_helper.rs"
+required-features = ["ni-daqmx-sdk"]
+
+[[bin]]
+name = "numanager-daqmx-plan-setup-helper"
+path = "src/bin/daqmx_plan_setup_helper.rs"
+required-features = ["ni-daqmx-sdk"]
+
+[[bin]]
+name = "numanager-daqmx-io-smoke-helper"
+path = "src/bin/daqmx_io_smoke_helper.rs"
+required-features = ["ni-daqmx-sdk"]

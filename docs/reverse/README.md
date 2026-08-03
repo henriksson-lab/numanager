@@ -1,0 +1,42 @@
+# Protocol Evidence Notes
+
+This directory tracks protocol targets where the normal source ladder has not
+yet produced enough evidence for a default SDK-free driver.
+
+Use these notes to decide whether a target can advance to a clean
+hardware-interface spec and then to a driver implementation.
+
+One entry is the inverse case: the USB3 Vision / GigE Vision / GenICam note
+records a target whose governing standards are public and authoritative, so it is
+blocked on implementation and hardware validation rather than on evidence. It is
+kept here because it is the same decision record — which documents justify which
+behavior, and what still needs a bench run.
+
+The current requirement-level status is summarized in
+[`evidence-gate-audit.md`](evidence-gate-audit.md). The source policy and
+clean-room criteria are in [`../protocol_evidence_plan.md`](../protocol_evidence_plan.md).
+
+| Target | Note | Current disposition |
+| --- | --- | --- |
+| ABS Camera | [`abs-camera.md`](abs-camera.md) | Reverse engineered evidence exists; one-shot capture can use the verified CamUSB runtime with explicit async software trigger; native transport, streaming, and broader controls are not exposed because USB protocol evidence is absent |
+| Agilent Laser Combiner | [`agilent-laser-combiner.md`](agilent-laser-combiner.md), [`agilent-laser-combiner-protocol.md`](agilent-laser-combiner-protocol.md) | Transport grammar, full opcode table, and output units recorded from external evidence; hardware-support claims wait for a real board to confirm the handshake and the missing interlock/fault surface |
+| MCL MicroDrive/NanoDrive | [`mcl.md`](mcl.md), [`mcl-protocol.md`](mcl-protocol.md) | Reverse engineered USB transport, endpoint map, VID/PID tables, vendor-request codes for both families, encoder format, and error mapping; typed motion/control is not exposed because payload fields, status-bit meaning, units/calibration, and move completion evidence is absent |
+| Mightex / Mightex_BLS | [`mightex.md`](mightex.md) | BLS/SLC has reverse engineered HID output; camera one-shot capture and repeated one-shot stream can use the verified vendor runtime; native frame transport is not exposed because protocol evidence is absent |
+| Okolab | [`okolab.md`](okolab.md) | Reverse engineered serial/configured runtime support exists from the frame grammar, checksum, handshake, error vocabulary, and `okolib.db` command dictionary in [`okolab-protocol.md`](okolab-protocol.md); hardware-support claims wait for ACK/status/fault replies and matching runtime output/readback traces |
+| Photometrics PVCAM | [`photometrics-pvcam.md`](photometrics-pvcam.md) | Configured evidence plus runtime-package file-status/digest/loadability/ABI-symbol checks, camera-name discovery, writable exposure setting, one-shot capture, repeated one-shot stream support, and runtime temperature read/setpoint control exist; native continuous streaming and broader control require further validation or validated native USB/PCIe traces |
+| Squid controller | [`squid-protocol.md`](squid-protocol.md) | Open firmware/controller source protocol spec for the existing simulated protocol-backed fixture; hardware validation note pending |
+| USB3 Vision / GigE Vision / GenICam | [`usb3-vision-genicam.md`](usb3-vision-genicam.md) | Not evidence-blocked: the governing standards are public, and GenCP/GenApi/SFNC/PFNC are free from EMVA. Live U3V `ReadMem`/`WriteMem` and UDP GVCP register paths exist, stream framing types are written but unfed, and the GenICam node map is not yet bound to either transport; stream receive plus a real camera are what remain |
+| Xeryon ASCII and integrated CANopen stages | [`xeryon.md`](xeryon.md) | Manufacturer controller manuals document ASCII serial framing, command/readback tags, units, and status bits; Xeryon integrated-controller materials identify CANopen/CiA 402 and EDS/example paths; native ASCII support exists, and integrated CANopen support includes transaction planning, optional live SocketCAN/SLCAN NMT/SDO execution, and EDS object parsing |
+
+Reverse engineered tooling and raw outputs are kept outside this
+repository. Curate only wire-level facts, artifact hashes, and validation gaps
+into the target note. Do not commit proprietary binaries, analysis tools, or
+large raw dumps.
+
+When the static pass reaches a serial/HID/USB boundary, use
+[`trace-capture-guide.md`](trace-capture-guide.md) to collect the hardware
+identity, command/action mapping, completion, fault, and frame/stream evidence
+needed before adding hardware operations that are not already defined by the
+current reverse engineered support. Use [`trace-note-template.md`](trace-note-template.md)
+when the capture needs a curated action timeline with runtime output and
+hardware output/readback.

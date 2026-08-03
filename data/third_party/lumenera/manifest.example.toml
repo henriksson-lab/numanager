@@ -1,0 +1,9 @@
+# Example only. Copy to `manifest.toml` and fill in for a local firmware set.
+#
+# [[file]]
+# name = "firmware-image-file.hex"
+# platform = "cypress-ez-usb/lu130"
+# sha256 = "replace-with-digest"
+# size_bytes = 0
+# selector = "bcdDevice value that selects this image"
+# license_note = "third-party data; not covered by repo MIT/Apache-2.0"

@@ -1,0 +1,62 @@
+name: Build
+
+# numanager is a driver collection consumed by other applications, so the thing
+# CI has to protect is simply: does it still build, everywhere? Windows is the
+# reason this exists — it is the platform where nusb's device-level control
+# transfers do not exist and where there is no system SQLite, and both of those
+# have already reached downstream projects as build failures.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never let one platform's failure hide another's — the point is knowing
+      # which platforms are broken, not just that something is.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        # libudev-dev: serialport (os-serial) and hidapi (os-hid) link against
+        # it. libfontconfig1-dev: slint, behind the examples' `gui` feature.
+        # macOS and Windows need no extra packages.
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev libfontconfig1-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Default features: the drivers' protocol logic and fixture paths.
+      # --all-targets also builds test code, so a broken test compiles here.
+      - name: Build (default features)
+        run: cargo build --workspace --all-targets
+
+      # The real device transports. These matter most: the USB/serial/HID code
+      # is `#[cfg(feature = ...)]`-gated, so a default build never compiles it
+      # and platform-specific breakage hides until someone enables a feature.
+      - name: Build (device transports)
+        run: cargo build --workspace --features numanager-drivers/os-usb,numanager-drivers/os-serial,numanager-drivers/os-hid
+
+      - name: Build (GUI example)
+        run: cargo build --workspace --features numanager-examples/gui

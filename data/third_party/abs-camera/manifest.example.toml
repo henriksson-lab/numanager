@@ -1,0 +1,7 @@
+# Example only. Copy to a local manifest when an ABS camera vendor firmware/runtime package is available.
+#
+# [[file]]
+# name = "abs-camera-runtime-package-file"
+# platform = "windows-x86_64"
+# sha256 = "replace-with-digest"
+# license_note = "third-party data; see local redistribution record"

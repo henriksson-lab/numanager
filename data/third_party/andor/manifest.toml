@@ -1,0 +1,38 @@
+# Third-party data. These files are not covered by this repository's
+# MIT or Apache-2.0 license terms.
+
+[[file]]
+name = "fx2_AndorCam.hex"
+kind = "firmware"
+family = "andor-sdk2-fx2"
+platform = "camera-firmware"
+sha256 = "08430b0259a6cd9f73ece020e42a140c6a7f615e03510e999952d3da0e47ac23"
+size_bytes = 23683
+license_note = "third-party data; verify redistribution terms before distribution"
+
+[[file]]
+name = "fx2_usbcam.hex"
+kind = "firmware"
+family = "andor-sdk2-fx2"
+platform = "camera-firmware"
+sha256 = "f816b02e8bdb2430d44eb611bbcdacb09b991617fd86ba98f80032b977baa2a2"
+size_bytes = 13571
+license_note = "third-party data; verify redistribution terms before distribution"
+
+[[file]]
+name = "fx2_vendax.hex"
+kind = "firmware"
+family = "andor-sdk2-fx2"
+platform = "camera-firmware"
+sha256 = "3a16f3c6b3570ba9013345589fd89aca77ab2dcd920b5ae789699ff53c8dd4df"
+size_bytes = 10422
+license_note = "third-party data; verify redistribution terms before distribution"
+
+[[file]]
+name = "fx2_temp_prog.hex"
+kind = "firmware"
+family = "andor-sdk2-fx2"
+platform = "camera-firmware"
+sha256 = "0d6a42d8e036c39468a7b60e58f5a801c4f0d2ba093c70e6199ff5e6fa6c0aca"
+size_bytes = 11648
+license_note = "third-party data; verify redistribution terms before distribution"

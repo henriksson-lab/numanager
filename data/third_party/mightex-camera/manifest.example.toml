@@ -1,0 +1,7 @@
+# Example only. Copy to a local manifest when a Mightex camera vendor firmware/runtime package is available.
+#
+# [[file]]
+# name = "mightex-camera-runtime-package-file"
+# platform = "windows-x86_64"
+# sha256 = "replace-with-digest"
+# license_note = "third-party data; see local redistribution record"

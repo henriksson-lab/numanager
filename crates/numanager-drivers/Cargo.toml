@@ -1,0 +1,30 @@
+[package]
+name = "numanager-drivers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+numanager-core = { path = "../numanager-core" }
+futures-lite = { version = "2", optional = true }
+hex = "0.4"
+libloading = "0.8.9"
+nusb = { version = "0.1", optional = true }
+# serde/serde_json are unconditional: the Okolab driver embeds its command
+# dictionary as JSON (see okolab.rs), so they are needed with or without the
+# os-* transports. This crate deliberately has no SQLite dependency — the
+# dictionary is extracted ahead of time by scripts/extract-okolab-db.sh.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = { version = "4", optional = true }
+sha2 = "0.10"
+
+[features]
+default = []
+egrabber-sdk = []
+os-can = ["numanager-core/os-can"]
+os-hid = ["numanager-core/os-hid"]
+os-serial = ["numanager-core/os-serial", "dep:serialport"]
+os-usb = ["dep:futures-lite", "dep:nusb"]

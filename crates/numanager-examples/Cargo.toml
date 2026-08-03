@@ -1,0 +1,26 @@
+[package]
+name = "numanager-examples"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+autobins = false
+
+[dependencies]
+numanager-core = { path = "../numanager-core" }
+numanager-drivers = { path = "../numanager-drivers" }
+numanager-imswitch-daqmx = { path = "../numanager-imswitch-daqmx" }
+slint = { version = "1.17", features = ["renderer-software"], optional = true }
+
+[features]
+default = []
+gui = ["dep:slint"]
+ni-daqmx-sdk = ["numanager-imswitch-daqmx/ni-daqmx-sdk"]
+os-hid = ["numanager-drivers/os-hid"]
+os-serial = ["numanager-drivers/os-serial"]
+os-usb = ["numanager-drivers/os-usb"]
+
+[[bin]]
+name = "numanager-examples"
+path = "src/main.rs"

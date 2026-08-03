@@ -1,0 +1,13 @@
+# Example only. Copy to a local manifest when a vendor package is available.
+#
+# [[file]]
+# name = "mcl-runtime-package-file"
+# platform = "windows-x86_64"
+# sha256 = "replace-with-digest"
+# license_note = "third-party data; see local redistribution record"
+#
+# [[file]]
+# name = "mcl-firmware-package-file"
+# platform = "controller-family-or-platform"
+# sha256 = "replace-with-digest"
+# license_note = "third-party data; see local redistribution record"

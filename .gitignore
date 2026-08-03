@@ -1,0 +1,19 @@
+/target/
+**/*.rs.bk
+
+# Fetched spectral curves. Upstream cannot clear third-party rights on
+# vendor-deposited data, so generated curve sets are cached, not redistributed.
+# See docs/filter_spectra_databases.md.
+/data/*
+!/data/third_party/
+!/data/third_party/*
+!/data/third_party/README.md
+!/data/third_party/okolab/
+!/data/third_party/okolab/*
+!/data/third_party/okolab/README.md
+!/data/third_party/okolab/okolib.db
+!/data/third_party/andor/
+!/data/third_party/andor/README.md
+!/data/third_party/andor/manifest.example.toml
+!/data/third_party/lumenera/
+!/data/third_party/lumenera/*
