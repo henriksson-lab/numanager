@@ -11,7 +11,7 @@ autobins = false
 numanager-core = { path = "../numanager-core" }
 
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-ni-daqmx-sys = { path = "/home/mahogny/github/claude/ni-daqmx-sys", optional = true }
+ni-daqmx-sys = { git = "https://github.com/mahogny/ni-daqmx-sys", optional = true }
 
 [features]
 default = []

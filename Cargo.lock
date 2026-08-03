@@ -3185,6 +3185,7 @@ dependencies = [
 [[package]]
 name = "ni-daqmx-sys"
 version = "26.3.1"
+source = "git+https://github.com/mahogny/ni-daqmx-sys#a0b8093686acd349bfea9b984dc4e656682e0a50"
 dependencies = [
  "bindgen",
 ]

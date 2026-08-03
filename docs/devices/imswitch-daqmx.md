@@ -138,8 +138,9 @@ The current Linux header has no literal package-version macro, so
 runtime/package version claims must be paired with
 `daqmx_runtime_probe` and package-input evidence.
 
-Inventory the local `ni-daqmx-sys` fork that numanager will link against after
-any bindgen regeneration or platform-support change:
+Inventory a checkout of the `ni-daqmx-sys` fork that numanager links from
+`https://github.com/mahogny/ni-daqmx-sys` after any bindgen regeneration or
+platform-support change:
 
 ```sh
 scripts/audit-ni-daqmx-sys-source.sh <ni-daqmx-sys-repo>
@@ -149,10 +150,10 @@ Record the output and API audit notes in
 [`ni-daqmx-sdk-evidence-template.md`](ni-daqmx-sdk-evidence-template.md). Mirror
 the package identity into `runtime_package`, `runtime_version`,
 `runtime_platform`, `runtime_license`, `sdk_header_path`, and
-`sdk_header_sha256`. The `ni-daqmx-sys` dependency is target-scoped to Linux and
-Windows in numanager. macOS remains configured-only unless NI-provided SDK and
-runtime evidence exists and a separate target-platform binding audit has been
-recorded.
+`sdk_header_sha256`. The `ni-daqmx-sys` dependency uses the GitHub fork and is
+target-scoped to Linux and Windows in numanager. macOS remains configured-only
+unless NI-provided SDK and runtime evidence exists and a separate
+target-platform binding audit has been recorded.
 For regenerated 26.5 bindings, the evidence note must record the exact
 installed target-platform `NIDAQmx.h` path used for bindgen and the bindgen
 regeneration command. The FFI-source audit must then come from that regenerated

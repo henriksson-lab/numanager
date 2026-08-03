@@ -21,8 +21,8 @@ buffer behavior, or hardware completion semantics are correct on a real device.
 | Header title line | `/* Title:       NIDAQmx.h                                                     */` |
 | Header copyright line | `/*    Copyright (c) National Instruments 2003-2026.  All Rights Reserved.     */` |
 | Literal package-version macro in header | none found by `scripts/audit-ni-daqmx-sdk-headers.sh` |
-| FFI source | Local `ni-daqmx-sys` fork regenerated from the Linux header with bindgen scripts |
-| FFI source path | `/home/mahogny/github/claude/ni-daqmx-sys` |
+| FFI source | `https://github.com/mahogny/ni-daqmx-sys` fork regenerated from the Linux header with bindgen scripts |
+| FFI source path | Git dependency `https://github.com/mahogny/ni-daqmx-sys`; audited local checkout `/home/mahogny/github/claude/ni-daqmx-sys` |
 | FFI package version | `26.3.1` |
 | FFI package edition | `2024` |
 | FFI package license | `MIT` |
@@ -80,7 +80,7 @@ That aggregate audit runs the package-input, installed-header, and FFI-source
 inventory scripts against configured local paths and checks stable markers
 without loading the runtime or making task/hardware claims. Override
 `NUMANAGER_DAQMX_PACKAGE_INPUTS`, `NUMANAGER_DAQMX_HEADER_ROOT`, and
-`NUMANAGER_DAQMX_SYS_REPO` when the inputs live elsewhere.
+`NUMANAGER_DAQMX_SYS_REPO` when the inputs or fork checkout live elsewhere.
 
 ```sh
 scripts/audit-ni-daqmx-sys-source.sh /home/mahogny/github/claude/ni-daqmx-sys

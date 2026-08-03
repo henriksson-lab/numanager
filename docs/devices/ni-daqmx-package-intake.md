@@ -200,12 +200,12 @@ hardware validation.
 - Audit installed Linux or Windows 26.5 SDK headers if those packages are used
   to regenerate bindings. The preferred procedure is to run
   `scripts/audit-ni-daqmx-sdk-headers.sh <installed-header-path-or-directory>`,
-  regenerate the local `ni-daqmx-sys` fork with its bindgen script for the
-  target platform, and then run
+  regenerate the `ni-daqmx-sys` fork with its bindgen script for the target
+  platform, push the fork, and then run
   `scripts/audit-ni-daqmx-sys-source.sh /home/mahogny/github/claude/ni-daqmx-sys`
-  before changing numanager to depend on the regenerated fork revision. The
-  scripts prefer an installed `bindgen` CLI and can fall back to the fork-local
-  Cargo generator when the CLI is not installed.
+  before updating numanager's git dependency revision. The scripts prefer an
+  installed `bindgen` CLI and can fall back to the fork-local Cargo generator
+  when the CLI is not installed.
 - Re-run
   `scripts/audit-ni-daqmx-package-inputs.sh /home/mahogny/github/claude/reveng-dll/nidaq`
   whenever package files are added, removed, or replaced, then update this note

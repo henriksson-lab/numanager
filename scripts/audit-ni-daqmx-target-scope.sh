@@ -44,7 +44,7 @@ if [[ $missing -ne 0 ]]; then
 fi
 
 require_literal "$manifest" '[target.'"'"'cfg(any(target_os = "linux", target_os = "windows"))'"'"'.dependencies]' 'Linux/Windows target-scoped dependency table'
-require_literal "$manifest" 'ni-daqmx-sys = { path = "/home/mahogny/github/claude/ni-daqmx-sys", optional = true }' 'optional ni-daqmx-sys dependency'
+require_literal "$manifest" 'ni-daqmx-sys = { git = "https://github.com/mahogny/ni-daqmx-sys", optional = true }' 'optional ni-daqmx-sys dependency'
 require_literal "$manifest" 'ni-daqmx-sdk = ["dep:ni-daqmx-sys"]' 'ni-daqmx-sdk feature dependency'
 
 top_level_dep_lines=$(

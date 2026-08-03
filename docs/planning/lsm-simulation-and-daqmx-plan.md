@@ -212,7 +212,8 @@ Current SDK/runtime intake notes:
   intentionally tied to `daqmx_runtime_probe` and package-intake evidence
   instead of inferred from the header alone. The header audit exits non-zero if
   `NIDAQmx.h` is absent from the supplied file/directory.
-- The local `ni-daqmx-sys` fork at
+- The `ni-daqmx-sys` fork at `https://github.com/mahogny/ni-daqmx-sys` is the
+  numanager dependency; the local checkout at
   `/home/mahogny/github/claude/ni-daqmx-sys` has been regenerated with the
   bindgen scripts from the Linux header and compiles/tests on Linux. The scripts
   prefer an installed bindgen CLI and fall back to the fork-local Cargo
@@ -462,10 +463,11 @@ Current SDK/runtime intake notes:
   DAQmx API surface, required validation gates, and pending hardware-validation
   evidence status.
 - `docs/example_outputs.md` now records a current
-  `scripts/audit-ni-daqmx-sys-source.sh` excerpt for the local `ni-daqmx-sys`
-  fork, including worktree status, bindgen inputs, platform-boundary verdict,
-  and required generated symbols, while keeping it explicitly scoped to
-  FFI-source evidence rather than runtime or hardware behavior.
+  `scripts/audit-ni-daqmx-sys-source.sh` excerpt for the audited
+  `ni-daqmx-sys` checkout, including worktree status, bindgen inputs,
+  platform-boundary verdict, and required generated symbols, while keeping it
+  explicitly scoped to FFI-source evidence rather than runtime or hardware
+  behavior.
 - The package-input audit now prints standalone Windows payload
   license/EULA/copyright file identities when present instead of silently
   dropping that positive case; the current 26.5 online-installer payload still
