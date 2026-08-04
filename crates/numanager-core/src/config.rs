@@ -506,11 +506,66 @@ fn parse_string_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Split a TOML array body on its top-level commas, leaving quoted commas alone.
+///
+/// A naive `split(',')` cuts "Dichroic 510, long pass" in half, which is exactly the kind of
+/// name a person gives a mirror.
+fn split_toml_array(body: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    for character in body.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if in_quotes => {
+                current.push(character);
+                escaped = true;
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(character);
+            }
+            '[' if !in_quotes => {
+                depth += 1;
+                current.push(character);
+            }
+            ']' if !in_quotes => {
+                depth = depth.saturating_sub(1);
+                current.push(character);
+            }
+            ',' if !in_quotes && depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(character),
+        }
+    }
+    parts.push(current);
+    parts
+        .into_iter()
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
 fn parse_value_for_key(key: &str, value: &str) -> Value {
     if value == "true" {
         Value::Bool(true)
     } else if value == "false" {
         Value::Bool(false)
+    } else if value.starts_with('[') && value.ends_with(']') {
+        let body = &value[1..value.len() - 1];
+        Value::List(
+            split_toml_array(body)
+                .iter()
+                .map(|item| parse_value_for_key(key, item))
+                .collect(),
+        )
     } else if value.starts_with('"') {
         let parsed = parse_string(value);
         parse_typed_string(key, &parsed).unwrap_or(Value::String(parsed))
@@ -630,7 +685,14 @@ fn value_to_toml(value: &Value) -> String {
         Value::FlowRate(v) => format!("\"{} {}\"", v.value, v.unit_symbol()),
         Value::String(v) => format!("\"{}\"", escape(v)),
         Value::Bytes(v) => format!("\"{} bytes\"", v.len()),
-        Value::List(_) | Value::Map(_) | Value::Null => "\"unsupported\"".to_string(),
+        // A TOML array. Lists carry things a person typed — the names of the filters in a
+        // wheel's slots — so they have to survive a save/load round trip rather than
+        // degrade to a placeholder the next load would read back as a string.
+        Value::List(items) => {
+            let rendered = items.iter().map(value_to_toml).collect::<Vec<_>>().join(", ");
+            format!("[{rendered}]")
+        }
+        Value::Map(_) | Value::Null => "\"unsupported\"".to_string(),
     }
 }
 
@@ -667,5 +729,95 @@ fn parse_role(value: &str) -> Role {
         "autofocus" => Role::Autofocus,
         "environment" => Role::Environment,
         other => Role::Custom(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reparse(config: &HardwareConfig) -> HardwareConfig {
+        parse_config(&config.to_toml()).expect("a config we just rendered should parse")
+    }
+
+    fn with_property(key: &str, value: Value) -> HardwareConfig {
+        HardwareConfig {
+            devices: vec![DeviceConfig::new(
+                7,
+                "prior-filter-wheel-1",
+                "prior",
+                BTreeMap::from([(key.to_string(), value)]),
+            )],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_list_property_survives_a_save_and_load() {
+        // Before lists round-tripped, this rendered as "unsupported" and came back a string,
+        // silently losing every filter name the moment a config was rewritten.
+        let labels = Value::List(vec![
+            Value::String("485/20".into()),
+            Value::String("500/100".into()),
+            Value::String("600/30".into()),
+        ]);
+        let config = with_property("slot_labels", labels.clone());
+        assert_eq!(
+            reparse(&config).devices[0].properties.get("slot_labels"),
+            Some(&labels)
+        );
+    }
+
+    #[test]
+    fn a_name_containing_a_comma_is_not_split_in_two() {
+        let labels = Value::List(vec![Value::String("Dichroic 510, long pass".into())]);
+        let config = with_property("slot_labels", labels.clone());
+        assert_eq!(
+            reparse(&config).devices[0].properties.get("slot_labels"),
+            Some(&labels)
+        );
+    }
+
+    #[test]
+    fn a_name_containing_a_quote_is_not_split_in_two() {
+        let labels = Value::List(vec![Value::String("the \"good\" GFP filter".into())]);
+        let config = with_property("slot_labels", labels.clone());
+        assert_eq!(
+            reparse(&config).devices[0].properties.get("slot_labels"),
+            Some(&labels)
+        );
+    }
+
+    #[test]
+    fn an_empty_list_stays_an_empty_list() {
+        let config = with_property("slot_labels", Value::List(Vec::new()));
+        assert_eq!(
+            reparse(&config).devices[0].properties.get("slot_labels"),
+            Some(&Value::List(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn scalar_properties_are_unaffected() {
+        let config = HardwareConfig {
+            devices: vec![DeviceConfig::new(
+                7,
+                "prior-filter-wheel-1",
+                "prior",
+                BTreeMap::from([
+                    ("positions".into(), Value::I64(6)),
+                    ("label".into(), Value::String("wheel".into())),
+                    ("enabled".into(), Value::Bool(true)),
+                ]),
+            )],
+            ..Default::default()
+        };
+        let properties = &reparse(&config).devices[0].properties;
+        assert_eq!(properties.get("positions"), Some(&Value::I64(6)));
+        assert_eq!(
+            properties.get("label"),
+            Some(&Value::String("wheel".into()))
+        );
+        assert_eq!(properties.get("enabled"), Some(&Value::Bool(true)));
     }
 }

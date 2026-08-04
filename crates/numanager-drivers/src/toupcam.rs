@@ -2726,7 +2726,8 @@ mod live_toupcam {
     use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient, RequestBuffer};
     use nusb::Interface;
     use serde::Deserialize;
-    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     /// Vendor request that starts and stops the image stream; `wValue` selects
@@ -2750,9 +2751,59 @@ mod live_toupcam {
         }
     }
 
+    /// Bulk chunks buffered ahead of the consumer, at [`BULK_CHUNK`] each.
+    ///
+    /// Bounded on purpose: the sensor free-runs at several megabytes a second,
+    /// so an unread stream would grow without limit. A full channel blocks the
+    /// reader, which stops resubmitting, which lets the device back off — the
+    /// right thing to do while nobody is asking for frames.
+    const STREAM_BACKLOG: usize = 8;
+
+    /// A running read of the image endpoint, alive for as long as the handle is.
+    ///
+    /// **One queue per handle, never one per frame.** The sensor free-runs, so
+    /// a queue built and dropped around each frame cancels its own in-flight
+    /// transfers as it goes — and those cancellations land in the *next* grab,
+    /// which the device then reports as `transfer was cancelled`. Measured on a
+    /// U3CMOS03100KPA, that cost every other frame in a continuous read.
+    struct StreamReader {
+        rx: Receiver<std::result::Result<Vec<u8>, String>>,
+    }
+
+    impl StreamReader {
+        fn start(iface: Interface) -> Self {
+            let (tx, rx) = sync_channel::<std::result::Result<Vec<u8>, String>>(STREAM_BACKLOG);
+            std::thread::spawn(move || {
+                let mut queue = iface.bulk_in_queue(EP_IMAGE);
+                for _ in 0..16 {
+                    queue.submit(RequestBuffer::new(BULK_CHUNK));
+                }
+                loop {
+                    let completion = block_on(queue.next_complete());
+                    let message = completion
+                        .status
+                        .map(|_| completion.data.clone())
+                        .map_err(|error| error.to_string());
+                    let stop = message.is_err();
+                    // Blocks while the consumer is behind; that backpressure is
+                    // what keeps the backlog bounded.
+                    if tx.send(message).is_err() || stop {
+                        return;
+                    }
+                    queue.submit(RequestBuffer::new(BULK_CHUNK));
+                }
+            });
+            Self { rx }
+        }
+    }
+
     pub struct LiveToupcam {
         iface: Interface,
         model: ToupcamModel,
+        /// Started on the first frame read and kept running. Cleared when the
+        /// stream errors, so the next read builds a fresh one rather than
+        /// talking to a thread that has already exited.
+        reader: Mutex<Option<StreamReader>>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -2886,7 +2937,11 @@ mod live_toupcam {
                 ))
             })?;
             let _ = iface.set_alt_setting(0);
-            let live = Self { iface, model };
+            let live = Self {
+                iface,
+                model,
+                reader: Mutex::new(None),
+            };
             live.init()?;
             Ok(live)
         }
@@ -3100,70 +3155,73 @@ mod live_toupcam {
         /// length on every frame.
         pub fn read_frame(&self, expected_bytes: usize) -> Result<Vec<u8>> {
             let wire_bytes = expected_bytes + self.model.frame_trailer_bytes;
-            let iface = self.iface.clone();
-            let (tx, rx) = channel::<std::result::Result<Vec<u8>, String>>();
-            std::thread::spawn(move || {
-                let mut queue = iface.bulk_in_queue(EP_IMAGE);
-                for _ in 0..16 {
-                    queue.submit(RequestBuffer::new(BULK_CHUNK));
-                }
+            let mut held = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+            // Restart the stream if a previous read left it dead.
+            let mut restart = false;
+            let outcome = {
+                let reader = held.get_or_insert_with(|| StreamReader::start(self.iface.clone()));
+                // Whatever arrived while nobody was reading describes a moment
+                // that has passed, and may predate the exposure just programmed.
+                // Rejoin at the live edge rather than hand back the past.
+                while reader.rx.try_recv().is_ok() {}
+
+                // The device delimits frames with a short bulk transfer. Reading
+                // a fixed byte count from wherever the stream happens to be
+                // returns a torn frame (the camera is free-running and this read
+                // starts at an arbitrary offset), so segment on that delimiter
+                // and keep the first segment that holds a whole frame. Partial
+                // leading segments — and a trailer that arrives in its own
+                // transfer — are discarded.
+                let mut frame = Vec::with_capacity(wire_bytes + BULK_CHUNK);
+                let deadline = Instant::now() + Duration::from_millis(15_000);
                 loop {
-                    let completion = block_on(queue.next_complete());
-                    let message = completion
-                        .status
-                        .map(|_| completion.data.clone())
-                        .map_err(|error| error.to_string());
-                    let stop = message.is_err();
-                    if tx.send(message).is_err() || stop {
-                        return;
-                    }
-                    queue.submit(RequestBuffer::new(BULK_CHUNK));
-                }
-            });
-            // The device delimits frames with a short bulk transfer. Reading a
-            // fixed byte count from wherever the stream happens to be returns a
-            // torn frame (the camera is free-running and this read starts at an
-            // arbitrary offset), so segment on that delimiter and keep the first
-            // segment that holds a whole frame. Partial leading segments — and a
-            // trailer that arrives in its own transfer — are discarded.
-            let mut frame = Vec::with_capacity(wire_bytes + BULK_CHUNK);
-            let deadline = Instant::now() + Duration::from_millis(15_000);
-            loop {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(usb_error(format!(
-                        "Toupcam {} frame read timed out ({} of {wire_bytes} bytes)",
-                        self.model.model,
-                        frame.len(),
-                    )));
-                }
-                match rx.recv_timeout(deadline - now) {
-                    Ok(Ok(data)) => {
-                        let short = data.len() < BULK_CHUNK;
-                        frame.extend_from_slice(&data);
-                        if frame.len() >= wire_bytes {
-                            frame.truncate(expected_bytes);
-                            return Ok(frame);
-                        }
-                        if short {
-                            // Frame boundary reached with too little data: this
-                            // was a partial frame or a lone trailer. Resynchronize.
-                            frame.clear();
-                        }
-                    }
-                    Ok(Err(error)) => return Err(usb_error(format!("bulk stream error: {error}"))),
-                    Err(RecvTimeoutError::Timeout) => {
-                        return Err(usb_error(format!(
-                            "short Toupcam {} frame: {} of {wire_bytes} bytes",
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break Err(usb_error(format!(
+                            "Toupcam {} frame read timed out ({} of {wire_bytes} bytes)",
                             self.model.model,
                             frame.len(),
                         )));
                     }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        return Err(usb_error("bulk stream thread ended"));
+                    match reader.rx.recv_timeout(deadline - now) {
+                        Ok(Ok(data)) => {
+                            let short = data.len() < BULK_CHUNK;
+                            frame.extend_from_slice(&data);
+                            if frame.len() >= wire_bytes {
+                                frame.truncate(expected_bytes);
+                                break Ok(frame);
+                            }
+                            if short {
+                                // Frame boundary reached with too little data:
+                                // this was a partial frame or a lone trailer.
+                                // Resynchronize.
+                                frame.clear();
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            // The reader thread stops on its first error, so the
+                            // handle needs a new one before the next frame.
+                            restart = true;
+                            break Err(usb_error(format!("bulk stream error: {error}")));
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            break Err(usb_error(format!(
+                                "short Toupcam {} frame: {} of {wire_bytes} bytes",
+                                self.model.model,
+                                frame.len(),
+                            )));
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            restart = true;
+                            break Err(usb_error("bulk stream thread ended"));
+                        }
                     }
                 }
+            };
+            if restart {
+                *held = None;
             }
+            outcome
         }
     }
 }

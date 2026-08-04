@@ -7,6 +7,7 @@ pub mod config;
 pub mod hid;
 pub mod runtime;
 pub mod serial;
+pub mod slots;
 pub mod usb;
 
 pub type Result<T> = std::result::Result<T, Error>;
