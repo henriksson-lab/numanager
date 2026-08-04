@@ -45,7 +45,7 @@ runtime/package backend or after independent protocol evidence is recorded.
 | `Marzhauser-LStep` | Marzhauser stages | serial ASCII | direct |
 | `Corvus` | ITK/Corvus stage controllers | serial ASCII | likely |
 | `ChuoSeiki_QT` | Chuo Seiki stages | serial ASCII | likely |
-| `WOSM` | project-defined microscope controller | TCP text | likely |
+| `WOSM` | project-defined microscope controller | TCP text | implemented from WOSM v0.900 command page plus legacy source-backed adapter evidence |
 | `ThorlabsElliptecSlider` / `Thorlabs_ELL14` | Elliptec sliders/rotators | serial ASCII | likely |
 | `ThorlabsSC10` | SC10 shutter | serial ASCII | likely |
 | `ThorlabsAPTStage` and related APT devices | Thorlabs stages/controllers | APT binary protocol over USB/serial | likely |

@@ -6,12 +6,12 @@
 | --- | --- |
 | Driver module | `numanager_drivers::wosm` |
 | Families | Warwick Open-Source Microscope controller |
-| Support level | Prompt-based TCP output, switch-state timing sequence loading/run/end, blanking-control, aggregate digital-input, input-pull-up control, and raw analog-input readback behind opt-in `connect` |
-| Protocol evidence | Reverse engineered TCP login, prompt-based command mode, CRLF text commands, digital outputs, DAC outputs, stage DAC channels, shutter/switch behavior, and `L,<pin>` / `A,<channel>` / `D,<pin>,<enabled>` input commands |
-| Transport | TCP text session, default host shown by controller LCD, default port 23, CRLF commands, `W>` prompt completion |
+| Support level | Project-command-page-backed TCP output for `dig_out`, `dig_in`, `dac_dest`, and `stg_out_*`; legacy source-backed switch-sequence, blanking, pull-up, and raw analog-input commands behind opt-in `connect` |
+| Protocol evidence | WOSM MCU command page for firmware code base `v0.900`; legacy reverse evidence for TCP login, prompt completion, CRLF framing, `P`/`N`/`R`/`E` sequences, `B`/`F` blanking, `A,<channel>` raw analog input, and `D,<pin>,<enabled>` pull-up commands |
+| Transport | TCP text session, default host shown by controller LCD, driver/controller-PC Telnet port `1023` by default, configurable user Telnet port `23`, CRLF commands, `W>` prompt completion |
 | Discovery | Config-backed two-stage discovery; optional TCP connection from config |
 | Validation | No hardware validation |
-| Runtime/evidence notes | Analog raw-count scaling, route mapping, non-switch sequence loading, sequence timing, blanking timing, current scaling, and safety behavior need hardware traces or documentation |
+| Runtime/evidence notes | [`../reverse/wosm-protocol.md`](../reverse/wosm-protocol.md) records the command-page audit. Analog raw-count scaling, route mapping, legacy sequence commands, blanking timing, current scaling, and safety behavior need hardware traces or firmware documentation |
 
 ## Logical Devices
 
@@ -29,21 +29,21 @@
 
 | Resource | Kind | Purpose |
 | --- | --- | --- |
-| `wosm-tcp` | `tcp.text` | Shared command session for microscope controller, stage DACs, digital switch/shutter lines, high-current light DACs, connected input readback, and input-pull-up writes; resource metadata records configured `host`, `port`, `prompt_timeout`, and `connected` state |
+| `wosm-tcp` | `tcp.text` | Shared command session for microscope controller, stage control, digital switch/shutter lines, high-current DAC destinations, connected input readback, and input-pull-up writes; resource metadata records configured `host`, `port`, `prompt_timeout`, and `connected` state |
 
 ## Capabilities
 
 | Capability | Device | Request | Response | Completion | Timing support |
 | --- | --- | --- | --- | --- | --- |
-| `StageMove` | `wosm-xy-stage` | `CapabilityRequest::StageMove` with X/Y targets | XYZ position map | TCP `W>` prompt when `connect = true`; configured completion otherwise | Not sequenceable by current WOSM sequence protocol |
-| `StageMove` | `wosm-z-stage` | `CapabilityRequest::StageMove` with Z target | XYZ position map | TCP `W>` prompt when `connect = true`; configured completion otherwise | Not sequenceable by current WOSM sequence protocol |
+| `StageMove` | `wosm-xy-stage` | `CapabilityRequest::StageMove` with X/Y targets | XYZ position map | `stg_out_x` / `stg_out_y` plus TCP `W>` prompt when `connect = true`; configured completion otherwise | Not sequenceable by current WOSM sequence protocol |
+| `StageMove` | `wosm-z-stage` | `CapabilityRequest::StageMove` with Z target | XYZ position map | `stg_out_z` plus TCP `W>` prompt when `connect = true`; configured completion otherwise | Not sequenceable by current WOSM sequence protocol |
 | `DigitalIo` | `wosm-switch` | `CapabilityRequest::DigitalIo` with whole output mask | Switch-state integer | TCP `W>` prompt when `connect = true`; configured completion otherwise | `state` is sequenceable |
 | `TriggerSource` | `wosm-switch` | `CapabilityRequest::Trigger` enable/disable/pulse | Sequence-enabled bool | TCP `W>` prompt when `connect = true`; configured completion otherwise | Starts/stops the switch-state sequence path loaded by timing `Arm` |
 | `TriggerSink` | `wosm-shutter` | `CapabilityRequest::Trigger` enable/disable/pulse | Open bool | TCP `W>` prompt when `connect = true`; configured completion otherwise | Not sequenceable directly; use switch `state` sequences for digital masks |
-| `Dac` | `wosm-light-1..4` | `CapabilityRequest::Dac` with `Ratio` | Output ratio | TCP `W>` prompt when `connect = true`; configured completion otherwise | Not sequenceable by current WOSM sequence protocol |
+| `Dac` | `wosm-light-1..4` | `CapabilityRequest::Dac` with `Ratio` | Output ratio | `dac_dest p<s|t|u|v> <0..65535>` plus TCP `W>` prompt when `connect = true`; configured completion otherwise | Not sequenceable by current WOSM sequence protocol |
 | `TriggerSink` | `wosm-light-1..4` | `CapabilityRequest::Trigger` enable/disable/pulse | Enabled bool | TCP `W>` prompt when `connect = true`; configured completion otherwise | Not sequenceable directly; use switch `state` sequences for digital masks |
-| `Adc` | `wosm-input` | `CapabilityRequest::Adc` with optional public channel `1..6` | Raw analog count | TCP `W>` prompt for live `A,<channel-1>` read when `connect = true`; cached raw count otherwise | No |
-| `Measure` | `wosm-input` | `CapabilityRequest::Measure` | Map with digital aggregate, raw analog channel 1 count, and configured percent channel 1 | TCP `W>` prompt for live `L,6` and `A,0` reads when `connect = true`; configured completion otherwise | No |
+| `Adc` | `wosm-input` | `CapabilityRequest::Adc` with optional public channel `1..6` | Raw analog count | TCP `W>` prompt for legacy live `A,<channel-1>` read when `connect = true`; cached raw count otherwise | No |
+| `Measure` | `wosm-input` | `CapabilityRequest::Measure` | Map with digital aggregate, raw analog channel 1 count, and configured percent channel 1 | TCP `W>` prompt for live `dig_in` and legacy `A,0` reads when `connect = true`; configured completion otherwise | No |
 | Timing plan | Switch/resource | `Command::Arm` / `Start` / `Stop` with switch `state` byte sequences | `Map` | `Arm` loads `P,index,value` bytes and `N,count`; `Start` sends `R`; `Stop` sends `E` | No route/timebase claims |
 
 ## Properties
@@ -64,15 +64,15 @@
 | `blanking_enabled` | Switch | `Bool` | none | R/W | enabled/disabled | No | Blanking enable command |
 | `blank_on` | Switch | `String` | none | R/W | `Low`, `High` | No | Blanking polarity command |
 | `open` | Shutter | `Bool` | none | R/W | open/closed | No | Digital output mask |
-| `x`, `y` | XY stage | `Position` | um | R/W | `0..x_travel`, `0..y_travel` | No | DAC-backed `px`/`py` stage channels |
+| `x`, `y` | XY stage | `Position` | um | R/W | `0..x_travel`, `0..y_travel` | No | `stg_out_x` / `stg_out_y` |
 | `x_travel`, `y_travel` | XY stage | `Position` | um | R | configured travel | No | Config/probe metadata |
-| `z` | Z stage | `Position` | um | R/W | `0..z_travel` | No | DAC-backed `pz` focus channel |
+| `z` | Z stage | `Position` | um | R/W | `0..z_travel` | No | `stg_out_z` |
 | `z_travel` | Z stage | `Position` | um | R | configured travel | No | Config/probe metadata |
-| `output` | Light | `Ratio` | percent | R/W | `0..100` | No | High-current DAC output |
+| `output` | Light | `Ratio` | percent | R/W | `0..100` | No | `dac_dest p<s|t|u|v>` mapped to 16-bit destination counts |
 | `enabled` | Light | `Bool` | none | R/W | enabled/disabled | No | Switch bit state |
 | `line` | Light | `String` | none | R | `s`, `t`, `u`, or `v` | No | WOSM high-current line label |
-| `digital_input` | Input | `I64` | none | R | `0..63` cached/configured value | No | Connected read sends aggregate input command `L,6` and parses `L,<value>` |
-| `input_pullups` | Input | `I64` | none | R/W | `0..63` bitmask for input pins 0..5 | No | Writes `D,<pin>,<enabled>` for each input pin and caches the requested mask |
+| `digital_input` | Input | `I64` | none | R | `0..63` cached/configured value | No | Connected read sends `dig_in` and parses decimal or hex aggregate input |
+| `input_pullups` | Input | `I64` | none | R/W | `0..63` bitmask for input pins 0..5 | No | Legacy source-backed `D,<pin>,<enabled>` for each input pin and caches the requested mask |
 | `analog_input_1..6` | Input | `Ratio` | percent | R | configured values | No | Configured percent values when ADC raw-count scaling is not evidenced |
 | `analog_input_1_raw..analog_input_6_raw` | Input | `I64` | none | R | cached/configured raw count | No | Connected read sends `A,<channel>` with zero-based channels and parses `A,<value>` |
 
@@ -82,7 +82,7 @@
 | --- | --- | --- | --- |
 | `driver = "wosm"` or `"warwick_wosm"` | Yes | string | Selects the WOSM provider |
 | `property.host` | No | string | Controller TCP host |
-| `property.port` | No | `I64` | Controller TCP port; default `23` |
+| `property.port` | No | `I64` | Controller TCP port; default `1023` for driver/controller-PC Telnet, use `23` for user Telnet sessions |
 | `property.connect` | No | `Bool` | If true, opens the configured TCP endpoint during discovery and completes output commands from the `W>` prompt |
 | `property.prompt_timeout_ms` | No | `I64` or `TimeInterval` | TCP prompt wait timeout; default 2000 ms |
 | `property.product` | No | string | Persistent product/model label |
@@ -116,7 +116,7 @@
 
 | Area | Gap |
 | --- | --- |
-| Hardware validation | Record login, prompt completion, stage writes, switch/shutter writes, light output/readback, `L,6` / `A,<channel>` input reads, `D,<pin>,<enabled>` pull-up writes, and matching public command output on a real controller |
+| Hardware validation | Record login, prompt completion, `stg_out_*` stage writes, `dig_out` switch/shutter writes, `dac_dest` light output/readback, `dig_in` input reads, legacy `A,<channel>` input reads, `D,<pin>,<enabled>` pull-up writes, and matching public command output on a real controller |
 | Input scaling | Aggregate digital and raw analog reply parsing is implemented, but analog conversion to physical units or percent is not recorded |
-| Sequences/blanking | Sequence run/end, switch-state sequence loading, and blanking controls are command-backed; route mapping, non-switch sequence loading, and exact timing behavior need hardware traces or documentation |
+| Sequences/blanking | Sequence run/end, switch-state sequence loading, and blanking controls are command-backed by legacy source evidence; route mapping, non-switch sequence loading, current v0.900 command equivalence, and exact timing behavior need hardware traces or firmware documentation |
 | Safety | Validate digital-line masks, light-current scaling, stage travel calibration, inversion behavior, and safe disable states |

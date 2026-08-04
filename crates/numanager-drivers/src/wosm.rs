@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 pub(crate) mod protocol {
     use super::*;
 
-    pub const DEFAULT_PORT: u16 = 23;
+    pub const DEFAULT_PORT: u16 = 1023;
     pub const LINE_ENDING: &str = "\r\n";
     pub const PROMPT: &str = "W>";
 
@@ -21,7 +21,8 @@ pub(crate) mod protocol {
         LcdConnected,
         SetDacMode { line: char, mode: u8 },
         SetDigitalMode { line: char, mode: u8 },
-        DacOut { line: char, value: f64 },
+        DacDestination { line: char, value: u16 },
+        StageOut { axis: char, value: f64 },
         DigitalOut { value: u32, mask: u32 },
         SequenceLoad { index: u8, value: u8 },
         SequenceCount { count: u8 },
@@ -30,7 +31,7 @@ pub(crate) mod protocol {
         Blanking(bool),
         BlankingPolarityLow(bool),
         AnalogInput { channel: u8 },
-        DigitalInput { pin: u8 },
+        DigitalInput,
         PullUp { pin: u8, enabled: bool },
     }
 
@@ -42,8 +43,11 @@ pub(crate) mod protocol {
             }
             WosmCommand::SetDacMode { line, mode } => format!("dac_mode p{line} {mode}"),
             WosmCommand::SetDigitalMode { line, mode } => format!("dig_mode {line} {mode}"),
-            WosmCommand::DacOut { line, value } => format!("dac_out p{line} {value:.3}"),
-            WosmCommand::DigitalOut { value, mask } => format!("dig_out {value} 0x{mask:08X}"),
+            WosmCommand::DacDestination { line, value } => format!("dac_dest p{line} {value}"),
+            WosmCommand::StageOut { axis, value } => format!("stg_out_{axis} {value:.3}"),
+            WosmCommand::DigitalOut { value, mask } => {
+                format!("dig_out 0x{value:08X} 0x{mask:08X}")
+            }
             WosmCommand::SequenceLoad { index, value } => format!("P,{index},{value}"),
             WosmCommand::SequenceCount { count } => format!("N,{count}"),
             WosmCommand::SequenceRun => "R".into(),
@@ -51,7 +55,7 @@ pub(crate) mod protocol {
             WosmCommand::Blanking(enabled) => format!("B,{}", u8::from(enabled)),
             WosmCommand::BlankingPolarityLow(low) => format!("F,{}", u8::from(low)),
             WosmCommand::AnalogInput { channel } => format!("A,{channel}"),
-            WosmCommand::DigitalInput { pin } => format!("L,{pin}"),
+            WosmCommand::DigitalInput => "dig_in".into(),
             WosmCommand::PullUp { pin, enabled } => format!("D,{pin},{}", u8::from(enabled)),
         }
     }
@@ -79,6 +83,10 @@ pub(crate) mod protocol {
                 "WOSM high-current light channel must be 0..=3",
             )),
         }
+    }
+
+    pub fn dac_counts(value: Ratio) -> u16 {
+        ((value.percent().clamp(0.0, 100.0) / 100.0) * f64::from(u16::MAX)).round() as u16
     }
 }
 
@@ -440,14 +448,11 @@ impl WosmDriver {
     }
 
     fn refresh_digital_input(&mut self) -> Result<u8> {
-        let Some(reply) = self.query(
-            protocol::WosmCommand::DigitalInput { pin: 6 },
-            "read_digital_input",
-        )?
+        let Some(reply) = self.query(protocol::WosmCommand::DigitalInput, "read_digital_input")?
         else {
             return Ok(self.configured.digital_input);
         };
-        if let Some(value) = parse_wosm_reply_integer(&reply, 'L') {
+        if let Some(value) = parse_wosm_reply_integer(&reply, "dig_in") {
             self.configured.digital_input = (value as u8) & 0x3f;
             self.emit_property(
                 self.input,
@@ -468,7 +473,7 @@ impl WosmDriver {
         else {
             return Ok(self.configured.analog_input_raw[index]);
         };
-        if let Some(value) = parse_wosm_reply_integer(&reply, 'A') {
+        if let Some(value) = parse_wosm_reply_integer(&reply, "A") {
             self.configured.analog_input_raw[index] = value;
             self.emit_property(
                 self.input,
@@ -559,8 +564,8 @@ impl WosmDriver {
         let z = clamp_position(z, self.configured.z_travel);
         if x != self.configured.x {
             self.send(
-                protocol::WosmCommand::DacOut {
-                    line: 'x',
+                protocol::WosmCommand::StageOut {
+                    axis: 'x',
                     value: x.micrometers(),
                 },
                 "move_x",
@@ -570,8 +575,8 @@ impl WosmDriver {
         }
         if y != self.configured.y {
             self.send(
-                protocol::WosmCommand::DacOut {
-                    line: 'y',
+                protocol::WosmCommand::StageOut {
+                    axis: 'y',
                     value: y.micrometers(),
                 },
                 "move_y",
@@ -581,8 +586,8 @@ impl WosmDriver {
         }
         if z != self.configured.z {
             self.send(
-                protocol::WosmCommand::DacOut {
-                    line: 'z',
+                protocol::WosmCommand::StageOut {
+                    axis: 'z',
                     value: z.micrometers(),
                 },
                 "move_z",
@@ -631,9 +636,9 @@ impl WosmDriver {
         validate_ratio(ratio, "WOSM light output")?;
         let line = protocol::light_line(index)?;
         self.send(
-            protocol::WosmCommand::DacOut {
+            protocol::WosmCommand::DacDestination {
                 line,
-                value: ratio.percent(),
+                value: protocol::dac_counts(ratio),
             },
             "set_light_output",
         )?;
@@ -1757,19 +1762,29 @@ fn validate_ratio(value: Ratio, label: &str) -> Result<()> {
     }
 }
 
-fn parse_wosm_reply_integer(reply: &str, tag: char) -> Option<i64> {
+fn parse_wosm_reply_integer(reply: &str, tag: &str) -> Option<i64> {
     reply
-        .split(|ch: char| ch == '\r' || ch == '\n' || ch.is_whitespace())
-        .filter_map(|token| {
-            let token = token.trim_matches(|ch: char| ch == '\0' || ch == ',' || ch == ';');
-            let (prefix, value) = token.split_once(',')?;
-            if prefix.len() == tag.len_utf8() && prefix.starts_with(tag) {
-                value.trim().parse::<i64>().ok()
-            } else {
-                None
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with(tag) {
+                return None;
             }
+            trimmed
+                .split(|ch: char| ch == ',' || ch.is_whitespace())
+                .rev()
+                .find_map(parse_integer_token)
         })
         .last()
+}
+
+fn parse_integer_token(token: &str) -> Option<i64> {
+    let token = token.trim_matches(|ch: char| ch == '\0' || ch == ',' || ch == ';');
+    token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+        .and_then(|hex| i64::from_str_radix(hex, 16).ok())
+        .or_else(|| token.parse::<i64>().ok())
 }
 
 fn invalid_property<T>(prefix: &str, key: &str) -> Result<T> {

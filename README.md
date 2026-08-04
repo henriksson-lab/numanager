@@ -109,7 +109,7 @@ record enough protocol evidence for an implementation.
 | [Toupcam/AmScope cameras](docs/devices/toupcam.md) | Config-backed geometry plus live userspace USB camera backend and local frame source | ✓ |
 | [USB3 Vision cameras](docs/devices/usb3-vision.md) | U3V command/stream model plus opt-in USB open, endpoint catalog, and live command ReadMem/WriteMem path | - |
 | [Velleman K8055/VM110 and K8061/VM140 IO boards](docs/devices/velleman.md) | USB analog, digital, PWM, and counter IO | - |
-| [Warwick Open-Source Microscope](docs/devices/wosm.md) | TCP stage, switch/shutter, light, blanking, switch-sequence timing, digital input, pull-up, and raw analog readback | - |
+| [Warwick Open-Source Microscope](docs/devices/wosm.md) | v0.900 command-page-backed TCP stage, switch/shutter, light, and digital input plus legacy switch-sequence, blanking, pull-up, and raw analog readback | - |
 | [Xeryon ASCII piezo stages](docs/devices/xeryon.md) | ASCII serial stage motion, velocity, status, and readback | - |
 | [Xeryon integrated CANopen stages](docs/devices/xeryon-canopen.md) | CiA 402 transaction planning, optional live SocketCAN/SLCAN NMT/SDO execution, and EDS object parsing | - |
 | [Zaber ASCII stages](docs/devices/zaber.md) | ASCII motion and readback | - |
