@@ -12,11 +12,360 @@ pub const EP_IMAGE: u8 = 0x81;
 pub const WIDTH: u32 = 3328;
 pub const HEIGHT: u32 = 2548;
 pub const PID_BENCH_CAM: u16 = 0x13a1;
+pub const PID_U3CMOS03100KPA: u16 = 0x3310;
 pub const FRAME_BYTES: usize = WIDTH as usize * HEIGHT as usize;
 pub const BULK_CHUNK: usize = 512 * 1024;
 pub const LINE_TIME_US: f64 = 37.983;
 pub const MIN_FRAME_LINES: u32 = 2608;
 pub const MAX_EXPOSURE_LINES: u32 = 0xffff;
+
+// ---------------------------------------------------------------------------
+// Wire protocol
+//
+// Implemented from the ToupTek USB camera interface specification
+// (`docs/reverse/toupcam-protocol.md`). Vendor requests, all to the device
+// recipient.
+// ---------------------------------------------------------------------------
+
+/// Presence probe. Its `wValue` announces the session token (see
+/// [`SESSION_TOKEN`]); the first returned byte must be [`PROBE_READY`].
+pub const REQ_PROBE: u8 = 0x16;
+/// Single-register access for this device family, "form A": operands ride in
+/// the setup packet and the single returned byte is status, not data.
+pub const REQ_REGISTER: u8 = 0x0b;
+/// Flat address-space read (identity/calibration blob).
+pub const REQ_DP_READ: u8 = 0x20;
+/// Stream start/stop.
+pub const REQ_STREAM: u8 = 0x01;
+/// `wIndex` for [`REQ_STREAM`].
+pub const STREAM_INDEX: u16 = 0x000f;
+pub const STREAM_START: u16 = 0x0003;
+pub const STREAM_STOP: u16 = 0x0000;
+/// Expected first byte from [`REQ_PROBE`].
+pub const PROBE_READY: u8 = 0x08;
+
+/// Integration time programmed at open, before the stream is started.
+pub const DEFAULT_EXPOSURE_US: u32 = 94_000;
+
+/// Session token announced in the probe.
+///
+/// The device masks register operands with a 16-bit value derived from this
+/// token, but the derivation maps 0 to 0. Announcing 0 therefore selects an
+/// identity mask and every register number and value travels in plaintext, so
+/// this driver needs no masking arithmetic anywhere. The token is chosen freely
+/// by the host and authenticates nothing.
+pub const SESSION_TOKEN: u16 = 0;
+
+// SMIA-style sensor registers used by the specified family.
+pub const REG_RESET: u16 = 0x301a;
+pub const REG_DATA_PEDESTAL: u16 = 0x301e;
+pub const REG_VT_PIX_CLK_DIV: u16 = 0x302a;
+pub const REG_VT_SYS_CLK_DIV: u16 = 0x302c;
+pub const REG_PRE_PLL_CLK_DIV: u16 = 0x302e;
+pub const REG_PLL_MULTIPLIER: u16 = 0x3030;
+pub const REG_X_ADDR_START: u16 = 0x3004;
+pub const REG_X_ADDR_END: u16 = 0x3008;
+pub const REG_Y_ADDR_START: u16 = 0x3002;
+pub const REG_Y_ADDR_END: u16 = 0x3006;
+pub const REG_FRAME_LENGTH_LINES: u16 = 0x300a;
+pub const REG_LINE_LENGTH_PCK: u16 = 0x300c;
+pub const REG_COARSE_INTEGRATION_TIME: u16 = 0x3012;
+pub const REG_ANALOG_GAIN: u16 = 0x3060;
+pub const REG_READ_MODE: u16 = 0x3040;
+pub const REG_X_ODD_INC: u16 = 0x30a2;
+pub const REG_Y_ODD_INC: u16 = 0x30a6;
+
+/// One step of a sensor bring-up table.
+#[derive(Debug, Clone, Copy)]
+pub enum InitStep {
+    /// Write `value` to `register`.
+    Reg(u16, u16),
+    /// Pause before continuing.
+    DelayMs(u64),
+}
+
+// `RESET_REGISTER` variants: the streaming bit plus two grouped-hold forms that
+// let a group of registers change without tearing.
+pub const RESET_POWER_ON: u16 = 0x00d8;
+pub const RESET_STREAMING: u16 = 0x10d8;
+pub const RESET_STANDBY: u16 = 0x10d0;
+pub const RESET_HOLD_A: u16 = 0x10de;
+pub const RESET_HOLD_B: u16 = 0x10dc;
+
+/// Bring-up table for the 2048x1534 / 2.2 um sensor, up to the point where the
+/// sensor is put in standby to accept the window and timing program.
+///
+/// Fixed for the device family and independent of the chosen resolution.
+///
+/// The published table ends this block with `RESET_REGISTER = 0x10D8`
+/// (streaming). Traffic recorded from a working host writes `0x10D0` (standby)
+/// at that point instead, and only returns to streaming after the window is
+/// programmed. Standby is what the hardware needs — leaving the sensor
+/// streaming across the window change yields no frames at all — so the standby
+/// value is used here and the transition is part of [`SensorProfile`]
+/// programming rather than of this table.
+pub const INIT_U3CMOS03100KPA: &[InitStep] = &[
+    InitStep::Reg(REG_RESET, RESET_POWER_ON),
+    InitStep::DelayMs(100),
+    InitStep::Reg(0x3021, 0x0100),
+    InitStep::DelayMs(30),
+    InitStep::Reg(REG_RESET, RESET_STREAMING),
+    InitStep::Reg(0x30b0, 0x0000),
+    InitStep::Reg(0x3064, 0x1902),
+    InitStep::Reg(0x31ac, 0x0c0c),
+    InitStep::Reg(0x3082, 0x0009),
+    InitStep::Reg(0x30ba, 0x06ec),
+    InitStep::Reg(0x3064, 0x1802),
+    InitStep::Reg(0x31ae, 0x0301),
+    InitStep::Reg(REG_RESET, RESET_STANDBY),
+    InitStep::DelayMs(100),
+    InitStep::Reg(REG_DATA_PEDESTAL, 0x0000),
+    InitStep::Reg(REG_VT_PIX_CLK_DIV, 0x0006),
+    InitStep::Reg(REG_PRE_PLL_CLK_DIV, 0x000a),
+    InitStep::Reg(REG_PLL_MULTIPLIER, 0x0093),
+    InitStep::Reg(REG_VT_SYS_CLK_DIV, 0x0001),
+    InitStep::DelayMs(100),
+];
+
+/// How a model's sensor is programmed once the link is open.
+#[derive(Debug, Clone, Copy)]
+pub struct SensorProfile {
+    /// Fixed bring-up sequence for the family.
+    pub init: &'static [InitStep],
+    /// Readout window. `end - start + 1` gives the frame geometry.
+    pub x_addr_start: u16,
+    pub x_addr_end: u16,
+    pub y_addr_start: u16,
+    pub y_addr_end: u16,
+    pub frame_length_lines: u16,
+    /// Row period in pixel clocks is twice this.
+    pub line_length_pck: u16,
+    /// Pixel-clock rate in MHz for the selected speed mode.
+    pub pix_clk_mhz: u32,
+}
+
+impl SensorProfile {
+    pub fn width(&self) -> u32 {
+        (self.x_addr_end - self.x_addr_start + 1) as u32
+    }
+    pub fn height(&self) -> u32 {
+        (self.y_addr_end - self.y_addr_start + 1) as u32
+    }
+}
+
+/// Sensor programming for the 2048x1534 device. The window reproduces the
+/// advertised geometry: `2181 - 134 + 1 = 2048`, `1539 - 6 + 1 = 1534`.
+pub const SENSOR_U3CMOS03100KPA: SensorProfile = SensorProfile {
+    init: INIT_U3CMOS03100KPA,
+    x_addr_start: 134,
+    x_addr_end: 2181,
+    y_addr_start: 6,
+    y_addr_end: 1539,
+    frame_length_lines: 1560,
+    line_length_pck: 1150,
+    pix_clk_mhz: 98,
+};
+
+/// Row period in pixel clocks, twice `LINE_LENGTH_PCK`.
+fn row_period(line_length_pck: u16) -> u32 {
+    2 * line_length_pck as u32
+}
+
+/// Exposure in microseconds to `(COARSE_INTEGRATION_TIME, LINE_LENGTH_PCK)`.
+///
+/// Long exposures stretch the row period rather than overflow the 16-bit
+/// integration-time field, so this can also change `LINE_LENGTH_PCK`; the
+/// caller writes that register only when it differs from the current value.
+pub fn coarse_integration_time(us: u32, profile: &SensorProfile) -> (u16, u16) {
+    let mut period = row_period(profile.line_length_pck);
+    let mut coarse =
+        (us as u64 * profile.pix_clk_mhz as u64 + period as u64 / 2) / period.max(1) as u64;
+    while coarse > 0xffff {
+        coarse >>= 1;
+        period <<= 1;
+    }
+    (coarse as u16, (period / 2) as u16)
+}
+
+/// Gain in hundredths (100 = 1.00x) to `ANALOG_GAIN`.
+///
+/// A step ladder: the code is that of the first threshold the gain falls under.
+pub fn analog_gain_code(gain_hundredths: u16) -> u16 {
+    const LADDER: &[(u16, u16)] = &[
+        (104, 0x06),
+        (108, 0x07),
+        (113, 0x08),
+        (118, 0x09),
+        (123, 0x0a),
+        (130, 0x0b),
+        (137, 0x0c),
+        (144, 0x0d),
+        (153, 0x0e),
+        (162, 0x0f),
+        (173, 0x10),
+        (186, 0x12),
+        (200, 0x14),
+        (217, 0x16),
+        (236, 0x18),
+        (260, 0x1a),
+        (289, 0x1c),
+    ];
+    for (threshold, code) in LADDER {
+        if gain_hundredths < *threshold {
+            return *code;
+        }
+    }
+    0x1e
+}
+
+/// How this driver brings a model up.
+#[derive(Debug, Clone, Copy)]
+pub enum ToupcamOpen {
+    /// Program the sensor from the interface specification. Exposure and gain
+    /// are computed, so any value in range can be set.
+    Sensor(SensorProfile),
+    /// Replay a recorded vendor open sequence verbatim. Reproduces exactly the
+    /// state it was captured at and nothing else: the register semantics for
+    /// this model were never derived, so exposure and gain cannot be computed.
+    Replay(&'static str),
+}
+
+/// Per-model wire facts for a Toupcam-compatible camera.
+///
+/// Geometry and bring-up are model-specific. Models whose sensor register map
+/// is specified are programmed directly; the rest fall back to a recorded
+/// replay of the vendor's own open sequence.
+#[derive(Debug, Clone, Copy)]
+pub struct ToupcamModel {
+    /// USB product id this profile is keyed on.
+    pub product_id: u16,
+    /// Vendor model string.
+    pub model: &'static str,
+    /// Full-frame sensor geometry in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Bytes the device appends after the RAW8 pixel plane in each bulk frame.
+    pub frame_trailer_bytes: usize,
+    /// Bring-up strategy.
+    pub open: ToupcamOpen,
+}
+
+impl ToupcamModel {
+    /// RAW8 pixel bytes in one full frame, excluding any device trailer.
+    pub fn pixel_bytes(&self) -> usize {
+        self.width as usize * self.height as usize
+    }
+
+    /// Total bytes the device sends per bulk frame, including the trailer.
+    pub fn frame_bytes(&self) -> usize {
+        self.pixel_bytes() + self.frame_trailer_bytes
+    }
+
+    /// Sensor programming for this model, when it has a specified register map.
+    pub fn sensor(&self) -> Option<SensorProfile> {
+        match self.open {
+            ToupcamOpen::Sensor(profile) => Some(profile),
+            ToupcamOpen::Replay(_) => None,
+        }
+    }
+
+    /// Whether exposure and gain can be computed for this model.
+    pub fn tunable_registers(&self) -> bool {
+        self.sensor().is_some()
+    }
+}
+
+/// The bench camera the original clean-room backend was built against. Its
+/// sensor register map was never derived, so it stays on the recorded replay.
+pub const MODEL_U3CMOS08500KPA: ToupcamModel = ToupcamModel {
+    product_id: PID_BENCH_CAM,
+    model: "U3CMOS08500KPA",
+    width: WIDTH,
+    height: HEIGHT,
+    frame_trailer_bytes: 0,
+    open: ToupcamOpen::Replay(include_str!("toupcam_init_seq.jsonl")),
+};
+
+/// 3.1 MP model, programmed from the interface specification.
+pub const MODEL_U3CMOS03100KPA: ToupcamModel = ToupcamModel {
+    product_id: PID_U3CMOS03100KPA,
+    model: "U3CMOS03100KPA",
+    width: 2048,
+    height: 1534,
+    frame_trailer_bytes: 1,
+    open: ToupcamOpen::Sensor(SENSOR_U3CMOS03100KPA),
+};
+
+/// Every model profile this driver carries a recorded open sequence for.
+pub fn models() -> Vec<ToupcamModel> {
+    vec![MODEL_U3CMOS08500KPA, MODEL_U3CMOS03100KPA]
+}
+
+/// The profile for a USB product id, if this driver has one.
+pub fn model_for_product_id(product_id: u16) -> Option<ToupcamModel> {
+    models()
+        .into_iter()
+        .find(|model| model.product_id == product_id)
+}
+
+/// Vendor-registry identity for a camera this driver can recognize but has no
+/// recorded open sequence for.
+///
+/// Streaming needs a per-model open sequence, which only a capture of that model
+/// can supply. Identity and geometry, though, are recoverable for the vendor's
+/// whole catalogue, which is what turns "device hangs waiting for a frame that
+/// never comes" into a named, actionable error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToupcamIdentity {
+    pub product_id: u16,
+    pub model: &'static str,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Registry recovered from the vendor runtime; see
+/// `docs/reverse/toupcam-model-registry.md` for provenance and known gaps.
+const MODEL_REGISTRY: &str = include_str!("toupcam_models.tsv");
+
+/// Look up a USB product id in the vendor registry.
+pub fn identity_for_product_id(product_id: u16) -> Option<ToupcamIdentity> {
+    for line in MODEL_REGISTRY.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let mut f = line.split('\t');
+        let (Some(name), Some(_vid), Some(pid), Some(w), Some(h)) =
+            (f.next(), f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let Ok(pid) = u16::from_str_radix(pid.trim_start_matches("0x"), 16) else {
+            continue;
+        };
+        if pid != product_id {
+            continue;
+        }
+        let (Ok(width), Ok(height)) = (w.parse::<u32>(), h.parse::<u32>()) else {
+            continue;
+        };
+        // `name` is borrowed from a `&'static str`, so the identity is 'static.
+        return Some(ToupcamIdentity {
+            product_id: pid,
+            model: name,
+            width,
+            height,
+        });
+    }
+    None
+}
+
+/// Number of camera variants in the vendor registry.
+pub fn registry_len() -> usize {
+    MODEL_REGISTRY
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .count()
+}
 
 pub fn is_toupcam_vendor(vid: u16) -> bool {
     matches!(vid, VID_TOUPTEK | VID_CYPRESS | VID_TOUPTEK2)
@@ -271,6 +620,18 @@ struct ToupcamConfiguredProbe {
     pixel_format: String,
     bayer_phase: BayerPhase,
     trigger_mode: String,
+    /// Geometry exactly as written in config, before defaults were filled in, so
+    /// a live open can fall back to the opened model's geometry rather than the
+    /// bench camera's.
+    configured_geometry: ConfiguredGeometry,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ConfiguredGeometry {
+    sensor_width: Option<u32>,
+    sensor_height: Option<u32>,
+    roi_width: Option<u32>,
+    roi_height: Option<u32>,
 }
 
 impl ToupcamConfiguredProbe {
@@ -290,7 +651,26 @@ impl ToupcamConfiguredProbe {
             pixel_format: ImageEncoding::Raw8.property_value().into(),
             bayer_phase: BayerPhase::Unknown,
             trigger_mode: "software".into(),
+            configured_geometry: ConfiguredGeometry::default(),
         }
+    }
+
+    /// Re-resolves geometry against the model actually opened. Config always
+    /// wins; anything the config left out comes from the model instead of the
+    /// bench-camera default.
+    #[cfg(feature = "os-usb")]
+    fn apply_model_geometry(&mut self, model: &ToupcamModel) {
+        let cfg = self.configured_geometry;
+        self.sensor_width = cfg.sensor_width.unwrap_or(model.width);
+        self.sensor_height = cfg.sensor_height.unwrap_or(model.height);
+        self.roi_width = cfg
+            .roi_width
+            .unwrap_or(self.sensor_width)
+            .clamp(64, self.sensor_width.max(64));
+        self.roi_height = cfg
+            .roi_height
+            .unwrap_or(self.sensor_height)
+            .clamp(64, self.sensor_height.max(64));
     }
 
     fn from_device_config(device: &DeviceConfig) -> Result<Self> {
@@ -308,12 +688,28 @@ impl ToupcamConfiguredProbe {
                 "Toupcam usb_index must be a non-negative integer",
             )
         })?;
-        probe.sensor_width =
-            pixel_count_prop(device, "sensor_width")?.unwrap_or(probe.sensor_width);
-        probe.sensor_height =
-            pixel_count_prop(device, "sensor_height")?.unwrap_or(probe.sensor_height);
-        probe.roi_width = pixel_count_prop(device, "roi_width")?.unwrap_or(probe.sensor_width);
-        probe.roi_height = pixel_count_prop(device, "roi_height")?.unwrap_or(probe.sensor_height);
+        probe.configured_geometry = ConfiguredGeometry {
+            sensor_width: pixel_count_prop(device, "sensor_width")?,
+            sensor_height: pixel_count_prop(device, "sensor_height")?,
+            roi_width: pixel_count_prop(device, "roi_width")?,
+            roi_height: pixel_count_prop(device, "roi_height")?,
+        };
+        probe.sensor_width = probe
+            .configured_geometry
+            .sensor_width
+            .unwrap_or(probe.sensor_width);
+        probe.sensor_height = probe
+            .configured_geometry
+            .sensor_height
+            .unwrap_or(probe.sensor_height);
+        probe.roi_width = probe
+            .configured_geometry
+            .roi_width
+            .unwrap_or(probe.sensor_width);
+        probe.roi_height = probe
+            .configured_geometry
+            .roi_height
+            .unwrap_or(probe.sensor_height);
         probe.roi_width = probe.roi_width.clamp(64, probe.sensor_width.max(64));
         probe.roi_height = probe.roi_height.clamp(64, probe.sensor_height.max(64));
         probe.exposure = time_interval_prop(device, "exposure")?.unwrap_or(probe.exposure);
@@ -421,7 +817,7 @@ impl ToupcamDriver {
     #[cfg(feature = "os-usb")]
     fn configured_usb(
         id: DriverId,
-        probe: ToupcamConfiguredProbe,
+        mut probe: ToupcamConfiguredProbe,
         info: live_toupcam::LiveToupcamInfo,
     ) -> Result<Self> {
         let (worker_tx, worker_rx) = mpsc::channel();
@@ -434,8 +830,24 @@ impl ToupcamDriver {
             ));
         }
         let live = live_toupcam::LiveToupcam::open(probe.usb_index)?;
-        live.set_exposure_us(seconds_to_us(exposure_s))?;
-        live.set_gain_percent(gain_percent as u16)?;
+        let model = live.model();
+        probe.apply_model_geometry(&model);
+        // A model whose register encoding is undecoded keeps whatever exposure
+        // and gain its recorded open sequence reproduces; applying the bench
+        // camera's register writes to it would be inventing behavior.
+        let mut open_log = format!(
+            "opened configured live Toupcam USB device {} as model {} ({}x{})",
+            info.label, model.model, model.width, model.height
+        );
+        if model.tunable_registers() {
+            live.set_exposure_us(seconds_to_us(exposure_s))?;
+            live.set_gain_percent(gain_percent as u16)?;
+        } else {
+            open_log.push_str(
+                "; configured exposure/gain not applied: register encoding not decoded for \
+                 this model",
+            );
+        }
         Ok(Self {
             id,
             camera: DeviceId(NodeId(id.0 * 1000 + 100)),
@@ -463,7 +875,7 @@ impl ToupcamDriver {
             next_token: 1,
             events: VecDeque::from([DriverEvent::Event(Event::Log(LogEvent {
                 driver: Some(id),
-                message: format!("opened configured live Toupcam USB device {}", info.label),
+                message: open_log,
             }))]),
             worker_tx,
             worker_rx,
@@ -488,6 +900,7 @@ impl ToupcamDriver {
     ) -> Result<Self> {
         let (worker_tx, worker_rx) = mpsc::channel();
         let live = live_toupcam::LiveToupcam::open(index)?;
+        let model = live.model();
         Ok(Self {
             id,
             camera: DeviceId(NodeId(100 + id.0)),
@@ -496,15 +909,15 @@ impl ToupcamDriver {
             label: info.identity.label.clone(),
             product: info.identity.product.clone(),
             serial_number: info.identity.serial.clone(),
-            sensor_width: WIDTH,
-            sensor_height: HEIGHT,
+            sensor_width: model.width,
+            sensor_height: model.height,
             exposure_s: 0.1,
             gain_percent: 100,
             pixel_format: ImageEncoding::Raw8.property_value().into(),
             bayer_phase: BayerPhase::Unknown,
             trigger_mode: "software".into(),
-            roi_width: WIDTH,
-            roi_height: HEIGHT,
+            roi_width: model.width,
+            roi_height: model.height,
             binning: 1,
             black_level: 0,
             white_balance_red_percent: 100,
@@ -515,7 +928,10 @@ impl ToupcamDriver {
             next_token: 1,
             events: VecDeque::from([DriverEvent::Event(Event::Log(LogEvent {
                 driver: Some(id),
-                message: format!("opened live Toupcam USB device {}", info.label),
+                message: format!(
+                    "opened live Toupcam USB device {} as model {} ({}x{})",
+                    info.label, model.model, model.width, model.height
+                ),
             }))]),
             worker_tx,
             worker_rx,
@@ -2309,16 +2725,30 @@ mod live_toupcam {
     use std::sync::mpsc::{channel, RecvTimeoutError};
     use std::time::{Duration, Instant};
 
-    const INIT_SCRIPT: &str = include_str!("toupcam_init_seq.jsonl");
+    /// Vendor request that starts and stops the image stream; `wValue` selects
+    /// the mode, `0x0000` stops. Recorded on both model captures.
+    const REQ_STREAM: u8 = 0x01;
+    const STREAM_INDEX: u16 = 0x000f;
+    const STREAM_STOP: u16 = 0x0000;
 
     #[derive(Debug, Clone)]
     pub struct LiveToupcamInfo {
         pub label: String,
         pub(super) identity: ToupcamUsbIdentity,
+        pub(super) model: Option<ToupcamModel>,
+    }
+
+    impl LiveToupcamInfo {
+        /// The model profile matched from the USB product id, if this driver has
+        /// a recorded open sequence for it.
+        pub fn model(&self) -> Option<ToupcamModel> {
+            self.model
+        }
     }
 
     pub struct LiveToupcam {
         iface: Interface,
+        model: ToupcamModel,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -2391,6 +2821,7 @@ mod live_toupcam {
                         bus_number: device.bus_number(),
                         device_address: device.device_address(),
                     },
+                    model: model_for_product_id(device.product_id()),
                 }
             })
             .collect())
@@ -2408,6 +2839,32 @@ mod live_toupcam {
                         "no Toupcam USB device found for configured index",
                     )
                 })?;
+            let product_id = device.product_id();
+            let model = model_for_product_id(product_id).ok_or_else(|| {
+                let known = models()
+                    .iter()
+                    .map(|m| format!("{} (0x{:04x})", m.model, m.product_id))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match identity_for_product_id(product_id) {
+                    Some(id) => Error::new(
+                        ErrorCode::Unsupported,
+                        format!(
+                            "Toupcam {} (0x{product_id:04x}, {}x{}) is a known model but has no \
+                             recorded open sequence, so it cannot be streamed; capture the vendor \
+                             application opening it and add a model profile. Streamable models: {known}",
+                            id.model, id.width, id.height
+                        ),
+                    ),
+                    None => Error::new(
+                        ErrorCode::Unsupported,
+                        format!(
+                            "no recorded Toupcam open sequence for product id 0x{product_id:04x}, \
+                             and it is not in the vendor model registry. Streamable models: {known}"
+                        ),
+                    ),
+                }
+            })?;
             let device = device.open().map_err(|error| {
                 usb_error(format!(
                     "open failed; another application may hold the camera: {error}"
@@ -2417,9 +2874,14 @@ mod live_toupcam {
                 .detach_and_claim_interface(0)
                 .map_err(|error| usb_error(format!("claim interface 0 failed: {error}")))?;
             let _ = iface.set_alt_setting(0);
-            let live = Self { iface };
+            let live = Self { iface, model };
             live.init()?;
             Ok(live)
+        }
+
+        /// The model profile this handle was opened against.
+        pub fn model(&self) -> ToupcamModel {
+            self.model
         }
 
         fn vendor_out(&self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
@@ -2457,8 +2919,95 @@ mod live_toupcam {
             })
         }
 
+        /// Announce the session token and wait for the device to report ready.
+        ///
+        /// The token selects the mask applied to register operands; this driver
+        /// always sends [`SESSION_TOKEN`], which selects the identity mask, so
+        /// every later register transfer is plaintext.
+        fn probe(&self) -> Result<()> {
+            let deadline = Instant::now() + Duration::from_millis(2_000);
+            let mut last = None;
+            while Instant::now() < deadline {
+                match self.vendor_in(REQ_PROBE, SESSION_TOKEN, 0x0000, 2) {
+                    Ok(data) if data.first() == Some(&PROBE_READY) => return Ok(()),
+                    Ok(data) => last = Some(format!("probe returned {data:02x?}")),
+                    Err(error) => last = Some(error.to_string()),
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(usb_error(format!(
+                "Toupcam {} did not become ready: {}",
+                self.model.model,
+                last.unwrap_or_else(|| "no response".into())
+            )))
+        }
+
+        /// Write one sensor register. Operands ride in the setup packet and the
+        /// returned byte is status, so a write is still an IN transfer.
+        fn write_reg(&self, register: u16, value: u16) -> Result<()> {
+            self.vendor_in(REQ_REGISTER, value, register, 1).map(|_| ())
+        }
+
+        fn set_streaming(&self, on: bool) -> Result<()> {
+            let value = if on { STREAM_START } else { STREAM_STOP };
+            self.vendor_out(REQ_STREAM, value, STREAM_INDEX, &[])
+        }
+
+        /// Bring the sensor up from the specification: fixed init table, then
+        /// the window and timing registers for the full frame.
+        fn init_sensor(&self, profile: &SensorProfile) -> Result<()> {
+            let _ = self.set_streaming(false);
+            self.probe()?;
+            for step in profile.init {
+                match *step {
+                    InitStep::Reg(register, value) => self.write_reg(register, value)?,
+                    InitStep::DelayMs(ms) => std::thread::sleep(Duration::from_millis(ms)),
+                }
+            }
+            // Window and readout, still in standby.
+            for (register, value) in [
+                (REG_X_ODD_INC, 0x0001),
+                (REG_Y_ODD_INC, 0x0001),
+                (REG_X_ADDR_START, profile.x_addr_start),
+                (REG_X_ADDR_END, profile.x_addr_end),
+                (REG_Y_ADDR_START, profile.y_addr_start),
+                (REG_Y_ADDR_END, profile.y_addr_end),
+                (REG_FRAME_LENGTH_LINES, profile.frame_length_lines),
+                (REG_READ_MODE, 0x0000),
+            ] {
+                self.write_reg(register, value)?;
+            }
+            // Row period and PLL are applied under grouped hold, then the sensor
+            // is returned to streaming.
+            self.write_reg(REG_RESET, RESET_HOLD_A)?;
+            self.write_reg(REG_LINE_LENGTH_PCK, profile.line_length_pck)?;
+            self.write_reg(REG_RESET, RESET_STREAMING)?;
+            self.write_reg(REG_PLL_MULTIPLIER, 0x0093)?;
+            self.write_reg(REG_RESET, RESET_HOLD_B)?;
+
+            // The sensor needs a valid integration time and gain before the
+            // stream is started; a frame is not produced otherwise.
+            let (coarse, _) = coarse_integration_time(DEFAULT_EXPOSURE_US, &profile);
+            self.write_reg(REG_COARSE_INTEGRATION_TIME, coarse)?;
+            self.write_reg(REG_ANALOG_GAIN, analog_gain_code(100))?;
+
+            let _ = self.iface.clear_halt(EP_IMAGE);
+            self.set_streaming(true)?;
+            Ok(())
+        }
+
         fn init(&self) -> Result<()> {
-            for (lineno, line) in INIT_SCRIPT.lines().enumerate() {
+            match self.model.open {
+                ToupcamOpen::Sensor(profile) => return self.init_sensor(&profile),
+                ToupcamOpen::Replay(script) => self.replay(script),
+            }
+        }
+
+        fn replay(&self, script: &str) -> Result<()> {
+            // A previous open may have left the stream running, which would make
+            // the first bulk reads land mid-frame. Stop before replaying.
+            let _ = self.vendor_out(REQ_STREAM, STREAM_STOP, STREAM_INDEX, &[]);
+            for (lineno, line) in script.lines().enumerate() {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
@@ -2499,25 +3048,46 @@ mod live_toupcam {
             Ok(())
         }
 
-        fn reg0b_raw(&self, windex: u16, wvalue: u16) -> Result<()> {
-            self.vendor_in(0x0b, wvalue, windex, 1).map(|_| ())
+        /// Fails for models with no specified sensor register map, rather than
+        /// writing another sensor's registers to this one.
+        fn require_tunable(&self, what: &str) -> Result<SensorProfile> {
+            self.model.sensor().ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Unsupported,
+                    format!(
+                        "Toupcam {}: {what} cannot be set because this model's sensor register \
+                         map is not specified; it is opened by replaying a recorded vendor \
+                         sequence and stays at the state that reproduces.",
+                        self.model.model
+                    ),
+                )
+            })
         }
 
         pub fn set_exposure_us(&self, us: u32) -> Result<()> {
-            for (windex, wvalue) in exposure_registers(us) {
-                self.reg0b_raw(windex, wvalue)?;
+            let profile = self.require_tunable("exposure")?;
+            let (coarse, line_length_pck) = coarse_integration_time(us, &profile);
+            // Long exposures stretch the row period instead of overflowing the
+            // 16-bit integration-time field; only write it when it changes.
+            if line_length_pck != profile.line_length_pck {
+                self.write_reg(REG_LINE_LENGTH_PCK, line_length_pck)?;
             }
+            self.write_reg(REG_COARSE_INTEGRATION_TIME, coarse)?;
             Ok(())
         }
 
         pub fn set_gain_percent(&self, percent: u16) -> Result<()> {
-            for (windex, wvalue) in gain_registers(percent) {
-                self.reg0b_raw(windex, wvalue)?;
-            }
-            Ok(())
+            self.require_tunable("gain")?;
+            self.write_reg(REG_ANALOG_GAIN, analog_gain_code(percent))
         }
 
+        /// Reads one frame's worth of pixel bytes.
+        ///
+        /// Reads the model's trailer bytes too and drops them, so the next read
+        /// still starts on a frame boundary instead of drifting by the trailer
+        /// length on every frame.
         pub fn read_frame(&self, expected_bytes: usize) -> Result<Vec<u8>> {
+            let wire_bytes = expected_bytes + self.model.frame_trailer_bytes;
             let iface = self.iface.clone();
             let (tx, rx) = channel::<std::result::Result<Vec<u8>, String>>();
             std::thread::spawn(move || {
@@ -2538,33 +3108,50 @@ mod live_toupcam {
                     queue.submit(RequestBuffer::new(BULK_CHUNK));
                 }
             });
-            let mut frame = Vec::with_capacity(expected_bytes + BULK_CHUNK);
+            // The device delimits frames with a short bulk transfer. Reading a
+            // fixed byte count from wherever the stream happens to be returns a
+            // torn frame (the camera is free-running and this read starts at an
+            // arbitrary offset), so segment on that delimiter and keep the first
+            // segment that holds a whole frame. Partial leading segments — and a
+            // trailer that arrives in its own transfer — are discarded.
+            let mut frame = Vec::with_capacity(wire_bytes + BULK_CHUNK);
             let deadline = Instant::now() + Duration::from_millis(15_000);
-            while frame.len() < expected_bytes {
+            loop {
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(usb_error(format!(
-                        "Toupcam frame read timed out ({} of {expected_bytes} bytes)",
+                        "Toupcam {} frame read timed out ({} of {wire_bytes} bytes)",
+                        self.model.model,
                         frame.len(),
                     )));
                 }
                 match rx.recv_timeout(deadline - now) {
-                    Ok(Ok(data)) => frame.extend_from_slice(&data),
+                    Ok(Ok(data)) => {
+                        let short = data.len() < BULK_CHUNK;
+                        frame.extend_from_slice(&data);
+                        if frame.len() >= wire_bytes {
+                            frame.truncate(expected_bytes);
+                            return Ok(frame);
+                        }
+                        if short {
+                            // Frame boundary reached with too little data: this
+                            // was a partial frame or a lone trailer. Resynchronize.
+                            frame.clear();
+                        }
+                    }
                     Ok(Err(error)) => return Err(usb_error(format!("bulk stream error: {error}"))),
-                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        return Err(usb_error(format!(
+                            "short Toupcam {} frame: {} of {wire_bytes} bytes",
+                            self.model.model,
+                            frame.len(),
+                        )));
+                    }
                     Err(RecvTimeoutError::Disconnected) => {
                         return Err(usb_error("bulk stream thread ended"));
                     }
                 }
             }
-            if frame.len() < expected_bytes {
-                return Err(usb_error(format!(
-                    "short Toupcam frame: {} of {expected_bytes} bytes",
-                    frame.len(),
-                )));
-            }
-            frame.truncate(expected_bytes);
-            Ok(frame)
         }
     }
 }

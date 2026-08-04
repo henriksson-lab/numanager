@@ -106,7 +106,7 @@ record enough protocol evidence for an implementation.
 | [Thorlabs SC10](docs/devices/thorlabs-sc10.md) | Serial shutter control and readback | - |
 | [TriggerScope](docs/devices/triggerscope.md) | Serial TTL/camera trigger, DAC, focus, and timing-program control | - |
 | [Trinamic TMCL stages](docs/devices/trinamic-tmcl.md) | Serial motion and readback | - |
-| [Toupcam/AmScope cameras](docs/devices/toupcam.md) | Config-backed geometry plus live userspace USB camera backend and local frame source | ✓ |
+| [Toupcam/AmScope cameras](docs/devices/toupcam.md) | Config-backed geometry plus live userspace USB camera backend with per-model profiles and local frame source | ✓ |
 | [USB3 Vision cameras](docs/devices/usb3-vision.md) | U3V command/stream model plus opt-in USB open, endpoint catalog, and live command ReadMem/WriteMem path | - |
 | [Velleman K8055/VM110 and K8061/VM140 IO boards](docs/devices/velleman.md) | USB analog, digital, PWM, and counter IO | - |
 | [Warwick Open-Source Microscope](docs/devices/wosm.md) | v0.900 command-page-backed TCP stage, switch/shutter, light, and digital input plus legacy switch-sequence, blanking, pull-up, and raw analog readback | - |
