@@ -65,6 +65,7 @@ record enough protocol evidence for an implementation.
 | [ASI MS-2000/Tiger](docs/devices/asi.md) | Serial stage, Tiger TTL/ring-buffer, and CRISP autofocus control/readback | - |
 | [Bluebox Optics niji](docs/devices/bluebox-niji.md) | Serial light output and status | - |
 | [Cephla Squid/Octopi](docs/devices/squid.md) | Serial controller motion, illumination, trigger, autofocus, and status | - |
+| [3Z Optics IRIS](docs/devices/3z-optics.md) | Source-backed Modbus-style serial light-source control and readback | - |
 | [Chuo Seiki QT stages](docs/devices/chuo-seiki-qt.md) | Serial stage startup, control, and status | - |
 | [ITK Corvus stages](docs/devices/corvus.md) | Serial stage control and status | - |
 | [Cobolt/Hubner lasers](docs/devices/cobolt.md) | Serial laser control and telemetry | - |

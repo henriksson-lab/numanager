@@ -50,6 +50,7 @@ pub mod thorlabs_apt;
 pub mod thorlabs_dc;
 pub mod thorlabs_kurios;
 pub mod thorlabs_sc10;
+pub mod three_z_optics;
 pub mod toupcam;
 pub mod triggerscope;
 pub mod trinamic_tmcl;
@@ -1287,6 +1288,7 @@ pub fn register_builtin_discovery(
     register_config!(thorlabs_dc::ThorlabsDcDiscovery::from_config);
     register_config!(thorlabs_kurios::KuriosDiscovery::from_config);
     register_config!(thorlabs_sc10::Sc10Discovery::from_config);
+    register_config!(three_z_optics::ThreeZOpticsDiscovery::from_config);
     register_config!(toupcam::ToupcamDiscovery::from_config);
     register_config!(triggerscope::TriggerScopeDiscovery::from_config);
     register_config!(trinamic_tmcl::TmclDiscovery::from_config);

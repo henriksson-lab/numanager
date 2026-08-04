@@ -36,7 +36,7 @@ runtime/package backend or after independent protocol evidence is recorded.
 | `LumencorSpectra` | Lumencor light engines | serial ASCII | direct |
 | `HamiltonMVP` | Hamilton MVP valve positioners | serial ASCII | direct |
 | `K8055` / `K8061` | Velleman USB IO boards | USB packets | direct/likely |
-| `3Z_Optics` | motorized optics via Modbus | RS-485 Modbus RTU | direct |
+| `3Z_Optics` | 3Z Optics IRIS LED light sources | USB serial / Modbus RTU-style frames | direct, new upstream target |
 | `kdv` | Trinamic/TMCL-style motion controller | serial binary | direct |
 | `StarlightXpress` | filter wheel | HID/serial small binary packets | direct |
 | `SpectralLMM5` | Spectral laser/illumination module | HID or RS-232 | direct/likely |
@@ -355,6 +355,66 @@ Implementation notes:
 - Good first laser driver.
 - Needs safety model: interlock/fault must be read-only telemetry that gates
   enabling output.
+- Current CoboltOfficial upstream also carries a manufacturer-authored
+  adapter with 2025-2026 updates for 05/Gen5 lasers, 12 V MLD/DPL variants,
+  and 5 V shutter-command handling. That code exposes command families not
+  covered by `numanager_drivers::cobolt`, including `laser:*`,
+  `system:input:*`, `autostart:*`, `fault:clear`, `gfv?`, `gkses?`,
+  `state?`, `gam?`, `gartn?`, `sartn`, Skyra line-addressed commands, and
+  modulation current/power setpoints. Treat these as candidate gaps pending a
+  Cobolt/Huebner manual revision or hardware traces for the specific laser
+  generation.
+
+### 3Z_Optics
+
+Source: Micro-Manager `3Z_Optics` adapter added upstream in June 2026.
+
+Transport:
+
+- USB serial port carrying Modbus RTU-style request/response frames.
+- Slave address `0x01`.
+- CRC-16/MODBUS over request and response frames.
+- Function codes used by the adapter: `0x01` read coils, `0x03` read holding
+  registers, `0x04` read input registers, `0x05` write single coil, and `0x06`
+  write single holding register.
+
+Core addresses visible in the adapter:
+
+| Address | Access | Meaning inferred from adapter |
+| --- | --- | --- |
+| `0x01` | input register | device model id |
+| `0x20` | holding register | mode: `1` global, `2` independent, `3` TTL |
+| `0x21` | coil | dirty/status-change bit used by polling |
+| `0x30` | coil/register | global switch and global intensity |
+| `0x31 + channel` | coil/register | channel switch and channel intensity |
+
+Adapter properties:
+
+| Property shape | Meaning |
+| --- | --- |
+| `<channel> Switch` | per-channel on/off state |
+| `<channel> Intensity` | per-channel brightness scalar |
+| `Global Switch` | global output state |
+| `Global Intensity` | global brightness scalar |
+| `Mode` | `Global`, `Independent`, or `TTL` |
+| `Refresh` | manual readback trigger |
+
+Implementation notes:
+
+- The adapter loads model-specific display names, channel labels, and
+  brightness limits from a local `models.json`, falling back to eight generic
+  channels and a `0..100` brightness range.
+- 3Z product pages confirm IRIS light-source families with controller, TTL
+  trigger, and serial communication modes; public product specs list IRIS-400,
+  IRIS-400HP/P, and IRIS-600HP/P channel counts, wavelength ranges, TTL timing,
+  and USB serial protocol availability.
+- I did not find an ungated vendor protocol/register-map manual. The
+  `numanager_drivers::three_z_optics` implementation therefore records
+  Micro-Manager as the command/register source and marks the behavior
+  source-backed rather than bench-validated. Hardware validation or an official
+  register-map manual should still be used to confirm serial settings, model
+  ids, brightness limits, dirty-bit behavior, fault behavior, and optical
+  output.
 
 ### Coherent OBIS
 

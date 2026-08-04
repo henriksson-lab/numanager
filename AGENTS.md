@@ -20,20 +20,29 @@ fixtures.
   self-confirming checks elsewhere.
 - Evidence for a command, reply, state transition, or unit conversion must be
   recorded in device pages, reverse notes, hardware validation notes, captured
-  traces, or bench logs and traced to one of:
+  traces, bench logs, or source-audit notes and traced to a named source.
+  Acceptable sources include, but are not limited to:
   - manufacturer documentation;
   - a public standard;
   - open firmware or audited open SDK/header source;
+  - audited open adapter source, including Micro-Manager adapters, with adapter
+    revision/source URL recorded;
+  - vendor SDK/API documentation or headers;
+  - reverse notes that identify observable wire/API behavior;
   - captured traffic from real hardware;
   - a documented bench run on real hardware.
-- If none of those evidence sources exists, do not write a fake test or
-  fixture. Mark the behavior as unknown or pending hardware validation.
+- Implementation may proceed from any recorded source type. Hardware testing is
+  a separate validation step: untested behavior must be labeled as implemented
+  from source evidence and not hardware validated.
+- If no recorded source exists for a behavior, do not write a fake test or
+  fixture. Mark the behavior as unknown or source-evidence missing.
 - Hardware validation notes should follow
   `docs/devices/hardware-validation-template.md` and include the hardware
   identity, firmware/software version, transport, observed completion/fault
   behavior, and remaining uncertainty.
-- Micro-Manager source may guide compatibility and edge-case investigation, but
-  it is not sufficient evidence by itself for driver behavior claims.
+- Micro-Manager source is acceptable implementation evidence when recorded with
+  provenance and uncertainty. It is not, by itself, hardware validation or proof
+  that behavior works on every device variant.
 - The general interim solution whenever firmware, a loader, or a vendor runtime
   is required is to ship the original vendor package as third-party excluded
   data when redistribution terms permit it, or load a user-configured local copy

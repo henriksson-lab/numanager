@@ -7,16 +7,20 @@ outside this repository.
 
 ## Source Ladder
 
-Prefer evidence in this order:
+Prefer evidence in this order when sources conflict or when deciding how much
+confidence to assign. Lower-ranked sources are still valid implementation
+inputs when their provenance and uncertainty are recorded.
 
 1. Manufacturer protocol manuals, application notes, and command references.
 2. Public standards such as Modbus, GenICam, USB class specs, SCPI, or HID
    report descriptors.
 3. Open firmware, open SDKs, public headers, or audited open-source adapters.
-4. Captured traffic from real hardware with matching runtime output.
-5. Documented bench runs on real hardware.
-6. Reverse engineered evidence stored outside this repository, used only to
-   identify candidate wire behavior that still needs trace or bench validation.
+4. Audited open adapter source such as Micro-Manager device adapters, with
+   revision and source URL recorded.
+5. Vendor SDK/API documentation or headers.
+6. Reverse notes that identify observable wire/API behavior.
+7. Captured traffic from real hardware with matching runtime output.
+8. Documented bench runs on real hardware.
 
 ## Clean-Room Spec Criteria
 
@@ -29,15 +33,17 @@ A protocol spec in this repository is acceptable when it:
   binaries or external tool output.
 - Avoids copied or proprietary implementation structure, private function names, addresses,
   call graphs, local variable layouts, and binary tooling details.
-- Marks unvalidated behavior as needing trace or bench evidence instead of
-  presenting it as supported.
+- Marks unvalidated behavior as not hardware validated instead of presenting it
+  as bench-tested.
 - Separates public API design from protocol helpers; examples must use public
   runtime/device/capability/property APIs.
 
 ## Driver Gate
 
-Default-supported driver code requires enough external evidence to make device
-behavior auditable without proprietary binary internals:
+Driver code may be implemented from any recorded source type as long as the
+source, confidence, and validation state are explicit. Default-supported driver
+code requires enough external evidence to make device behavior auditable without
+proprietary binary internals:
 
 - discovery identity and transport setup;
 - command and reply framing;
@@ -46,12 +52,18 @@ behavior auditable without proprietary binary internals:
 - units, scaling, and limits for physical quantities;
 - safe disable/stop behavior for motion, laser, light, temperature, pressure,
   and fluidic output devices;
-- a hardware validation note following
-  `docs/devices/hardware-validation-template.md`.
+- a validation state recorded in the device page or evidence register.
 
 If those criteria are not met, implementation attempts are still allowed, but
 the driver must expose unsupported/unknown behavior explicitly and must not
 claim hardware validation or complete protocol coverage.
+
+Hardware validation notes following
+`docs/devices/hardware-validation-template.md` promote source-backed support to
+bench-validated support. They are not required before writing the implementation
+when another recorded source describes the behavior.
+A hardware validation note is the promotion record, not the implementation
+permission slip.
 
 The general interim solution whenever firmware, a loader, or a vendor runtime
 is required is to ship the original vendor package as third-party excluded data
