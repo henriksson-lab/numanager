@@ -308,23 +308,25 @@ pub fn model_for_product_id(product_id: u16) -> Option<ToupcamModel> {
         .find(|model| model.product_id == product_id)
 }
 
-/// Vendor-registry identity for a camera this driver can recognize but has no
-/// recorded open sequence for.
+/// Catalogue identity for a camera this driver can recognize but has no
+/// profile for.
 ///
-/// Streaming needs a per-model open sequence, which only a capture of that model
-/// can supply. Identity and geometry, though, are recoverable for the vendor's
-/// whole catalogue, which is what turns "device hangs waiting for a frame that
-/// never comes" into a named, actionable error.
+/// Streaming needs a per-model sensor register map or a recorded open sequence.
+/// Identity and geometry, though, are known for the whole catalogue, which is
+/// what turns "device hangs waiting for a frame that never comes" into a named,
+/// actionable error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToupcamIdentity {
     pub product_id: u16,
     pub model: &'static str,
-    pub width: u32,
-    pub height: u32,
+    /// Full-frame geometry. A minority of catalogue rows carry a name and
+    /// product id but no geometry, so this is optional — a camera is still
+    /// worth naming when its geometry is unknown.
+    pub geometry: Option<(u32, u32)>,
 }
 
-/// Registry recovered from the vendor runtime; see
-/// `docs/reverse/toupcam-model-registry.md` for provenance and known gaps.
+/// Camera catalogue; see `docs/reverse/toupcam-model-registry.md` for contents
+/// and known gaps.
 const MODEL_REGISTRY: &str = include_str!("toupcam_models.tsv");
 
 /// Look up a USB product id in the vendor registry.
@@ -334,9 +336,7 @@ pub fn identity_for_product_id(product_id: u16) -> Option<ToupcamIdentity> {
             continue;
         }
         let mut f = line.split('\t');
-        let (Some(name), Some(_vid), Some(pid), Some(w), Some(h)) =
-            (f.next(), f.next(), f.next(), f.next(), f.next())
-        else {
+        let (Some(name), Some(_vid), Some(pid)) = (f.next(), f.next(), f.next()) else {
             continue;
         };
         let Ok(pid) = u16::from_str_radix(pid.trim_start_matches("0x"), 16) else {
@@ -345,15 +345,19 @@ pub fn identity_for_product_id(product_id: u16) -> Option<ToupcamIdentity> {
         if pid != product_id {
             continue;
         }
-        let (Ok(width), Ok(height)) = (w.parse::<u32>(), h.parse::<u32>()) else {
-            continue;
+        // Geometry is absent for a minority of rows; still report the model.
+        let geometry = match (f.next(), f.next()) {
+            (Some(w), Some(h)) => match (w.parse::<u32>(), h.parse::<u32>()) {
+                (Ok(width), Ok(height)) => Some((width, height)),
+                _ => None,
+            },
+            _ => None,
         };
         // `name` is borrowed from a `&'static str`, so the identity is 'static.
         return Some(ToupcamIdentity {
             product_id: pid,
             model: name,
-            width,
-            height,
+            geometry,
         });
     }
     None
@@ -2839,7 +2843,7 @@ mod live_toupcam {
                         "no Toupcam USB device found for configured index",
                     )
                 })?;
-            let product_id = device.product_id();
+            let (vendor_id, product_id) = (device.vendor_id(), device.product_id());
             let model = model_for_product_id(product_id).ok_or_else(|| {
                 let known = models()
                     .iter()
@@ -2850,17 +2854,22 @@ mod live_toupcam {
                     Some(id) => Error::new(
                         ErrorCode::Unsupported,
                         format!(
-                            "Toupcam {} (0x{product_id:04x}, {}x{}) is a known model but has no \
-                             recorded open sequence, so it cannot be streamed; capture the vendor \
-                             application opening it and add a model profile. Streamable models: {known}",
-                            id.model, id.width, id.height
+                            "Toupcam {model} (0x{product_id:04x}{geometry}) is in the camera \
+                             catalogue but this driver has no profile for it, so it cannot be \
+                             streamed. Add one: either its sensor register map, or a recorded \
+                             open sequence. Streamable models: {known}",
+                            model = id.model,
+                            geometry = match id.geometry {
+                                Some((w, h)) => format!(", {w}x{h}"),
+                                None => String::new(),
+                            }
                         ),
                     ),
                     None => Error::new(
                         ErrorCode::Unsupported,
                         format!(
-                            "no recorded Toupcam open sequence for product id 0x{product_id:04x}, \
-                             and it is not in the vendor model registry. Streamable models: {known}"
+                            "no Toupcam profile for product id 0x{product_id:04x}, and it is not \
+                             in the camera catalogue. Streamable models: {known}"
                         ),
                     ),
                 }
@@ -2870,9 +2879,12 @@ mod live_toupcam {
                     "open failed; another application may hold the camera: {error}"
                 ))
             })?;
-            let iface = device
-                .detach_and_claim_interface(0)
-                .map_err(|error| usb_error(format!("claim interface 0 failed: {error}")))?;
+            let iface = device.detach_and_claim_interface(0).map_err(|error| {
+                usb_error(format!(
+                    "claim interface 0 failed: {error}{}",
+                    crate::usb_discovery::usb_claim_hint(vendor_id, product_id, 0)
+                ))
+            })?;
             let _ = iface.set_alt_setting(0);
             let live = Self { iface, model };
             live.init()?;

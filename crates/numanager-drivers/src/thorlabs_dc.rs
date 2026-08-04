@@ -3695,8 +3695,13 @@ mod live_thorlabs_dc_usbtmc {
                 .detach_and_claim_interface(endpoint.interface)
                 .map_err(|error| {
                     usb_error(format!(
-                        "claim Thorlabs DC USBTMC interface {} failed: {error}",
-                        endpoint.interface
+                        "claim Thorlabs DC USBTMC interface {} failed: {error}{}",
+                        endpoint.interface,
+                        crate::usb_discovery::usb_claim_hint(
+                            endpoint.vendor_id,
+                            endpoint.product_id,
+                            endpoint.interface
+                        )
                     ))
                 })?;
             Ok(Self {

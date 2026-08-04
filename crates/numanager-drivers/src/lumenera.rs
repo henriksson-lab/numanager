@@ -911,7 +911,10 @@ mod live_lumenera {
         let interface = device.claim_interface(0).map_err(|error| {
             Error::new(
                 ErrorCode::Transport,
-                format!("claiming the Lumenera loader interface failed: {error}"),
+                format!(
+                    "claiming the Lumenera loader interface failed: {error}{}",
+                    crate::usb_discovery::usb_claim_hint(vendor_id, product_id, 0)
+                ),
             )
         })?;
 

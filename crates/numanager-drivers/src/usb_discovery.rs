@@ -96,3 +96,34 @@ impl DriverDiscovery for UsbVidPidDiscovery {
         self.registry.detect_all()
     }
 }
+
+/// Host-access diagnosis to append to a failed USB interface claim, already
+/// punctuated for that position (`"; …"`), or empty when the host has nothing
+/// to add.
+///
+/// A userspace USB driver can only claim an interface the host has granted it:
+/// a udev rule on Linux, a WinUSB binding on Windows. Windows is the case that
+/// needs explaining at the point of failure — `nusb` reports only
+/// `Device driver is "…", not WinUSB`, which does not tell the user what to do
+/// — so on Windows this asks the `winusb_access` module what owns the node
+/// (that module is not compiled on other hosts, hence no link). See
+/// [`builtin_usb_vendor_claims`] for the Linux side.
+///
+/// This reports; it never changes a driver binding. Empty off Windows.
+pub fn usb_claim_hint(vendor_id: u16, product_id: u16, interface: u8) -> String {
+    #[cfg(any(windows, feature = "winusb"))]
+    {
+        let function =
+            crate::winusb_access::UsbFunction::new(vendor_id, product_id).interface(interface);
+        match crate::winusb_access::claim_failure_hint(function) {
+            Some(hint) => format!("; {hint}"),
+            None => String::new(),
+        }
+    }
+
+    #[cfg(not(any(windows, feature = "winusb")))]
+    {
+        let _ = (vendor_id, product_id, interface);
+        String::new()
+    }
+}

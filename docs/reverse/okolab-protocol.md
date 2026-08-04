@@ -4,109 +4,69 @@
 
 | Item | Value |
 | --- | --- |
-| Status | External-evidence protocol specification; no hardware validation yet |
-| Runtime evidence | Reverse engineered |
-| Header evidence | Public declarations |
-| Command dictionary | Shipped Okolab command database: [`../../data/third_party/okolab/okolib.db`](../../data/third_party/okolab/okolib.db) |
-| Adapter evidence | Micro-Manager adapter behavior |
-| Note coverage | Frame grammar, checksum control bytes, raw checksum trailer, CR terminator, serial settings, retry gates, DB-driven identity probe, property-table loading, write-code selection, and RPC reachability |
-| Consistency check | Checked copies carry the same command grammar and database content. The shipped database is third-party data and is excluded from this repository's license. |
-| Cross-build check | The checked alternate build carries the same baud table, command-code format, float formats, error strings, database filename, and identification/discovery queries. |
-| Validation boundary | Framing, checksum, retry, error vocabulary, product identification, and the database read algorithm are recorded as candidate wire facts. What the values *mean* on real hardware — units in practice, settling/completion behavior, alarm semantics, safe write ranges — is **not** validated and still needs a hardware trace. |
-
----
+| Status | Interface specification from external evidence; no hardware validation yet |
+| Evidence classes | Manufacturer documentation (public interface declarations); an independent interface specification maintained outside this repository; a manufacturer-supplied command database shipped as third-party data in this repository and excluded from its license |
+| Consistency check | Independent copies of the interface specification agree on the command grammar, baud table, command-code format, float formats, error strings, and the identification/discovery lookups; the command-database content matches across copies. |
+| Validation boundary | Framing, checksum, retry, error vocabulary, product identification, and the dictionary lookup are recorded as candidate wire facts. What the values *mean* on real hardware — units in practice, settling/completion behavior, alarm semantics, safe write ranges — is **not** validated and still needs a hardware trace. |
 
 ## 1. Transport
 
-| Field | Recovered value | Evidence class |
-| --- | --- | --- |
-| API transport | Serial | reverse engineered |
-| Line settings | **8 data bits, no parity, 1 stop bit, no flow control**; CTS ignore, DSR ignore, DTR off, RTS off, XON/XOFF disabled | reverse engineered |
-| Open mode | `sp_open(port, 3)` = `SP_MODE_READ_WRITE`, then `sp_flush(BOTH)` | reverse engineered |
-| Baud rates tried | `115200`, then `4800` | reverse engineered |
-| Terminator | Carriage return `0x0D` on both directions. **No LF.** | reverse engineered |
-| Write timeout | 200 ms per `sp_blocking_write`, followed by `sp_drain` | literal `0xc8` at every write site |
-| Reply timeout | 200 ms for a bare-CR probe; **500 ms** once a command code has been written | reverse engineered |
-| Read granularity | One byte per `sp_blocking_read(port, buf, 1, 199)`, looped until CR or deadline | `0xc7` = 199 ms |
-| Max reply | 199 bytes of payload + NUL into a 200-byte channel buffer | index guard `cmp edx,0xc7` |
-| Max request payload | 201 bytes (`0xc9`), truncated by `strncpy`/`snprintf` | reverse engineered |
-| Concurrency | One transaction at a time per port: `EnterCriticalSection`, then spin `Sleep(1000)` while an in-flight flag is set | reverse engineered |
-
-### Auto-reconnect on write failure
-
-Every write site has the same recovery path: if `sp_blocking_write` returns
-negative, the vendor implementation does `sp_flush(BOTH)` → `sp_close` → `sp_free_port` →
-`sp_free_config` → `_SerialConnect()` (re-open with the same settings) and
-**retries the identical write once**. A second failure returns comm error.
-This means a driver that reimplements the protocol will see the controller
-tolerate a port re-open mid-session without any re-handshake.
-
----
+| Field | Value |
+| --- | --- |
+| Transport | Serial (USB-serial bridges in practice, §3.1) |
+| Line settings | **8 data bits, no parity, 1 stop bit, no flow control**; CTS/DSR ignored, DTR off, RTS off, XON/XOFF disabled |
+| Baud rates tried | `115200`, then `4800` |
+| Terminator | Carriage return `0x0D` in both directions. **No LF.** |
+| Write timeout | 200 ms per write, followed by a drain |
+| Reply timeout | 200 ms for a bare-CR probe; **500 ms** once a command code has been written |
+| Read granularity | One byte at a time with a 199 ms per-byte deadline, looped until CR or overall deadline |
+| Max reply | 199 payload bytes plus a terminating NUL in a 200-byte buffer |
+| Max request payload | 201 bytes, truncated beyond that |
+| Concurrency | One transaction at a time per port; concurrent callers block until the in-flight transaction clears |
+| Write failure | Flush, close, re-open with the same settings, retry the identical write **once**; a second failure is a communication error. The controller therefore tolerates a mid-session port re-open with no re-handshake. |
 
 ## 2. Frame grammar
 
-A command is always identified by a **numeric command code**, rendered as
-exactly three decimal digits with `snprintf("%03d")`. Codes are `unsigned int`
-and the shipped database contains codes up to 4 digits (for example `544`,
-`1051`) — `%03d` does not truncate, it only zero-pads, so a 4-digit code emits
-4 characters. Any parser must therefore treat the code field as *variable
-length* in the general case even though the vendor implementation's own reply validation assumes
-3 characters (see §2.3 quirk).
+A command is identified by a **numeric command code** in decimal, zero-padded to
+a minimum of three digits. The command database contains 4-digit codes (for
+example `544`, `1051`), which emit 4 characters, so a parser must treat the code
+field as *variable length* even though the recorded reply validation assumes 3
+characters (§2.3).
 
 ### 2.1 Plain Frame Grammar
 
-This path is used when checksum support is disabled or not present.
+Used when checksum support is disabled or not present.
 
 | Operation | Bytes on the wire |
 | --- | --- |
 | Read | `DDD` `\r` |
 | Write | `DDD` `<payload>` `\r` |
-| RPC | `DDD` `\r` (indistinguishable from a read in plain mode) |
+| RPC | `DDD` `\r` (indistinguishable from a read) |
 | Status probe | `\r` (bare CR, no code) |
+| Success reply | `DDD` `<payload>` `\r` |
 
-Writes are emitted as three separate `sp_blocking_write` + `sp_drain` calls:
-the code, then the payload if non-empty, then the terminator. The command type
-(`G`/`S`/`R`) is **not** transmitted in plain mode — the device distinguishes a
-read from a write purely by whether a payload precedes the CR.
-
-Success reply: `DDD` `<payload>` `\r`. the vendor implementation validates that the first three
-received bytes equal the three code characters it sent, then copies everything
-from offset 3 up to (not including) the CR as the value.
+A write is emitted as three separate write+drain operations: code, payload,
+terminator. The command type (`G`/`S`/`R`) is **not** transmitted in plain mode —
+the device distinguishes a read from a write purely by whether a payload precedes
+the CR. On reply, the first three bytes must echo the code sent; everything from
+offset 3 up to (not including) the CR is the value.
 
 ### 2.2 Checksum Frame Grammar
 
-External notes record the checksum-mode frame builder and parser.
-
-`eCommandType` maps to a leading type character:
-
-| `eCommandType` | Char | Meaning |
-| --- | --- | --- |
-| `0` | `G` (`0x47`) | Get / read |
-| `1` | `S` (`0x53`) | Set / write |
-| `2` | `R` (`0x52`) | RPC / execute |
-| other | — | rejected locally with internal code 15 |
-
-Request:
+Request and reply share one shape, where `<type>` is `G` (`0x47`, get/read),
+`S` (`0x53`, set/write), or `R` (`0x52`, RPC/execute); any other type value is
+rejected locally with internal code 15.
 
 ```text
 <type> <DDD> <payload> '#' <sum_hi> <sum_lo> '\r'
 ```
 
-Status probe in checksum mode is `'#' 0x00 0x00 '\r'` — i.e. an empty body with
-a zero checksum.
+The status probe in checksum mode is `'#' 0x00 0x00 '\r'` — an empty body with a
+zero checksum.
 
-Reply:
-
-```text
-<type> <DDD> <payload> '#' <sum_hi> <sum_lo> '\r'
-```
-
-#### Checksum algorithm
-
-The checksum is a 16-bit value transmitted as two raw bytes, high byte first.
-It is the sum of the **signed 8-bit** values of the frame body, where the body
-is *everything after the type character and before the `#`* for normal
-three-digit command codes:
+The checksum is a 16-bit value sent as two raw bytes, high byte first: the sum of
+the **signed 8-bit** values of everything after the type character and before the
+`#`.
 
 ```text
 sum = Σ (int8_t) c   for c in DDD ++ payload
@@ -114,161 +74,84 @@ sum_hi = (sum >> 8) & 0xFF
 sum_lo =  sum       & 0xFF
 ```
 
-Send side: external note sign-extends `buf[1]`, `buf[2]`, `buf[3]` (the three
-digits) and adds them; external note adds the payload bytes with `movsx` /
-`pcmpgtb` sign extension. The type character at `buf[0]` is deliberately
-skipped.
-
-Receive side: external note accumulates `movsx` (signed) bytes into the running
-sum starting at received index 1 — index 0, the echoed type character, is
-stored but not summed — and stops at `#`. The two bytes after `#` are read
-**unsigned** and combined as `hi*256 + lo` (external note: contribution =
-`b + b*255*k` with `k = 1` then `k = 0`). Mismatch yields internal code 16.
+The type character is excluded on both send and receive. On receive the two bytes
+after `#` are read **unsigned** and combined as `hi*256 + lo`; a mismatch yields
+internal code 16.
 
 > Because the checksum bytes are raw binary, a checksum-mode frame is **not**
-> ASCII-safe: `sum_hi`/`sum_lo` can be `0x00`, `0x0D`, or `0x23`. the vendor implementation's
-> receive loop handles an embedded CR by only treating CR as end-of-frame once
-> both checksum bytes have been consumed (`cmp ebp,-2`) or when
-> the frame starts with `E`.
+> ASCII-safe: `sum_hi`/`sum_lo` can be `0x00`, `0x0D`, or `0x23`. An embedded CR
+> is handled by treating CR as end-of-frame only once both checksum bytes have
+> been consumed, or when the frame starts with `E`.
 
-#### Reply validation in checksum mode
+Reply validation order: length ≤ 1 → malformed (internal 11); first byte `'E'` →
+error string (§4); length ≤ 3 → malformed; checksum mismatch → internal 16;
+leading `<type><DDD>` does not echo what was sent → malformed; otherwise payload
+is bytes 4 .. len-3 (total minus the 4-byte header, `#`, and two checksum bytes).
 
-1. length ≤ 1 → malformed (internal 11)
-2. first byte is `'E'` → parse as an error string (§4)
-3. length ≤ 3 → malformed
-4. computed sum ≠ received sum → internal 16
-5. `strncmp(reply, "<type><DDD>", 4) != 0` → malformed
-6. otherwise payload = `reply[4 .. len-3]`, i.e. total length minus the
-   4-byte header minus `#` and the two checksum bytes
+### 2.3 Known quirks worth reproducing or deliberately not reproducing
 
-### 2.3 Known vendor implementation quirks worth reproducing or deliberately not reproducing
-
-- The reply header comparison is hard-coded to **3 bytes** in plain mode and
-  **4 bytes** in checksum mode. For a 4-digit command code the vendor implementation therefore
-  only checks a prefix and then strips a fixed 3 (or 4) bytes, which would
-  leave the trailing code digit inside the returned value. Either the affected
-  4-digit codes are never used on a real reply path, or the vendor tolerates it.
-  Treat 4-digit codes as unvalidated until a hardware trace exists.
-- The checksum request builder has a related 4-digit-code quirk: it writes all
-  code digits produced by `snprintf("%03d")`, but the send-side checksum seed
-  only adds `buf[1]`, `buf[2]`, and `buf[3]` before adding payload bytes. A
-  checksum-mode request for a 4-digit code would therefore transmit the fourth
-  code digit but not include it in the outgoing checksum. The receive-side
-  checksum validator does sum every byte after the type until `#`, so replies
-  with 4-digit echoed codes are especially unvalidated.
+- The reply header comparison is fixed at **3 bytes** plain / **4 bytes**
+  checksum, so for a 4-digit code only a prefix is checked and a fixed 3 (or 4)
+  bytes stripped, leaving the trailing digit inside the value. Send side, same
+  cause: a checksum-mode request for a 4-digit code transmits the fourth digit
+  but omits it from the outgoing checksum, while the receive-side validator sums
+  every byte after the type until `#`. Treat 4-digit codes as unvalidated.
 - In plain mode a read and an RPC produce byte-identical traffic.
-- On a bare-CR status probe in plain mode, the vendor implementation compares the reply against
-  an all-zero 4-byte buffer, so a well-formed data reply to a bare CR would be
-  reported as malformed. The bare CR is only ever used as a liveness probe.
-
----
+- A bare-CR probe in plain mode compares the reply against an all-zero buffer, so
+  a well-formed data reply to a bare CR reads as malformed; the bare CR is only
+  ever a liveness probe.
 
 ## 3. Session and identification sequence
 
-This is the full open sequence recorded in the external notes.
-
 ### 3.1 Port selection
 
-The vendor implementation follows this sequence:
+Reject a port already open; run the filtered connect sequence (§3.2–3.4) against
+a product-name filter; discover properties (§5); detect modules (§7). When
+USB-only filtering is enabled, restrict to USB-transport ports whose VID/PID
+appears in the database's USB table for products matching the filter:
 
-1. Reject if the port is already open by this library (`"Port already used"`).
-2. Create the device object and run `ConnectFiltered(name_filter)` (§3.2–3.4).
-3. Run `PropertiesDiscover` (§5).
-4. If USB-only filtering is enabled (`oko_LibSetSuggestedUSBOnly`), query
+| vid | pid | Product lines |
+| --- | --- | --- |
+| 1027 (`0x0403`, FTDI) | 24577 | Bold Line, CO2-UNIT-XL, H401-T, UNO |
+| 1003 (`0x03EB`, Atmel) | 9220 (`0x2404`) | TC-7D, H402-T, UNO-CONTROLLER |
+| 0 | 0 | H402-T, UNO-CONTROLLER, H401-T, UNO |
 
-   ```sql
-   SELECT DISTINCT vid, pid FROM UsbInfo
-     INNER JOIN Product ON UsbInfo.prodLineID = Product.prodLineID
-    WHERE Product.name LIKE '%<name_filter>%'
-   ```
-
-   then `sp_get_port_transport(port)` and accept only
-   `SP_TRANSPORT_USB` (`1`) ports whose VID/PID is in that set.
-5. `PropertiesGetNumber()`, then `ModulesDetect()` (§6).
-
-The shipped `UsbInfo` table:
-
-| vid | pid | speed | product line |
-| --- | --- | --- | --- |
-| 1027 (`0x0403` FTDI) | 24577 | 4800 | Bold Line |
-| 1027 | 24577 | 115200 | Bold Line |
-| 1027 | 24577 | 4800 | CO2-UNIT-XL |
-| 1027 | 24577 | 115200 | H401-T |
-| 1027 | 24577 | 115200 | UNO |
-| 1003 (`0x03EB` Atmel) | 9220 (`0x2404`) | 115200 | TC-7D |
-| 1003 | 9220 | 115200 | H402-T |
-| 1003 | 9220 | 115200 | UNO-CONTROLLER |
-| 0 | 0 | 115200 | H402-T, UNO-CONTROLLER, H401-T, UNO |
-
-`speed` is informational — the vendor implementation does not read it. Baud is discovered by the
-scan in §3.2.
+The table also carries a nominal baud (`4800` for Bold Line and CO2-UNIT-XL,
+`115200` elsewhere), but it is informational and unused — baud is discovered by
+the scan in §3.2.
 
 ### 3.2 Baud discovery / liveness probe
 
-The vendor implementation walks the baud list **twice** (a two-pass retry;
-the retry index starts at 2 and is reset to 1 for a second full sweep). For each
-baud:
-
-1. `sp_flush(BOTH)`, `sp_close`, `sp_free_port`, `sp_free_config`
-2. `_SerialConnect()` with the candidate baud
-3. send a **bare CR** and read the reply
-
-The port is accepted when the probe returns internal `12` (success) **or**
-internal `2`, which is the error reply `E3`. In practice an idle Okolab
-controller answers a bare CR with `E3\r`; that is the liveness signature.
-
-The vendor implementation confirms this: it sends a bare CR and only
-sets the "device alive" flag when the reply is exactly `E3`.
+The baud list is walked **twice** (a two-pass retry). For each baud: flush and
+re-open the port at that baud, send a **bare CR**, read the reply. The port is
+accepted on internal `12` (success) or internal `2`, which is the error reply
+`E3`. An idle Okolab controller answers a bare CR with `E3\r`; that is the
+liveness signature, and the "device alive" flag is set only on exactly `E3`.
 
 ```text
-host -> DDD-less:  0D
+host -> (no code):  0D
 dev  -> "E3" 0D                 ; device present and idle
 ```
 
 ### 3.3 Product identification
 
 Identification is a **database-driven probe**, not a fixed identity command.
+Candidates are the distinct non-zero `name_code` and `code_alt` values of
+`Product` rows whose `name` matches the caller's product-name substring, ordered
+by product line; an empty filter matches every product. Each candidate is an
+**(identity command code, product line)** pair. For each, in order:
 
-The vendor implementation opens `okolib.db` and runs:
+1. Send a **read** of the identity command code.
+2. On failure, move to the next candidate.
+3. On success the reply string is the product name; match it back to the
+   catalogue against `Product.name` and `AltName.alt_name` for that identity
+   code, appending every matching `Product.id` to the device's product-id list.
+4. After the first match, stop probing *other* product lines and continue only
+   within the matched line.
+5. If any probe returns internal `8` (reply `E10`), abort the whole scan — the
+   device is a bus slave and must not be enumerated on this port.
 
-```sql
-SELECT DISTINCT t.nc, t.pl FROM (
-    SELECT DISTINCT name_code AS nc, prodLineID AS pl FROM Product WHERE name LIKE '%<filter>%'
-    UNION
-    SELECT DISTINCT code_alt  AS nc, prodLineID AS pl FROM Product WHERE name LIKE '%<filter>%'
-) AS t
-WHERE t.nc IS NOT NULL AND t.nc > 0
-ORDER BY pl
-```
-
-`filter` is the caller's product-name substring; `oko_DevicesDetect` /
-`oko_DeviceOpen` pass an empty string, which makes `LIKE '%%'` match every
-product. This yields a candidate list of **(identity command code, product
-line)** pairs, grouped by product line.
-
-For each candidate row, in order:
-
-1. Send a **read** of `nc` — the identity command code:
-   `Receive(nc, &reply)`.
-2. If the read fails, move to the next row.
-3. If the read succeeds, the reply string is the device's product name. Match
-   it back to the catalogue:
-
-   ```sql
-   SELECT DISTINCT(Product.id) AS pid
-     FROM Product LEFT JOIN AltName ON Product.id = AltName.productId
-    WHERE Product.name = '<reply>' OR AltName.alt_name = '<reply>' AND name_code = <nc>
-   ```
-
-   Every matching `Product.id` is appended to the device's product-id list.
-4. Once at least one row has matched, the scan stops probing *other* product
-   lines and only continues within the matched line
-   (`cmp eax,r13d` / `test dil,dil`).
-5. If any probe returns internal `8` (reply `E10`, mapped to
-   `OKO_ERR_DEV_SLAVE`), the whole scan aborts — the device is a slave on a bus
-   and must not be enumerated on this port.
-
-Identity command codes present in the shipped database:
+Identity command codes in the shipped command database:
 
 | `name_code` | Parameter that carries it | Product lines |
 | --- | --- | --- |
@@ -280,28 +163,20 @@ Identity command codes present in the shipped database:
 | `64` | `Temperature product code` (id 45) / `Product code (PT-Sens)` (id 630) | Bold Line, LEO |
 | `362` | `Humidity product code` (id 255) | Bold Line |
 
-So a Bold Line temperature unit is identified by `064\r` → `064H301 T Unit-BL\r`,
-a Bold Line gas unit by `031\r` → `031CO2 Unit-BL\r`, and so on.
+A Bold Line temperature unit is identified by `064\r` → `064H301 T Unit-BL\r`, a
+Bold Line gas unit by `031\r` → `031CO2 Unit-BL\r`.
 
-> **SQL precedence quirk.** In the match query, `AND` binds tighter than `OR`,
-> so the `name_code` filter applies only to the `AltName` branch. A reply that
-> happens to equal a `Product.name` from a *different* identity code will still
-> match. A reimplementation should apply `name_code = nc` to both branches.
+> **Matching caution.** The recorded catalogue match applies the identity-code
+> filter to the alternative-name branch only, so a reply equal to a product name
+> from a *different* identity code can still match. Apply it to both branches.
 
 ### 3.4 Sub-product probe
 
-The vendor implementation then runs:
-
-```sql
-SELECT DISTINCT sp_code, subProdId FROM SubProduct
- WHERE subprodId NOT IN (0, <already-found ids>)
-   AND productId IN (<found ids>);
-```
-
-For each row it sends a read of `sp_code` and adds `subProdId` to the product
-list **iff the reply string is exactly `"1"`**. The shipped database has one
-such rule: `sp_code = 234` detects `HM-ACTIVE-SUB` (an active humidity module)
-attached to `CO2 Unit-BL` and the three `CO2-O2 Unit-BL` variants.
+For each `SubProduct` row whose `productId` is in the found list and whose
+`subProdId` is not already found, send a read of that row's `sp_code` and add
+`subProdId` **iff the reply is exactly `"1"`**. The shipped database has one such
+rule: `sp_code = 234` detects `HM-ACTIVE-SUB` (an active humidity module) on
+`CO2 Unit-BL` and the three `CO2-O2 Unit-BL` variants.
 
 ```text
 host -> "234" 0D
@@ -310,105 +185,67 @@ dev  -> "234" "1" 0D            ; humidity sub-module present
 
 ### 3.5 Checksum negotiation
 
-After the product list is non-empty:
-
-1. `GetChecksumUsage()` — the caller's preference, set via
-   `oko_DeviceSetChecksumUsage`. Default is off.
-2. If the caller wants checksums, `SetChecksumPresence(true)` and re-read the
-   identity code `nc` — this time framed with `G`/`#`/checksum.
-3. If that read returns success, checksum mode stays on. Otherwise
-   `SetChecksumPresence(false)` and the session falls back to plain framing.
-
-Checksum framing is used only when **presence AND usage** are both true
-using the two checksum flag bytes in driver state.
-
----
+Once the product list is non-empty and the caller has asked for checksums
+(default off), the identity code is re-read framed with `G`/`#`/checksum. Success
+keeps checksum mode on; otherwise the session falls back to plain framing.
+Checksum framing is used only when **presence AND usage** are both true.
 
 ## 4. Error vocabulary and result mapping
 
 ### 4.1 Wire error replies
 
-Any reply whose first byte is `'E'` is an error string. External notes record
-this decode table:
+Any reply whose first byte is `'E'` is an error string. There is no `E11`-`E14`
+handler.
 
-| Wire reply | Internal code | Mapped `oko_res_type` |
+| Wire reply | Internal code | Meaning |
 | --- | --- | --- |
-| `E1` | 0 | `OKO_ERR_NOTSUPP` (-4) |
-| `E2` | 1 | `OKO_ERR_COMM` (-13) |
-| `E3` | 2 | `OKO_ERR_COMM` (-13) — but treated as *device alive* by the probes |
-| `E4` | 3 | `OKO_ERR_NOTSUPP` (-4) |
-| `E5` | 4 | `OKO_ERR_ARG` (-2) |
-| `E6` | 5 | `OKO_ERR_NOTSUPP` (-4) |
-| `E7` | 6 | `OKO_ERR_COMM` (-13) |
-| `E8` | 11 | `OKO_ERR_COMM` (-13) |
-| `E9` | 7 | `OKO_ERR_DEV_NOTRUNNING` (-17) |
-| `E10` | 8 | `OKO_ERR_DEV_SLAVE` (-16) |
-| `E15` | 13 | `OKO_ERR_COMM` (-13) |
-| `E16` | 14 | `OKO_ERR_COMM` (-13) |
-| `E17` | 15 | `OKO_ERR_COMM` (-13) |
-| `E18` | 16 | `OKO_ERR_COMM` (-13) |
-| any other `E…` | 11 | `OKO_ERR_COMM` (-13) |
-
-There is no `E11`-`E14` handler.
-
-Behavioural reading of the codes, from how the vendor implementation reacts to them:
-
-- `E1` — command not supported by this unit. the vendor implementation will retry it twice and
-  then, if invalid-command checking is armed, give up permanently.
-- `E3` — the canonical "I am here but that was not a command" reply. It is what
-  a bare CR gets, and it is accepted as proof of liveness.
-- `E5` — argument rejected (out of range / bad format).
-- `E9` — device present but not running.
-- `E10` — device is a slave; do not enumerate it on this port.
+| `E1` | 0 | Not supported by this unit; retried twice, then abandoned when invalid-command checking is armed |
+| `E2` | 1 | Communication error |
+| `E3` | 2 | Communication error — the canonical "I am here but that was not a command" reply; accepted as proof of liveness (§3.2) |
+| `E4` | 3 | Not supported |
+| `E5` | 4 | Bad argument (out of range / bad format) |
+| `E6` | 5 | Not supported |
+| `E7` | 6 | Communication error |
+| `E8` | 11 | Communication error |
+| `E9` | 7 | Device present but not running |
+| `E10` | 8 | Device is a bus slave; do not enumerate it on this port |
+| `E15` | 13 | Communication error |
+| `E16` | 14 | Communication error |
+| `E17` | 15 | Communication error |
+| `E18` | 16 | Communication error |
+| any other `E…` | 11 | Communication error |
 
 ### 4.2 Internal (non-wire) codes
 
-| Internal | Meaning | Mapped `oko_res_type` |
-| --- | --- | --- |
-| 9 | Reply timeout (deadline expired with no CR) | `OKO_ERR_TIMEOUT` (-19) |
-| 10 | Serial write failed after one reconnect+retry | `OKO_ERR_PORT_NOTVALID` (-9) |
-| 11 | Malformed reply: too short, or header did not echo the sent code | `OKO_ERR_COMM` (-13) |
-| 12 | **Success** | `OKO_OK` (0) |
-| 15 | Bad `eCommandType` (local programming error) | — |
-| 16 | Checksum mismatch | `OKO_ERR_COMM` (-13) |
-
-libserialport failures map as follows:
-`SP_ERR_SUPP → OKO_ERR_NOTSUPP`, `SP_ERR_MEM → OKO_ERR_MEMORY`,
-`SP_ERR_FAIL → OKO_ERR_FAIL`, `SP_ERR_ARG → OKO_ERR_PORT_NOTVALID`,
-anything else → `OKO_ERR_UNDEF` (-999). `sp_open` returning
-`SP_ERR_ARG`-class error code 5 is reported as `OKO_ERR_PORT_BUSY` (-7).
+| Internal | Meaning |
+| --- | --- |
+| 9 | Reply timeout (deadline expired with no CR) |
+| 10 | Serial write failed after one reconnect+retry |
+| 11 | Malformed reply: too short, or header did not echo the sent code |
+| 12 | **Success** |
+| 15 | Bad command type (local programming error) |
+| 16 | Checksum mismatch |
 
 ### 4.3 Retry policy
 
-The vendor implementation:
+If the "device alive" flag is clear, the liveness check runs first and a failure
+is returned immediately. Otherwise up to **20 attempts** are made: return
+immediately on internal `3,4,5,6,7,8,12` (and on `2` when the command code is 0);
+on `0,1,2,9,10,11,13,14,15,16` re-run the liveness check and either return its
+error or retry. Internal `0` (`E1`) after the second attempt, with
+invalid-command checking armed, returns `E1` with no further retries. The
+liveness check itself retries the bare-CR probe **10 times** if the device was
+previously known-alive and **2 times** otherwise, clearing the alive flag when it
+gives up.
 
-1. If the "device alive" flag is clear, run `_CheckWorkingStatus()` first; if
-   that does not return success, fail immediately.
-2. Loop up to **20 attempts**:
-   - issue one plain or checksum transaction;
-   - **return immediately** on internal `3,4,5,6,7,8,12` (and on `2` when the
-     command code is 0);
-   - otherwise (`0,1,2,9,10,11,13,14,15,16`) run `_CheckWorkingStatus()`; if
-     that fails, return its error, else retry.
-3. Special case: internal `0` (`E1`) after the second attempt, with
-   invalid-command checking armed, returns `E1` without further retries.
+Net effect: one property read can legitimately generate up to ~20 command frames
+interleaved with up to ~10 bare-CR probes each. A reimplementation should choose
+a much tighter budget and document it.
 
-`_CheckWorkingStatus` itself retries the bare-CR probe **10 times** if the
-device was previously known-alive, **2 times** otherwise, and clears the alive
-flag when it gives up.
+## 5. Command dictionary
 
-Net effect: a single property read can legitimately generate up to ~20
-command frames interleaved with up to ~10 bare-CR probes each. Any
-reimplementation should choose a much tighter budget and document it.
-
----
-
-## 5. Reading `okolib.db`
-
-The database is the command dictionary. It is opened by name **`okolib.db`**
-relative to the process working directory (the vendor implementation,
-global string), with `sqlite3_open_v2`. It is read-only in
-practice — the vendor implementation never writes to it.
+The manufacturer-supplied command database shipped as third-party data in this
+repository is the command dictionary; it is read-only in practice.
 
 ### 5.1 Schema roles
 
@@ -416,7 +253,7 @@ practice — the vendor implementation never writes to it.
 | --- | --- | --- |
 | `ProdLine` | 10 | Product families (`Bold Line`, `H401-T`, `H402-T`, `UNO`, `TC-7D`, `LEO`, …) |
 | `Product` | 44 | One row per marketed unit: `name`, `name_code`, `code_alt`, `prodLineID` |
-| `AltName` | 15 | Alternative reply strings that map to the same `Product` |
+| `AltName` | 15 | Alternative reply strings mapping to the same `Product` |
 | `SubProduct` | 4 | `sp_code` probe → `subProdId` to add when the reply is `"1"` |
 | `UsbInfo` | 12 | Per-product-line USB VID/PID and nominal baud |
 | `VarType` | 5 | `0 Undefined, 1 String, 2 Integer, 3 Floating, 4 Enumerator` |
@@ -424,31 +261,27 @@ practice — the vendor implementation never writes to it.
 | `ProductVar` | 2116 | Which parameters each product exposes (many-to-many) |
 | `EnumType` / `EnumValues` | 40 / 164 | Named value sets for `var_type = 4` |
 
-**Command codes are not globally unique.** `read_code = 1` is `Product code`
-for TC-7D but `Temperature 1` for another line. A code is only meaningful in
-the context of a specific `Product.id`. Resolution is always
-`Product → ProductVar → Parameters`.
+**Command codes are not globally unique.** `read_code = 1` is `Product code` for
+TC-7D but `Temperature 1` for another line; a code is only meaningful for a
+specific `Product.id`. Resolution is always `Product → ProductVar → Parameters`.
 
 ### 5.2 The `Parameters` row
 
 | Column | Wire role |
 | --- | --- |
-| `name` | Property key used by the SDK API |
+| `name` | Property key |
 | `unit` | Display unit (`°C`, `%`, `bar`, `ml/min`, `mbar`, `rpm`, `l/min`, `V`, `W`, `s`, `min`, `day`, …) |
 | `description` | Human text |
 | `var_type` | Value encoding (see `VarType`) |
-| `main` | Show in a summary/primary view |
-| `advanced` | Hide behind an "advanced" flag |
-| `oneshot` | Marks identity-like values (product code, serial number, software version). **the vendor implementation does not read this column** — see §5.4. Useful for us: it identifies values that need reading only once. |
-| `read_code` | Command code for a read (`G`). `0` = not readable → property is write-only. |
-| `write_code` | Command code for a persistent (EEPROM) write (`S`). `0` = not writable → property is read-only. |
-| `write_code_ram` | Command code for a volatile (RAM) write (`S`). Used by the `oko_PropertyWriteVolatile*` entry points. |
-| `min_code` | Command code whose **read** returns the minimum settable value |
-| `max_code` | Command code whose **read** returns the maximum settable value |
+| `main` / `advanced` | Summary-view / advanced-view flags |
+| `oneshot` | Identity-like values (product code, serial number, software version) that need reading only once and can be cached |
+| `read_code` | Read command code (`G`); `0` = write-only property |
+| `write_code` | Persistent (EEPROM) write command code (`S`); `0` = read-only property |
+| `write_code_ram` | Volatile (RAM) write command code (`S`) |
+| `min_code` / `max_code` | Command codes whose **read** returns the minimum / maximum settable value |
 | `enum_type_id` | `EnumType.id` when `var_type = 4` |
 
-Derived flags, exactly as `PropertiesDiscover` computes them
-:
+Derived flags:
 
 ```text
 read_only  = (write_code == 0)
@@ -457,58 +290,21 @@ has_limits = (min_code != 0 && max_code != 0)
 write_type = (write_code != 0 ? EEPROM : 0) | (write_code_ram != 0 ? VOLATILE : 0)
 ```
 
-Note `read_only` deliberately ignores `write_code_ram`: a property with only a
-volatile write is reported read-only by `oko_PropertyGetReadOnly` but is still
-writable through `oko_PropertyWriteVolatile*`.
+`read_only` deliberately ignores `write_code_ram`: a property with only a
+volatile write reports read-only yet is still writable through the volatile path.
 
-### 5.3 The property-discovery query
+### 5.3 Property discovery
 
-The vendor implementation issues exactly:
+Select the `Parameters` rows joined through `ProductVar` to the product-id list
+built in §3.3–3.4, so a device matching both a base product and a sub-product
+gets the union of both parameter sets; for each `var_type = 4` row load its value
+set from `EnumValues`. Parameter names prefixed `[DBG]` or `[PROD]` are
+debug/production-only entries and are meant to be filtered out of the normal set.
 
-```sql
-SELECT DISTINCT V.id, V.name, V.unit, V.description, V.advanced, V.oneshot,
-                V.main, V.read_code, V.write_code, V.write_code_ram,
-                V.min_code, V.max_code, V.var_type, V.enum_type_id
-  FROM Parameters V
- INNER JOIN ProductVar ON ProductVar.variablesId = V.id
- WHERE ProductVar.productId IN (-1, <id>, <id>, …)
-   -- appended only when debug properties are disabled:
-   AND (V.name NOT LIKE '[DBG]%' OR V.name NOT LIKE '[PROD]%')
-```
+### 5.4 A worked example
 
-and, for each row with `var_type = 4`:
-
-```sql
-SELECT E.id, E.enum_value, E.enum_name FROM EnumValues E WHERE E.enum_type_id = <id>
-```
-
-The `IN (-1, …)` list is the product-id list built in §3.3–3.4, so a device
-that matched both a base product and a sub-product gets the union of both
-parameter sets.
-
-> **Filter quirk.** `A NOT LIKE x OR A NOT LIKE y` is a tautology for any name
-> that is not both `[DBG]…` and `[PROD]…` — which is impossible. The debug
-> filter therefore never removes anything. If we want it to work the operator
-> must be `AND`. (SQLite `LIKE` does not treat `[` as a wildcard, so the
-> bracket prefixes match literally.)
-
-### 5.4 Post-processing the row
-
-- `unit` has every byte equal to `0xC3` stripped. In the shipped
-  database `°C` is stored as UTF-8 `C2 B0 43`, which contains no `0xC3`, so
-  this is a no-op here — it looks like defensive handling of a mojibake
-  (`C3 82 C2 B0`) seen in some database revision. Reproduce it only if a
-  hardware trace shows a database that needs it.
-- `oneshot` (column index 5) is fetched by the query but **never read** from
-  the statement — `PropertiesDiscover` reads columns 1,2,3,4,6,7,8,9,10,11,12,13
-  and skips 5. the vendor implementation therefore re-polls identity strings like `Product code`
-  on every update cycle. We should honour `oneshot` and cache instead.
-- `id` (column 0) is also fetched and unused.
-
-### 5.5 A worked example
-
-Product `H301 T Unit-BL` (`Product.id = 5`, product line `Bold Line`,
-`name_code = 64`) exposes 70 parameters. Selected rows:
+Product `H301 T Unit-BL` (`Product.id = 5`, `Bold Line`, `name_code = 64`)
+exposes 70 parameters. Selected rows:
 
 | name | unit | var_type | read | write | write_ram | min | max |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -519,134 +315,85 @@ Product `H301 T Unit-BL` (`Product.id = 5`, product line `Bold Line`,
 | `Temperature serial number` | — | 1 string | 67 | – | – | – | – |
 | `Objective Heater temperature` | `°C` | 3 float | 189 | – | – | – | – |
 
-Resulting traffic, plain mode. **The command codes and their order are
-recovered evidence; the reply payload values below are illustrative examples,
-not captured bytes** — no hardware trace exists yet, so the exact
-numeric formatting is unknown:
+Resulting traffic, plain mode. **The command codes and their order are recorded
+evidence; the reply payload values are illustrative, not captured bytes** — no
+hardware trace exists yet, so the exact numeric formatting is unknown.
 
 ```text
-; identify
-host -> "064" 0D
-dev  -> "064H301 T Unit-BL" 0D
-
-; read current temperature
-host -> "048" 0D
-dev  -> "048" "37.02" 0D
-
-; read setpoint, and its allowed range
-host -> "082" 0D            dev -> "082" "37.00" 0D
-host -> "144" 0D            dev -> "144" "25.00" 0D     ; min_code
-host -> "143" 0D            dev -> "143" "50.00" 0D     ; max_code
-
-; volatile setpoint write (RAM), then persistent write (EEPROM)
-host -> "141" "37.50" 0D    dev -> "141" … 0D
-host -> "142" "37.50" 0D    dev -> "142" … 0D
-
-; read the status enum -> integer, resolved via EnumValues(Status)
-host -> "128" 0D            dev -> "128" "0" 0D          ; 0=OK 1=Transient 2=Alarm 3=Error 4=Disabled
+host -> "064" 0D            dev -> "064H301 T Unit-BL" 0D  ; identify
+host -> "048" 0D            dev -> "048" "37.02" 0D        ; current temperature
+host -> "082" 0D            dev -> "082" "37.00" 0D        ; setpoint
+host -> "144" 0D            dev -> "144" "25.00" 0D        ; min_code
+host -> "143" 0D            dev -> "143" "50.00" 0D        ; max_code
+host -> "141" "37.50" 0D    dev -> "141" … 0D              ; volatile (RAM) write
+host -> "142" "37.50" 0D    dev -> "142" … 0D              ; persistent (EEPROM) write
+host -> "128" 0D            dev -> "128" "0" 0D            ; Status: 0=OK 1=Transient 2=Alarm 3=Error 4=Disabled
 ```
 
-The same sequence in checksum mode, for the setpoint read. The request line is
-byte-exact — `"082"` is `0x30 0x38 0x32`, so
-`sum = 0x30 + 0x38 + 0x32 = 0x9A`:
+The setpoint read in checksum mode is byte-exact — `"082"` is `0x30 0x38 0x32`,
+so `sum = 0x9A`:
 
 ```text
 host -> 'G' "082" '#' 0x00 0x9A 0D
 dev  -> 'G' "082" "37.00" '#' <hi> <lo> 0D
 ```
 
----
-
 ## 6. Value encoding
 
 | `var_type` | Request payload | Reply parsing |
 | --- | --- | --- |
-| `1` String | Raw bytes, `strncpy` into a 201-byte buffer | Raw bytes between header and terminator |
-| `2` Integer | `snprintf("%d")` | `atoi`-equivalent |
-| `3` Floating | `snprintf` with a caller-selected precision: `%.03f`, `%.02f`, `%.01f`, or `%0f` for anything else | `atof` (the vendor implementation uses `atof` directly) |
+| `1` String | Raw bytes, max 201 | Raw bytes between header and terminator |
+| `2` Integer | Decimal integer text | Decimal integer text |
+| `3` Floating | Fixed-point decimal with a caller-selected precision of 3, 2, or 1 fractional digits, or default float formatting otherwise | Decimal float text |
 | `4` Enumerator | The requested enum *name* is matched against `EnumValues.enum_name` and the numeric `enum_value` is sent as an integer | Integer, resolved back to a name through `EnumValues` |
 
-The vendor implementation selects the format; precision comes from the property
-write path.
+A volatile write uses `write_code_ram`, a persistent write uses `write_code`.
+Limits are plain reads of `min_code` then `max_code`, parsed as floats — there is
+no dedicated limit frame type.
 
-Write-code selection:
-
-```text
-volatile requested ? write_code_ram (+0x74) : write_code (+0x70)
-```
-
-Limit reads: read `min_code`, then
-`max_code`, `atof` each. Both are plain reads — there is no dedicated limit
-frame type.
-
-`oko_CommandExecute` does **not**
-use the `R` type. It issues a plain `Receive(read_code)` on the named property.
-The `R` / RPC type is reachable only through the lower-level external-evidence
-path, which nothing in the ordinary device layer calls. Parameters whose name ends in `(RPC)`
-(for example id 580 `Pid-Tuning Start (RPC)`, `read_code = 0`,
-`write_code = 580`) therefore cannot be triggered through `oko_CommandExecute`
-as shipped — they need a write. Flag this as unresolved until a hardware trace
-shows which framing the controller actually accepts.
-
----
+**RPC framing is unresolved.** The recorded command-execute path issues a plain
+read of the property's `read_code` and never emits the `R` type, which is
+reachable only from a lower-level path nothing in the ordinary device layer uses.
+Parameters whose name ends in `(RPC)` (for example id 580 `Pid-Tuning Start
+(RPC)`, `read_code = 0`, `write_code = 580`) therefore appear to need a write
+rather than an `R` frame. Unresolved until a hardware trace shows which framing
+the controller accepts.
 
 ## 7. Module abstraction
 
-`oko_module_type` is a fixed four-entry enum, and each module is a hard-coded
-view over named properties:
+`Module` is a fixed four-entry grouping and is purely a naming convention over
+named properties — it adds **no new wire commands**, so a reimplementation can
+skip it and work from `Parameters` directly.
 
 | Module | Value property | Setpoint property | "paused"/status properties | Default limits |
 | --- | --- | --- | --- | --- |
-| `OKO_MODULE_TEMP` (0) | `Temperature` | `Temperature setpoint` | *(none)* | 25.0 … 50.0 |
-| `OKO_MODULE_CO2` (1) | `CO2` | `CO2 setpoint` | `Gas control paused` | 0.0 … 20.0 |
-| `OKO_MODULE_O2` (2) | `O2` | `O2 setpoint` | `Air mode status`, `Gas control paused` | 0.0 … 20.0 |
-| `OKO_MODULE_HMD` (3) | `Humidity` | `Humidity setpoint` | `Gas control paused` | 50.0 … 100.0 |
+| Temperature (0) | `Temperature` | `Temperature setpoint` | *(none)* | 25.0 … 50.0 |
+| CO2 (1) | `CO2` | `CO2 setpoint` | `Gas control paused` | 0.0 … 20.0 |
+| O2 (2) | `O2` | `O2 setpoint` | `Air mode status`, `Gas control paused` | 0.0 … 20.0 |
+| Humidity (3) | `Humidity` | `Humidity setpoint` | `Gas control paused` | 50.0 … 100.0 |
 
-The vendor implementation:
-
-1. For each of the four types, construct the `Module` and test
-   `PropertyIsValid(<value property>)` — i.e. is that name in the set loaded in
-   §5.3. If not, the module is absent.
-2. Read the value property's `unit` from the database and store it as the
-   module's dimension unit.
-3. For each "paused" property name, attempt `PropertyUpdate(name)`; if the read
-   fails, drop that name. A module with no surviving paused property reports
-   `CanBeDisabled() == false`.
-
-`ModuleGetEnabled` reads the paused property as a boolean and inverts it.
-Module limits fall back to the table above when the underlying property has no
+A module exists when its value property is in the set loaded in §5.3; its
+dimension unit is that property's `unit`. A candidate "paused" property is kept
+only if it reads successfully, and a module with no surviving paused property
+cannot be disabled. Enabled state is that property read as a boolean and
+inverted. Limits fall back to the table above when the underlying property has no
 `min_code`/`max_code`.
-
-Note the module layer adds no new wire commands — it is purely a naming
-convention over the property table. A reimplementation can skip it entirely and
-work from `Parameters` directly.
-
----
 
 ## 8. Background polling
 
-The vendor implementation arms a
-per-property poll. It runs a thread that, under
-the same critical section as foreground traffic, drains a write queue
-(`PropertyWrite`) and then re-reads any property whose next-due `clock()` tick
-has passed (`PropertyUpdate`). Every polled read is a full request/reply
-transaction with the retry policy of §4.3.
-
-There is no push/streaming path. All telemetry is polled.
-
----
+There is no push/streaming path — all telemetry is polled. Polling is
+per-property with a per-property due time, shares the same serialization as
+foreground traffic, drains queued writes first, and every polled read is a full
+request/reply transaction under the retry policy of §4.3.
 
 ## 9. Implementation checklist for an SDK-free driver
 
-Recovered and safe to implement from this document:
-
-- Serial settings, baud scan, bare-CR liveness probe, CR framing.
-- Plain and checksum request/reply grammar, including the exact checksum.
-- Database-driven identification (`name_code` probe → name match) and
-  sub-product probe.
-- `Parameters`/`ProductVar` resolution into a per-device command dictionary,
-  including read/write/volatile-write/min/max codes and enum resolution.
-- Error string vocabulary and its mapping to typed errors.
+Recorded and safe to implement from this document: serial settings, baud scan,
+bare-CR liveness probe and CR framing; plain and checksum request/reply grammar
+including the exact checksum; database-driven identification (`name_code` probe →
+name match) and sub-product probe; `Parameters`/`ProductVar` resolution into a
+per-device command dictionary with read/write/volatile-write/min/max codes and
+enum resolution; and the error vocabulary with its mapping to typed errors.
 
 Needs a hardware trace before claiming hardware-complete status
 (`docs/reverse/trace-capture-guide.md`):
@@ -655,13 +402,13 @@ Needs a hardware trace before claiming hardware-complete status
 | --- | --- |
 | Reply formats | Actual numeric formatting, decimal separator, sign, and unit handling for float properties on at least one temperature and one gas unit |
 | Write completion | Whether the reply to a write echoes the value, is empty, or is an ACK; and how long a setpoint takes to be reflected in the readback |
-| Stability / settling | What `Temperature status` (enum `Status`: OK / Transient / Alarm / Error / Disabled) does across a setpoint change — this is the only visible completion signal |
+| Stability / settling | What `Temperature status` (enum `Status`: OK / Transient / Alarm / Error / Disabled) does across a setpoint change — the only visible completion signal |
 | Faults and alarms | Real `E…` replies from a live unit, sensor disconnect, over-range, gas alarm, interlock |
-| 4-digit codes | Whether any product actually uses a >3-digit code on a reply path, given the vendor implementation's fixed-width header check |
+| 4-digit codes | Whether any product actually uses a >3-digit code on a reply path, given the fixed-width header check in §2.3 |
 | RPC framing | Whether `(RPC)` parameters are triggered by an `S` write or an `R` frame |
 | Checksum mode | That a real controller accepts `G`/`S` framing and the byte-exact checksum above |
 | Safe ranges | That `min_code`/`max_code` reads return usable bounds, and what the controller does with an out-of-range write (expected `E5`) |
 
 Until those exist, the Okolab driver exposes the configured/read-write protocol
-surface recorded in `docs/reverse/okolab.md` without claiming validated
-settling, alarm, or safe-range behavior.
+surface recorded in `docs/reverse/okolab.md` without claiming validated settling,
+alarm, or safe-range behavior.

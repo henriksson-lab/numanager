@@ -1,258 +1,38 @@
+//! The wire layer for this driver lives in [`crate::spark`].
+//!
+//! It used to be sketched inline here — a five-type frame with a little-endian length and
+//! no checksum — which disagreed with the captured traces on every field. That sketch was
+//! never reachable (no transport was ever constructed for its session), but keeping it
+//! beside the real codec would invite someone to bind a transport to the wrong one, so it
+//! has been removed rather than left as an alternative.
+//!
+//! What remains here is the part that was always right: the device graph, its typed
+//! capabilities and its properties.
+
+use crate::spark::backend::{self, Detector, Intent};
+use crate::spark::session::{BoxedTransport, Progress, SparkSession};
 use numanager_core::config::{DeviceConfig, HardwareConfig};
 use numanager_core::runtime::{DriverCandidate, DriverDiscovery};
 use numanager_core::*;
 use std::collections::{BTreeMap, VecDeque};
 
-#[doc(hidden)]
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FrameType {
-    Command = 0x01,
-    Busy = 0x02,
-    Ready = 0x03,
-    Error = 0x04,
-    Data = 0x05,
-}
-
-#[doc(hidden)]
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TdclFrame {
-    pub(crate) seq: u8,
-    pub(crate) frame_type: FrameType,
-    pub(crate) payload: Vec<u8>,
-}
-
-#[allow(dead_code)]
-impl TdclFrame {
-    pub(crate) fn encode(&self) -> Packet {
-        let mut bytes = vec![self.seq, self.frame_type as u8];
-        bytes.extend_from_slice(&(self.payload.len() as u16).to_le_bytes());
-        bytes.extend_from_slice(&self.payload);
-        Packet { bytes }
-    }
-
-    pub(crate) fn decode(packet: &Packet) -> Result<Self> {
-        if packet.bytes.len() < 4 {
-            return Err(Error::new(ErrorCode::Transport, "short TDCL frame"));
-        }
-        let seq = packet.bytes[0];
-        let frame_type = match packet.bytes[1] {
-            0x01 => FrameType::Command,
-            0x02 => FrameType::Busy,
-            0x03 => FrameType::Ready,
-            0x04 => FrameType::Error,
-            0x05 => FrameType::Data,
-            other => {
-                return Err(Error::new(
-                    ErrorCode::Transport,
-                    format!("unknown TDCL frame type {other:#04x}"),
-                ))
-            }
-        };
-        let len = u16::from_le_bytes([packet.bytes[2], packet.bytes[3]]) as usize;
-        if packet.bytes.len() < 4 + len {
-            return Err(Error::new(ErrorCode::Transport, "truncated TDCL payload"));
-        }
-        Ok(Self {
-            seq,
-            frame_type,
-            payload: packet.bytes[4..4 + len].to_vec(),
-        })
-    }
-}
-
-#[doc(hidden)]
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct SparkOutcome {
-    pub(crate) ready_text: String,
-    pub(crate) data: Vec<TdclFrame>,
-}
-
-#[doc(hidden)]
-#[allow(dead_code)]
-pub(crate) struct SymbioCommand {
-    op: SymbioOp,
-    keyword: String,
-    words: Vec<String>,
-    params: Vec<(String, String)>,
-    module: Option<u32>,
-}
-
-#[allow(dead_code)]
-impl SymbioCommand {
-    pub(crate) fn set(keyword: impl Into<String>) -> Self {
-        Self::new(SymbioOp::Set, keyword)
-    }
-
-    pub(crate) fn query(keyword: impl Into<String>) -> Self {
-        Self::new(SymbioOp::Query, keyword)
-    }
-
-    pub(crate) fn range(keyword: impl Into<String>) -> Self {
-        Self::new(SymbioOp::Range, keyword)
-    }
-
-    pub(crate) fn word(mut self, word: impl Into<String>) -> Self {
-        self.words.push(word.into());
-        self
-    }
-
-    pub(crate) fn param(mut self, key: impl Into<String>, value: impl ToString) -> Self {
-        self.params.push((key.into(), value.to_string()));
-        self
-    }
-
-    pub(crate) fn module(mut self, module: u32) -> Self {
-        self.module = Some(module);
-        self
-    }
-
-    pub(crate) fn build(&self) -> String {
-        let mut out = self.op.prefix().to_string();
-        out.push_str(&self.keyword);
-        for word in &self.words {
-            out.push(' ');
-            out.push_str(word);
-        }
-        for (key, value) in &self.params {
-            out.push(' ');
-            out.push_str(key);
-            out.push('=');
-            if value.contains(' ') {
-                out.push('"');
-                out.push_str(value);
-                out.push('"');
-            } else {
-                out.push_str(value);
-            }
-        }
-        if let Some(module) = self.module {
-            out.push_str(&format!(" MODULE={module}"));
-        }
-        out
-    }
-
-    fn new(op: SymbioOp, keyword: impl Into<String>) -> Self {
-        Self {
-            op,
-            keyword: keyword.into(),
-            words: Vec::new(),
-            params: Vec::new(),
-            module: None,
-        }
-    }
-}
-
-#[doc(hidden)]
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SymbioOp {
-    Set,
-    Query,
-    Range,
-}
-
-#[allow(dead_code)]
-impl SymbioOp {
-    fn prefix(self) -> &'static str {
-        match self {
-            SymbioOp::Set => "",
-            SymbioOp::Query => "?",
-            SymbioOp::Range => "#",
-        }
-    }
-}
-
-#[doc(hidden)]
-#[allow(dead_code)]
-pub(crate) struct SparkSession<T: Transport> {
-    transport: T,
-    seq: u8,
-    pending: VecDeque<SessionEvent>,
-}
-
-#[allow(dead_code)]
-impl<T: Transport> SparkSession<T> {
-    pub(crate) fn new(transport: T) -> Self {
-        Self {
-            transport,
-            seq: 0,
-            pending: VecDeque::new(),
-        }
-    }
-
-    pub(crate) fn execute(
-        &mut self,
-        command: &SymbioCommand,
-        poll_budget: usize,
-    ) -> Result<SparkOutcome> {
-        let seq = self.seq;
-        let packet = TdclFrame {
-            seq,
-            frame_type: FrameType::Command,
-            payload: command.build().into_bytes(),
-        }
-        .encode();
-        let token = self.submit_packet(packet)?;
-        let mut data = Vec::new();
-
-        for _ in 0..poll_budget {
-            let Some(bytes) = self.transport.poll_recv()? else {
-                continue;
-            };
-            let frame = TdclFrame::decode(&Packet { bytes })?;
-            if frame.seq as u64 != token.0 {
-                return Err(Error::new(ErrorCode::Transport, "TDCL sequence mismatch"));
-            }
-            match frame.frame_type {
-                FrameType::Busy => continue,
-                FrameType::Data => data.push(frame),
-                FrameType::Ready => {
-                    return Ok(SparkOutcome {
-                        ready_text: String::from_utf8_lossy(&frame.payload).into_owned(),
-                        data,
-                    })
-                }
-                FrameType::Error => {
-                    return Err(Error::new(
-                        ErrorCode::Driver,
-                        String::from_utf8_lossy(&frame.payload).into_owned(),
-                    ))
-                }
-                FrameType::Command => {}
-            }
-        }
-
-        Err(Error::new(ErrorCode::Timeout, "TDCL command timed out"))
-    }
-}
-
-impl<T: Transport> Session for SparkSession<T> {
-    fn submit_packet(&mut self, packet: Packet) -> Result<SessionToken> {
-        let token = SessionToken(self.seq as u64);
-        self.seq = self.seq.wrapping_add(1);
-        self.transport.send(&packet.bytes)?;
-        self.pending
-            .push_back(SessionEvent::Packet { token, packet });
-        Ok(token)
-    }
-
-    fn poll(&mut self) -> Vec<SessionEvent> {
-        while let Ok(Some(bytes)) = self.transport.poll_recv() {
-            let token = SessionToken(self.seq.wrapping_sub(1) as u64);
-            self.pending.push_back(SessionEvent::Completed {
-                token,
-                response: Packet { bytes },
-            });
-        }
-        self.pending.drain(..).collect()
-    }
+/// The live half of the driver: a session over a real transport, plus what each outstanding
+/// command was for.
+///
+/// Absent by default. Without it the driver answers from its own modeled state, which is
+/// what every existing example relies on; with it, capability requests become TDCL commands
+/// and completion arrives from the instrument instead of immediately.
+struct Backend {
+    session: SparkSession<BoxedTransport, DriverToken>,
+    /// Commands sent and not yet answered, in submission order per token. A token completes
+    /// when its *last* transaction does — setting a wavelength and then measuring is one
+    /// operation to a client, not three.
+    outstanding: VecDeque<(DriverToken, Intent, bool)>,
 }
 
 pub struct SparkCytoDriver {
     id: DriverId,
+    backend: Option<Backend>,
     next_token: u64,
     events: VecDeque<DriverEvent>,
     devices: Vec<DeviceDescriptor>,
@@ -581,6 +361,7 @@ impl SparkCytoDriver {
         ];
         Self {
             id,
+            backend: None,
             next_token: 1,
             events: VecDeque::new(),
             devices,
@@ -631,6 +412,160 @@ impl SparkCytoDriver {
             }
         }
         graph
+    }
+
+    /// Attach a transport, so capability requests become TDCL commands.
+    ///
+    /// Until this is called the driver answers from its own modeled state — which is what
+    /// the examples and the device graph exercise, and what keeps this driver useful with
+    /// no instrument present.
+    pub fn attach(&mut self, transport: impl Transport + 'static) {
+        self.backend = Some(Backend {
+            session: SparkSession::new(BoxedTransport::new(transport)),
+            outstanding: VecDeque::new(),
+        });
+    }
+
+    pub fn detach(&mut self) {
+        self.backend = None;
+    }
+
+    /// Is this driver talking to hardware, or answering from its model?
+    pub fn is_live(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    /// Which detector a device is, for the measurement command.
+    fn detector_of(&self, device: DeviceId) -> Option<Detector> {
+        let descriptor = self.devices.iter().find(|d| d.id == device)?;
+        if descriptor.kinds.iter().any(|k| k == "detector.absorbance") {
+            Some(Detector::Absorbance)
+        } else if descriptor
+            .kinds
+            .iter()
+            .any(|k| k == "detector.fluorescence")
+        {
+            Some(Detector::Fluorescence)
+        } else if descriptor
+            .kinds
+            .iter()
+            .any(|k| k == "detector.luminescence")
+        {
+            Some(Detector::Luminescence)
+        } else {
+            None
+        }
+    }
+
+    /// Send a capability request to the instrument, if there is one attached and it has a
+    /// command for it.
+    ///
+    /// Returns `true` when the request went to the wire, in which case the token completes
+    /// later from [`Driver::poll`] rather than now.
+    fn dispatch_to_instrument(
+        &mut self,
+        token: DriverToken,
+        device: DeviceId,
+        request: &CapabilityRequest,
+    ) -> Result<bool> {
+        let detector = self.detector_of(device);
+        let wavelength_nm = detector.map(|detector| match detector {
+            Detector::Fluorescence => self.fluorescence_wavelength.nanometers().round() as u32,
+            _ => self.absorbance_wavelength.nanometers().round() as u32,
+        });
+        let well = self.well.clone();
+        let Some(transactions) = backend::plan_request(request, detector, &well, wavelength_nm)
+        else {
+            return Ok(false);
+        };
+        if transactions.is_empty() {
+            return Ok(false);
+        }
+        let Some(backend) = self.backend.as_mut() else {
+            return Ok(false);
+        };
+        let last = transactions.len() - 1;
+        for (index, transaction) in transactions.into_iter().enumerate() {
+            backend
+                .outstanding
+                .push_back((token, transaction.intent, index == last));
+            backend.session.submit(token, transaction.line)?;
+        }
+        Ok(true)
+    }
+
+    /// Drain the session and turn finished transactions into driver events.
+    fn poll_instrument(&mut self) {
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        let progress = match backend.session.poll() {
+            Ok(progress) => progress,
+            Err(error) => {
+                let report = ErrorReport {
+                    code: error.code,
+                    message: error.message.clone(),
+                };
+                // A transport failure ends every command riding on it; completing them
+                // individually would leave a client waiting on the ones that never went.
+                for (token, _, terminal) in backend.outstanding.drain(..) {
+                    if terminal {
+                        self.events.push_back(DriverEvent::TokenFailed {
+                            token,
+                            report: report.clone(),
+                        });
+                    }
+                }
+                return;
+            }
+        };
+
+        for event in progress {
+            match event {
+                Progress::Completed(outcome) => {
+                    let Some((token, intent, terminal)) = backend.outstanding.pop_front() else {
+                        continue;
+                    };
+                    if terminal {
+                        let value = backend::completion(&intent, &outcome);
+                        self.events
+                            .push_back(DriverEvent::TokenCompleted { token, value });
+                    }
+                    let _ = token;
+                }
+                Progress::Failed(failure) => {
+                    // Everything queued behind a failed command belongs to operations that
+                    // will now never run as asked, so they fail with it.
+                    if let Some((token, _, _)) = backend.outstanding.pop_front() {
+                        self.events.push_back(DriverEvent::TokenFailed {
+                            token,
+                            report: ErrorReport {
+                                code: ErrorCode::Driver,
+                                message: match failure.number {
+                                    Some(number) => {
+                                        format!("instrument error {number}: {}", failure.text)
+                                    }
+                                    None => failure.text.clone(),
+                                },
+                            },
+                        });
+                    }
+                }
+                Progress::Busy { .. } => {
+                    // Still working. Nothing to report: the operation stays in progress.
+                }
+                Progress::Asynchronous { number, text } => {
+                    self.events
+                        .push_back(DriverEvent::Event(Event::Log(LogEvent {
+                            driver: Some(self.id),
+                            message: match number {
+                                Some(number) => format!("Spark fault {number}: {text}"),
+                                None => format!("Spark fault: {text}"),
+                            },
+                        })));
+                }
+            }
+        }
     }
 
     fn next_token(&mut self) -> DriverToken {
@@ -1368,6 +1303,10 @@ impl Driver for SparkCytoDriver {
         let token = self.next_token();
         let command_count = prepared.commands.len() as i64;
         let mut last = Value::Null;
+        // With an instrument attached, a capability request goes to the wire and the token
+        // completes from `poll` when the instrument says so. Without one, the modeled path
+        // below answers immediately, exactly as it always has.
+        let mut deferred = false;
         for command in prepared.commands {
             match command {
                 Command::ReadProperty { device, key } => {
@@ -1385,7 +1324,15 @@ impl Driver for SparkCytoDriver {
                     capability,
                     request,
                 } => {
-                    last = self.invoke_capability(device, capability, request)?;
+                    if self.dispatch_to_instrument(token, device, &request)? {
+                        // The instrument owns this one now. Local state is still updated so
+                        // property reads stay consistent with what was asked for; the
+                        // completion value comes from the reply, not from here.
+                        let _ = self.invoke_capability(device, capability, request);
+                        deferred = true;
+                    } else {
+                        last = self.invoke_capability(device, capability, request)?;
+                    }
                 }
                 Command::Arm(_) | Command::Start(_) | Command::Stop(_) => unreachable!(),
             }
@@ -1399,21 +1346,24 @@ impl Driver for SparkCytoDriver {
                     prepared.physical_transactions.len()
                 ),
             })));
-        self.events.push_back(DriverEvent::TokenCompleted {
-            token,
-            value: Value::Map(BTreeMap::from([
-                ("commands".into(), Value::I64(command_count)),
-                (
-                    "physical_transactions".into(),
-                    Value::I64(prepared.physical_transactions.len() as i64),
-                ),
-                ("result".into(), last),
-            ])),
-        });
+        if !deferred {
+            self.events.push_back(DriverEvent::TokenCompleted {
+                token,
+                value: Value::Map(BTreeMap::from([
+                    ("commands".into(), Value::I64(command_count)),
+                    (
+                        "physical_transactions".into(),
+                        Value::I64(prepared.physical_transactions.len() as i64),
+                    ),
+                    ("result".into(), last),
+                ])),
+            });
+        }
         Ok(token)
     }
 
     fn poll(&mut self) -> Vec<DriverEvent> {
+        self.poll_instrument();
         self.events.drain(..).collect()
     }
 

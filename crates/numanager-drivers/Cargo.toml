@@ -8,6 +8,13 @@ publish = false
 
 [dependencies]
 numanager-core = { path = "../numanager-core" }
+# WinUSB provisioning is part of the driver crate on Windows, not an add-on: a
+# userspace USB driver there cannot open a device that is not bound to WinUSB,
+# so the diagnosis belongs next to the claim that fails. The optional entry
+# below exposes the same code off Windows under the `winusb` feature (where it
+# compiles against numanager-winusb's `Unsupported` entry points), so the wiring
+# can be built and checked from a non-Windows host.
+numanager-winusb = { path = "../numanager-winusb", optional = true }
 futures-lite = { version = "2", optional = true }
 hex = "0.4"
 libloading = "0.8.9"
@@ -21,6 +28,10 @@ serde_json = "1"
 serialport = { version = "4", optional = true }
 sha2 = "0.10"
 
+# Always present on Windows regardless of features: see the note above.
+[target.'cfg(windows)'.dependencies]
+numanager-winusb = { path = "../numanager-winusb" }
+
 [features]
 default = []
 egrabber-sdk = []
@@ -28,3 +39,6 @@ os-can = ["numanager-core/os-can"]
 os-hid = ["numanager-core/os-hid"]
 os-serial = ["numanager-core/os-serial", "dep:serialport"]
 os-usb = ["dep:futures-lite", "dep:nusb"]
+# Off Windows only: build the WinUSB access module against the non-Windows
+# entry points. Redundant on Windows, where the module is always compiled.
+winusb = ["dep:numanager-winusb"]

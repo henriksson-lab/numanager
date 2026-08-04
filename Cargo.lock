@@ -3300,6 +3300,7 @@ dependencies = [
  "hex",
  "libloading",
  "numanager-core",
+ "numanager-winusb",
  "nusb",
  "serde",
  "serde_json",

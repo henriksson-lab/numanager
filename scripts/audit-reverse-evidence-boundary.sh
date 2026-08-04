@@ -152,7 +152,9 @@ exported_driver_modules() {
     /^pub mod [a-z0-9_]+;/ {
       module=$3
       sub(/;$/, "", module)
-      if (module == "usb_discovery") {
+      # Host-side USB support modules, not device drivers: they describe no
+      # hardware, so they have no device page or index row.
+      if (module == "usb_discovery" || module == "winusb_access") {
         next
       }
       print module
@@ -1136,7 +1138,7 @@ require_text "$evidence_file" "connected set/enquiry paths and named GenericComm
 require_text "$readme_file" "| [Evident/Olympus IX85](docs/devices/evident-ix85.md) | Serial focus, state-device, shutter, timing endpoints, and body readback/control | - |" "IX85 README index row"
 require_text "$readme_file" "| [Photometrics/QImaging PVCAM cameras](docs/devices/photometrics-pvcam.md) | USB discovery, verified PVCAM runtime discovery, one-shot capture, repeated-capture stream, and temperature setpoint control | - |" "PVCAM README index row"
 
-require_reverse_index_row "ABS Camera" abs-camera.md "one-shot capture can use the verified CamUSB runtime"
+require_reverse_index_row "ABS Camera" abs-camera.md "one-shot capture can use an optional vendor runtime, loaded only through explicit user configuration"
 require_reverse_index_row "Agilent Laser Combiner" agilent-laser-combiner.md "Transport grammar, full opcode table"
 require_text "${driver_src_dir}/agilent_laser_combiner.rs" '"serial_port".into()' "Agilent serial-port resource metadata"
 require_text "${driver_src_dir}/agilent_laser_combiner.rs" '"connected".into(), Value::Bool(self.connected)' "Agilent connected resource metadata"
@@ -1154,7 +1156,7 @@ require_text "$evidence_file" 'hub `GenericCommand` is constrained to typed iden
 require_text "$evidence_file" 'diagnostic analog-output devices expose raw `0x0C`/`0x2A` DAC counts without calibrated voltage claims' "Agilent evidence analog-output boundary"
 require_text "$evidence_file" 'resource metadata records configured `serial_port`, fixed `baud_rate`, fixed `serial_timeout`, and `connected` state' "Agilent evidence resource metadata wording"
 require_reverse_index_row "MCL MicroDrive/NanoDrive" mcl.md "typed motion/control is not exposed because payload fields"
-require_reverse_index_row "Mightex / Mightex_BLS" mightex.md "camera one-shot capture and repeated one-shot stream can use the verified vendor runtime"
+require_reverse_index_row "Mightex / Mightex_BLS" mightex.md "camera one-shot capture and repeated one-shot stream can use an optional vendor runtime loaded only through explicit user configuration"
 require_reverse_index_row "Okolab" okolab.md "Reverse engineered serial/configured runtime support"
 require_reverse_index_row "Photometrics PVCAM" photometrics-pvcam.md "runtime temperature read/setpoint control exist"
 

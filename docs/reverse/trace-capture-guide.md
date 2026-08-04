@@ -24,8 +24,8 @@ Every trace note should start with this table or equivalent metadata.
 | Target device page | Link to `docs/devices/<target>.md` |
 | Hardware identity | Model, serial/asset tag, firmware, module/channel inventory |
 | Host identity | OS version, driver stack, USB/serial adapter, VM/pass-through if any |
-| Software identity | Micro-Manager build, vendor software version, numanager commit if used |
-| Config identity | Micro-Manager device config or numanager discovery/config record |
+| Software identity | Name and version of the host software that drove the device; numanager commit if used |
+| Config identity | Device configuration used, or the numanager discovery/config record |
 | Capture tool | Tool name/version and capture filter |
 | Clock alignment | How trace timestamps map to user actions and command output |
 | Safety setup | Output limits, interlocks, motion limits, emergency stop, sample/load state |

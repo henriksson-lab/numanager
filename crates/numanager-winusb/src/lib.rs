@@ -32,10 +32,120 @@
 //! needs a driverless device and Administrator rights); detection and the
 //! approval gate *are* hardware-validated.
 //!
+//! ## WinUSB specifically, not "some generic driver"
+//!
+//! There is no libusbK/libusb0 alternative here, and that is not an omission:
+//! `nusb` — the USB backend every numanager driver opens through — calls
+//! `winusb.dll`'s `WinUsb_Initialize`, and refuses a node whose kernel service
+//! is anything other than `winusb` (including `libusbK`). Binding libusbK with
+//! Zadig makes a device *less* openable, not more.
+//!
+//! ## Composite devices
+//!
+//! On a multi-function device Windows binds `usbccgp` to the parent and gives
+//! each USB function its own child node (`…&MI_00`); WinUSB binds to the child.
+//! Identify the function with [`UsbFunction`] — the same VID/PID/interface a
+//! driver already passes to `nusb` — rather than formatting device ids by hand.
+//! Asking about the parent of such a device reports [`PortState::Composite`],
+//! which says "re-ask about an interface", not "replace usbccgp".
+//!
 //! Everything here is Windows-only. On other platforms the entry points return
 //! [`ErrorCode::Unsupported`] so callers can be written once and gated by result.
 
 use numanager_core::{Error, ErrorCode, Result};
+use std::fmt;
+
+/// The USB function to provision, named the way a driver already knows it:
+/// the VID/PID it probes for, plus the interface it claims.
+///
+/// [`hardware_id`](Self::hardware_id) renders the Windows device id, so callers
+/// never format `USB\VID_…&PID_…&MI_…` strings themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UsbFunction {
+    pub vendor_id: u16,
+    pub product_id: u16,
+    /// The interface (USB function) to bind, for a composite device. `None`
+    /// addresses the device node as a whole, which is right for a
+    /// single-function device.
+    pub interface: Option<u8>,
+}
+
+impl UsbFunction {
+    /// The device as a whole — no interface selected.
+    pub const fn new(vendor_id: u16, product_id: u16) -> Self {
+        Self {
+            vendor_id,
+            product_id,
+            interface: None,
+        }
+    }
+
+    /// Narrow to one USB function of a composite device.
+    pub const fn interface(self, interface: u8) -> Self {
+        Self {
+            interface: Some(interface),
+            ..self
+        }
+    }
+
+    /// The Windows hardware id to match and to install against, e.g.
+    /// `USB\VID_1234&PID_5678` or `USB\VID_1234&PID_5678&MI_00`. Both forms are
+    /// among the ids Windows lists for the corresponding node, so the same
+    /// string works for lookup and for `UpdateDriverForPlugAndPlayDevices`.
+    pub fn hardware_id(&self) -> String {
+        let Self {
+            vendor_id,
+            product_id,
+            interface,
+        } = self;
+        match interface {
+            Some(interface) => {
+                format!("USB\\VID_{vendor_id:04X}&PID_{product_id:04X}&MI_{interface:02X}")
+            }
+            None => format!("USB\\VID_{vendor_id:04X}&PID_{product_id:04X}"),
+        }
+    }
+
+    /// Whether one of a device node's hardware ids denotes this function.
+    ///
+    /// Matched component-wise rather than as a contiguous prefix, because
+    /// Windows lists both `USB\VID_x&PID_y&MI_00` and the revision-qualified
+    /// `USB\VID_x&PID_y&REV_0100&MI_00` for the same node. With no interface
+    /// selected, a node carrying `&MI_` is rejected: that is a child function,
+    /// not the device.
+    pub fn matches_hardware_id(&self, hardware_id: &str) -> bool {
+        let id = hardware_id.to_ascii_uppercase();
+        let Self {
+            vendor_id,
+            product_id,
+            interface,
+        } = self;
+        if !id.contains(&format!("VID_{vendor_id:04X}"))
+            || !id.contains(&format!("PID_{product_id:04X}"))
+        {
+            return false;
+        }
+        match interface {
+            Some(interface) => id.contains(&format!("&MI_{interface:02X}")),
+            None => !id.contains("&MI_"),
+        }
+    }
+}
+
+impl fmt::Display for UsbFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            vendor_id,
+            product_id,
+            interface,
+        } = self;
+        write!(f, "USB {vendor_id:04x}:{product_id:04x}")?;
+        if let Some(interface) = interface {
+            write!(f, " interface {interface}")?;
+        }
+        Ok(())
+    }
+}
 
 #[cfg(windows)]
 mod signing;
@@ -49,9 +159,15 @@ pub enum PortState {
     Free,
     /// WinUSB is already bound. [`ensure_winusb`] treats this as success.
     WinUsb,
-    /// Another driver owns the node (its service name, e.g. `usbccgp` or a
-    /// vendor `.sys`). Installing WinUSB would replace a working driver, so
-    /// callers should warn before proceeding.
+    /// The node is the parent of a composite (multi-function) device, owned by
+    /// Windows' USB generic parent driver `usbccgp`. That binding is correct
+    /// and normally must stay: each USB function has its own child node, and
+    /// WinUSB binds there. Re-query with [`UsbFunction::interface`] set to the
+    /// function that carries the endpoints the driver needs.
+    Composite,
+    /// Another driver owns the node (its service name, e.g. a vendor `.sys`).
+    /// Installing WinUSB would replace a working driver, so callers must warn
+    /// before proceeding.
     TakenBy(String),
 }
 
@@ -62,69 +178,189 @@ impl PortState {
     }
 
     /// Whether installing WinUSB would displace an existing, working driver.
-    /// Callers should surface a warning to the user when this is true.
+    /// Callers must surface a warning to the user when this is true.
     pub fn would_displace(&self) -> bool {
-        matches!(self, PortState::TakenBy(_))
+        matches!(self, PortState::Composite | PortState::TakenBy(_))
     }
+
+    /// The kernel service that owns the node today, for message text.
+    pub fn owner(&self) -> &str {
+        match self {
+            PortState::Free => "no driver",
+            PortState::WinUsb => "WinUSB",
+            PortState::Composite => "usbccgp (USB generic parent)",
+            PortState::TakenBy(service) => service,
+        }
+    }
+
+    /// Why opening `function` fails today and what the user can do about it —
+    /// for error messages. Describes; installs nothing.
+    pub fn diagnosis(&self, function: &UsbFunction) -> String {
+        let id = function.hardware_id();
+        match self {
+            PortState::Free => format!(
+                "{function} ({id}) has no kernel driver bound; it needs the inbox WinUSB driver \
+                 before it can be opened from userspace"
+            ),
+            PortState::WinUsb => {
+                format!("{function} ({id}) is already bound to WinUSB")
+            }
+            PortState::Composite => format!(
+                "{function} ({id}) is a composite device whose parent is owned by usbccgp; WinUSB \
+                 binds per function, so the interface node (…&MI_xx) is what needs it"
+            ),
+            PortState::TakenBy(service) => format!(
+                "{function} ({id}) is owned by the '{service}' driver, not WinUSB; it cannot be \
+                 opened from userspace until WinUSB is bound instead, which would take the device \
+                 away from '{service}'"
+            ),
+        }
+    }
+}
+
+/// What a caller must put in front of the user before [`ensure_winusb`]
+/// touches anything.
+///
+/// [`prompt`](Self::prompt) is pre-composed so every caller warns consistently;
+/// it opens with `WARNING:` exactly when [`PortState::would_displace`] holds.
+/// A caller that shows nothing else must still show that.
+#[derive(Debug, Clone)]
+pub struct InstallApproval<'a> {
+    /// The function that would be bound.
+    pub function: &'a UsbFunction,
+    /// Its Windows hardware id — what the generated INF matches on.
+    pub hardware_id: String,
+    /// What owns the node right now.
+    pub state: &'a PortState,
+    /// The message to show the user verbatim.
+    pub prompt: String,
+}
+
+impl<'a> InstallApproval<'a> {
+    fn new(function: &'a UsbFunction, state: &'a PortState) -> Self {
+        let hardware_id = function.hardware_id();
+        let prompt = match state {
+            PortState::Free | PortState::WinUsb => format!(
+                "Bind the inbox WinUSB driver to {function} ({hardware_id})?\n\
+                 No driver owns this device, so nothing is displaced. This changes Windows \
+                 driver bindings for the device and requires an Administrator process."
+            ),
+            PortState::Composite => format!(
+                "WARNING: this REPLACES a working driver.\n\
+                 {function} ({hardware_id}) is a composite device currently owned by usbccgp, the \
+                 Windows USB generic parent driver. Binding WinUSB here detaches every function of \
+                 the device — all of its child interfaces disappear, and any software using any of \
+                 them stops working.\n\
+                 The usual fix is to bind WinUSB to one interface (…&MI_xx) instead, leaving \
+                 usbccgp on the parent.\n\
+                 Proceed anyway?"
+            ),
+            PortState::TakenBy(service) => format!(
+                "WARNING: this REPLACES a working driver.\n\
+                 {function} ({hardware_id}) is currently controlled by '{service}'. Binding WinUSB \
+                 detaches '{service}' from the device: any vendor software that talks to it \
+                 through '{service}' will stop working until you restore that driver by hand \
+                 (Device Manager > the device > Update driver > Browse > Let me pick).\n\
+                 Proceed anyway?"
+            ),
+        };
+        Self {
+            function,
+            hardware_id,
+            state,
+            prompt,
+        }
+    }
+}
+
+/// Report which driver owns the node for `function`.
+///
+/// This is the entry point drivers should use: it takes the VID/PID (and, for a
+/// composite device, the interface) a driver already has, and never asks the
+/// caller to format a Windows device id.
+///
+/// Errors if no matching device is present, or on a SetupAPI failure.
+pub fn port_state(function: &UsbFunction) -> Result<PortState> {
+    port_state_matching(
+        &|id| function.matches_hardware_id(id),
+        &function.to_string(),
+    )
 }
 
 /// Report which driver owns the first present USB device whose hardware id
 /// contains `hardware_id_prefix` (case-insensitive), e.g.
 /// `"USB\\VID_5354&PID_009A"`.
 ///
-/// Matching on a prefix rather than the full id lets a caller ignore the
-/// trailing `&REV_xxxx`. For a composite device WinUSB binds per interface
-/// (`…&MI_00`); pass that fuller id to target one function.
-///
-/// Errors if no present device matches, or on a SetupAPI failure.
-#[cfg(windows)]
-pub fn port_state(hardware_id_prefix: &str) -> Result<PortState> {
-    win::port_state(hardware_id_prefix)
+/// The escape hatch for ids [`UsbFunction`] cannot express — a container id, or
+/// a device matched on something other than VID/PID. Note that a bare
+/// VID/PID prefix also matches the `…&MI_xx` children of a composite device, so
+/// which node is reported is whichever the enumeration reaches first; prefer
+/// [`port_state`] when the target is a VID/PID.
+pub fn port_state_by_hardware_id(hardware_id_prefix: &str) -> Result<PortState> {
+    let target = hardware_id_prefix.to_ascii_uppercase();
+    port_state_matching(
+        &|id| id.to_ascii_uppercase().contains(&target),
+        hardware_id_prefix,
+    )
 }
 
-/// Non-Windows stub: WinUSB provisioning does not apply.
+#[cfg(windows)]
+fn port_state_matching(matches: &dyn Fn(&str) -> bool, description: &str) -> Result<PortState> {
+    win::port_state(matches, description)
+}
+
+/// Non-Windows: WinUSB provisioning does not apply.
 #[cfg(not(windows))]
-pub fn port_state(_hardware_id_prefix: &str) -> Result<PortState> {
+fn port_state_matching(_matches: &dyn Fn(&str) -> bool, _description: &str) -> Result<PortState> {
     Err(Error::new(
         ErrorCode::Unsupported,
         "WinUSB provisioning is only available on Windows",
     ))
 }
 
-/// Ensure WinUSB is bound to the device identified by `hardware_id_prefix`.
+/// Ensure WinUSB is bound to `function`, with the user's consent.
 ///
-/// * If WinUSB is already bound, returns `Ok(())` (idempotent).
-/// * Otherwise `approve` is called with the current [`PortState`] — `Free` for a
-///   clean install, `TakenBy(_)` when an existing driver would be displaced — so
-///   the caller can prompt (and phrase the warning differently for the two). If
-///   it returns `false`, this returns [`ErrorCode::Cancelled`] and touches
-///   nothing.
+/// * If WinUSB is already bound, returns `Ok(())` without calling `approve`
+///   (idempotent).
+/// * Otherwise `approve` is called with an [`InstallApproval`] carrying the
+///   current [`PortState`] and a ready-composed [`prompt`](InstallApproval::prompt)
+///   that opens with `WARNING:` whenever a working driver would be displaced.
+///   The caller must show it — this function never installs unprompted. If
+///   `approve` returns `false`, this returns [`ErrorCode::Cancelled`] and
+///   touches nothing.
 /// * On approval, the install runs. It requires elevation; on a non-elevated
 ///   process the backend surfaces that as an error rather than silently failing.
-pub fn ensure_winusb(hardware_id_prefix: &str, approve: &dyn Fn(&PortState) -> bool) -> Result<()> {
-    let state = port_state(hardware_id_prefix)?;
+pub fn ensure_winusb(
+    function: &UsbFunction,
+    approve: &dyn Fn(&InstallApproval) -> bool,
+) -> Result<()> {
+    let state = port_state(function)?;
     if state.is_winusb() {
         return Ok(());
     }
-    if !approve(&state) {
+    let approval = InstallApproval::new(function, &state);
+    if !approve(&approval) {
         return Err(Error::new(
             ErrorCode::Cancelled,
-            "WinUSB installation was not approved",
+            format!(
+                "WinUSB installation for {function} was not approved; the device is still owned by {}",
+                state.owner()
+            ),
         ));
     }
-    install_winusb(hardware_id_prefix, &state)
+    install_winusb(&approval.hardware_id)
 }
 
 /// Perform the install: require elevation, write a WinUSB INF, sign the package,
 /// and apply it. See the module docs for why the install is native rather than
 /// libwdi; signing is a faithful port of libwdi's `pki.c` (see [`signing`]).
 #[cfg(windows)]
-fn install_winusb(hardware_id_prefix: &str, _state: &PortState) -> Result<()> {
-    win::install(hardware_id_prefix)
+fn install_winusb(hardware_id: &str) -> Result<()> {
+    win::install(hardware_id)
 }
 
 #[cfg(not(windows))]
-fn install_winusb(_hardware_id_prefix: &str, _state: &PortState) -> Result<()> {
+fn install_winusb(_hardware_id: &str) -> Result<()> {
     Err(Error::new(
         ErrorCode::Unsupported,
         "WinUSB provisioning is only available on Windows",
@@ -174,8 +410,10 @@ mod win {
     /// failure; `HDEVINFO` is an `isize`, so compare against that.
     const INVALID_DEVINFO: HDEVINFO = -1;
 
-    pub(super) fn port_state(hardware_id_prefix: &str) -> Result<PortState> {
-        let target = hardware_id_prefix.to_ascii_uppercase();
+    pub(super) fn port_state(
+        matches: &dyn Fn(&str) -> bool,
+        description: &str,
+    ) -> Result<PortState> {
         let enumerator = wide("USB");
         // SAFETY: FFI. The device info set is destroyed before returning, and no
         // borrowed pointer outlives the call it is passed to.
@@ -203,10 +441,7 @@ mod win {
                 let Some(hwids) = get_reg_prop(set, &data, SPDRP_HARDWAREID) else {
                     continue;
                 };
-                let matches = decode_multi_sz(&hwids)
-                    .iter()
-                    .any(|h| h.to_ascii_uppercase().contains(&target));
-                if !matches {
+                if !decode_multi_sz(&hwids).iter().any(|h| matches(h)) {
                     continue;
                 }
 
@@ -219,6 +454,8 @@ mod win {
                     PortState::Free
                 } else if service.eq_ignore_ascii_case("WinUSB") {
                     PortState::WinUsb
+                } else if service.eq_ignore_ascii_case("usbccgp") {
+                    PortState::Composite
                 } else {
                     PortState::TakenBy(service)
                 });
@@ -229,7 +466,7 @@ mod win {
             found.ok_or_else(|| {
                 Error::new(
                     ErrorCode::Transport,
-                    format!("no present USB device matches hardware id '{hardware_id_prefix}'"),
+                    format!("no present USB device matches {description}"),
                 )
             })
         }
@@ -474,12 +711,53 @@ mod tests {
         assert!(PortState::WinUsb.is_winusb());
         assert!(!PortState::WinUsb.would_displace());
         assert!(!PortState::Free.is_winusb());
-        assert!(PortState::TakenBy("usbccgp".into()).would_displace());
+        assert!(PortState::Composite.would_displace());
+        assert!(PortState::TakenBy("vendor.sys".into()).would_displace());
+    }
+
+    #[test]
+    fn displacing_states_warn_in_the_prompt_callers_show() {
+        let function = UsbFunction::new(0x1234, 0x5678);
+        for state in [
+            PortState::Composite,
+            PortState::TakenBy("vendor.sys".into()),
+        ] {
+            assert!(
+                InstallApproval::new(&function, &state)
+                    .prompt
+                    .starts_with("WARNING:"),
+                "{state:?} must warn that a working driver is replaced"
+            );
+        }
+        assert!(!InstallApproval::new(&function, &PortState::Free)
+            .prompt
+            .starts_with("WARNING:"));
+    }
+
+    #[test]
+    fn hardware_ids_address_the_device_or_one_function() {
+        let device = UsbFunction::new(0x5354, 0x009a);
+        assert_eq!(device.hardware_id(), r"USB\VID_5354&PID_009A");
+        assert_eq!(
+            device.interface(10).hardware_id(),
+            r"USB\VID_5354&PID_009A&MI_0A"
+        );
+
+        // The device query must not match a composite child, and an interface
+        // query must match whether or not Windows qualifies the id with &REV_.
+        assert!(device.matches_hardware_id(r"USB\VID_5354&PID_009A&REV_0100"));
+        assert!(!device.matches_hardware_id(r"USB\VID_5354&PID_009A&MI_00"));
+        assert!(device
+            .interface(0)
+            .matches_hardware_id(r"USB\VID_5354&PID_009A&REV_0100&MI_00"));
+        assert!(!device
+            .interface(0)
+            .matches_hardware_id(r"USB\VID_5354&PID_009A&MI_01"));
     }
 
     #[cfg(not(windows))]
     #[test]
     fn unsupported_off_windows() {
-        assert!(port_state("USB\\VID_5354&PID_009A").is_err());
+        assert!(port_state(&UsbFunction::new(0x5354, 0x009a)).is_err());
     }
 }

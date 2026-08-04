@@ -634,15 +634,20 @@ fn open_usb3_vision_interface(
     let interface = match device.detach_and_claim_interface(probe.usb_interface) {
         Ok(interface) => interface,
         Err(error) => {
+            let hint = crate::usb_discovery::usb_claim_hint(
+                identity.vendor_id,
+                identity.product_id,
+                probe.usb_interface,
+            );
             return (
                 Some(identity),
                 format!(
-                    "USB3 Vision interface {} claim failed: {error}",
+                    "USB3 Vision interface {} claim failed: {error}{hint}",
                     probe.usb_interface
                 ),
                 None,
                 endpoint_summary,
-            )
+            );
         }
     };
     (

@@ -1,21 +1,26 @@
-//! Composed brightfield microscope simulation.
+//! Composed multiwell plate reader/imager simulation.
 //!
-//! One hub offers a camera, an XY stage, a Z stage, a three-position objective
-//! turret, and a transmitted-light lamp. All five devices share a single
-//! procedurally generated cell-culture model, so stage motion, focus, objective
-//! choice, illumination, exposure, and binning are coupled the way they are on a
-//! real instrument rather than mocked per device.
+//! One hub offers a plate carrier, three detectors, an incubator, a gas controller, a
+//! camera, XY/Z stages, an objective turret and a lamp. Every one of them observes the
+//! same [`Specimen`](crate::sim_sample::Specimen), so an absorbance read and an image of
+//! the same well agree — which is the property that makes a simulator worth developing
+//! against rather than merely worth compiling.
 //!
-//! The module exists to publish the optical calibration chain that lets a client
-//! convert image pixels to micrometres:
+//! Two things it deliberately does **not** do:
 //!
-//! ```text
-//! sample_pixel_size = pixel_pitch * binning / magnification
-//! ```
+//! * **It simulates no wire protocol.** Commands arrive as typed capability requests. A
+//!   reference-firmware simulator that framed bytes would test the framing, not the
+//!   application.
+//! * **It computes no OD, RFU or RLU.** [`CapabilityKind::Measure`] answers in raw counts
+//!   plus the settings they were taken under. What a count *means* needs assay context the
+//!   instrument does not have, and keeping the counts is what lets a run be recomputed when
+//!   the photometry is corrected.
 //!
-//! `pixel_pitch` and `binning` are camera properties, `magnification` belongs to
-//! the selected objective, and the turret reaches the camera through a
-//! `Role::Custom("objective")` graph edge.
+//! The biology lives outside this driver: supply it with
+//! [`SimPlateReaderConfig::with_specimen`]. What is here is the instrument.
+//!
+//! Started as a copy of [`crate::sim_microscope`], which carries the stream, motion and
+//! completion machinery this shares.
 
 use numanager_core::*;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -41,13 +46,19 @@ pub mod shared_sample {
 /// contract and is documented on the device page.
 pub const OBJECTIVE_ROLE: &str = "objective";
 
-const RESOURCE_OFFSET: u64 = 850;
-const HUB_OFFSET: u64 = 851;
-const CAMERA_OFFSET: u64 = 852;
-const XY_OFFSET: u64 = 853;
-const Z_OFFSET: u64 = 854;
-const TURRET_OFFSET: u64 = 855;
-const LAMP_OFFSET: u64 = 856;
+const RESOURCE_OFFSET: u64 = 870;
+const HUB_OFFSET: u64 = 871;
+const CAMERA_OFFSET: u64 = 872;
+const XY_OFFSET: u64 = 873;
+const Z_OFFSET: u64 = 874;
+const TURRET_OFFSET: u64 = 875;
+const LAMP_OFFSET: u64 = 876;
+const TRANSPORT_OFFSET: u64 = 877;
+const ABSORBANCE_OFFSET: u64 = 878;
+const FLUORESCENCE_OFFSET: u64 = 879;
+const LUMINESCENCE_OFFSET: u64 = 880;
+const TEMPERATURE_OFFSET: u64 = 881;
+const GAS_OFFSET: u64 = 882;
 
 /// Widest blur this camera will ask the specimen to draw, in image pixels. Beyond this a
 /// feature is spread so thin that further growth only costs time. It is the camera's
@@ -61,6 +72,130 @@ const BACKGROUND_FILL: f64 = 0.78;
 const SETTLE: Duration = Duration::from_millis(20);
 
 /// One objective in the turret.
+/// Where the wells are on a piece of plastic.
+///
+/// The application owns plate *types* — a plate-type library is an application concern, and
+/// which plastic is on the deck changes per run. What the instrument owns is turning a well
+/// label into a position its own stage can reach, which is this. Defaults describe a
+/// standard SBS 96-well plate.
+#[derive(Debug, Clone, Copy)]
+pub struct PlateGeometry {
+    pub rows: u32,
+    pub columns: u32,
+    /// Centre-to-centre spacing. Square on every SBS plate, so one number.
+    pub well_pitch_um: f64,
+    /// Centre of well A1, from the plate's top-left corner.
+    pub a1_x_um: f64,
+    pub a1_y_um: f64,
+    pub well_diameter_um: f64,
+    /// Depth of the well bottom below the carrier reference. Where focus starts looking.
+    pub well_bottom_um: f64,
+}
+
+impl Default for PlateGeometry {
+    fn default() -> Self {
+        // ANSI/SLAS 1-2004 through 4-2004 for a 96-well plate.
+        Self {
+            rows: 8,
+            columns: 12,
+            well_pitch_um: 9_000.0,
+            a1_x_um: 14_380.0,
+            a1_y_um: 11_240.0,
+            well_diameter_um: 6_960.0,
+            well_bottom_um: 4_250.0,
+        }
+    }
+}
+
+impl PlateGeometry {
+    /// Centre of a well in plate coordinates, or `None` if it is off the plate.
+    pub fn well_center_um(&self, row: u32, column: u32) -> Option<(f64, f64)> {
+        if row >= self.rows || column >= self.columns {
+            return None;
+        }
+        Some((
+            self.a1_x_um + column as f64 * self.well_pitch_um,
+            self.a1_y_um + row as f64 * self.well_pitch_um,
+        ))
+    }
+
+    /// Parse a well label — `A1`, `A01`, `h12`, all accepted — into zero-based
+    /// `(row, column)`.
+    ///
+    /// Rejects anything outside the plate rather than clamping: a protocol that asks for
+    /// H13 on a 96-well plate has a real mistake in it, and reading G12 instead would
+    /// attribute one well's numbers to another.
+    pub fn parse_well(&self, label: &str) -> Option<(u32, u32)> {
+        let label = label.trim();
+        let mut chars = label.chars();
+        let row_char = chars.next()?.to_ascii_uppercase();
+        if !row_char.is_ascii_alphabetic() {
+            return None;
+        }
+        let row = row_char as u32 - 'A' as u32;
+        let column_text = chars.as_str();
+        if column_text.is_empty() || !column_text.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let column_1 = column_text.parse::<u32>().ok()?;
+        if column_1 == 0 {
+            return None;
+        }
+        let column = column_1 - 1;
+        if row >= self.rows || column >= self.columns {
+            return None;
+        }
+        Some((row, column))
+    }
+
+    /// Canonical label for a well, zero-padded to the plate's widest column number so
+    /// labels sort lexicographically the way a person expects.
+    pub fn well_label(&self, row: u32, column: u32) -> String {
+        let width = self.columns.to_string().len();
+        format!(
+            "{}{:0width$}",
+            (b'A' + row as u8) as char,
+            column + 1,
+            width = width
+        )
+    }
+
+    /// How far the carrier must travel in X to reach past the last column, plus the margin
+    /// a field of view needs around it.
+    pub fn x_extent_um(&self) -> f64 {
+        self.a1_x_um
+            + self.columns.saturating_sub(1) as f64 * self.well_pitch_um
+            + self.well_diameter_um
+    }
+
+    /// The same in Y.
+    pub fn y_extent_um(&self) -> f64 {
+        self.a1_y_um
+            + self.rows.saturating_sub(1) as f64 * self.well_pitch_um
+            + self.well_diameter_um
+    }
+
+    /// Every well label, row-major — the order a plate reader sweeps in.
+    pub fn well_labels(&self) -> Vec<String> {
+        (0..self.rows)
+            .flat_map(|row| (0..self.columns).map(move |column| (row, column)))
+            .map(|(row, column)| self.well_label(row, column))
+            .collect()
+    }
+
+    /// How far a point sits from the centre of the well containing it, as a fraction of
+    /// the well radius. Above 1.0 the point is on plastic rather than over liquid, which
+    /// is what puts a rim in an image and what makes an off-centre read meaningless.
+    pub fn radial_fraction(&self, row: u32, column: u32, x_um: f64, y_um: f64) -> f64 {
+        let Some((cx, cy)) = self.well_center_um(row, column) else {
+            return f64::INFINITY;
+        };
+        let dx = x_um - cx;
+        let dy = y_um - cy;
+        (dx * dx + dy * dy).sqrt() / (self.well_diameter_um / 2.0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SimObjective {
     pub magnification: f64,
@@ -79,7 +214,7 @@ impl SimObjective {
 }
 
 #[derive(Clone)]
-pub struct SimMicroscopeConfig {
+pub struct SimPlateReaderConfig {
     /// Seed for the cell-culture model. The same seed always yields the same
     /// sample, so recorded output and screenshots are reproducible.
     pub seed: u64,
@@ -103,15 +238,30 @@ pub struct SimMicroscopeConfig {
     pub exposure: TimeInterval,
     pub frame_interval: TimeInterval,
     pub illumination_wavelength: Wavelength,
+    /// Where the wells are.
+    pub plate: PlateGeometry,
+    /// Absorbance detector's initial wavelength.
+    pub absorbance_wavelength: Wavelength,
+    /// Fluorescence excitation band.
+    pub fluorescence_wavelength: Wavelength,
+    /// Counts a detector reports with nothing in the light path — the reference read that
+    /// absorbance is computed against, and the ceiling every other count sits under.
+    pub detector_full_scale_counts: f64,
+    /// Counts a detector reports in the dark. Real detectors do not read zero, and code
+    /// that assumes they do produces an absorbance of infinity on a blocked path.
+    pub detector_dark_counts: f64,
+    /// Incubator setpoints at power-on.
+    pub temperature_target: Temperature,
+    pub co2_target: GasConcentration,
     /// What the camera is pointed at. Defaults to the built-in cell culture described by
     /// the `seed`/`focal_plane`/`sample_tilt_um_per_mm`/`cells_per_tile` fields above; set
-    /// it with [`SimMicroscopeConfig::with_specimen`] to observe something else.
+    /// it with [`SimPlateReaderConfig::with_specimen`] to observe something else.
     pub specimen: Arc<dyn Specimen>,
 }
 
-impl std::fmt::Debug for SimMicroscopeConfig {
+impl std::fmt::Debug for SimPlateReaderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SimMicroscopeConfig")
+        f.debug_struct("SimPlateReaderConfig")
             .field("seed", &self.seed)
             .field("sensor_width", &self.sensor_width)
             .field("sensor_height", &self.sensor_height)
@@ -123,7 +273,7 @@ impl std::fmt::Debug for SimMicroscopeConfig {
     }
 }
 
-impl Default for SimMicroscopeConfig {
+impl Default for SimPlateReaderConfig {
     fn default() -> Self {
         Self {
             seed: 0x5EED_0C11_A73E_0001,
@@ -148,6 +298,13 @@ impl Default for SimMicroscopeConfig {
             exposure: TimeInterval::from_milliseconds(20.0),
             frame_interval: TimeInterval::from_milliseconds(50.0),
             illumination_wavelength: Wavelength::from_nanometers(550.0),
+            plate: PlateGeometry::default(),
+            absorbance_wavelength: Wavelength::from_nanometers(600.0),
+            fluorescence_wavelength: Wavelength::from_nanometers(485.0),
+            detector_full_scale_counts: 52_000.0,
+            detector_dark_counts: 300.0,
+            temperature_target: Temperature::from_celsius(37.0),
+            co2_target: GasConcentration::from_percent(5.0),
             specimen: Arc::new(SimSampleConfig {
                 seed: 0x5EED_0C11_A73E_0001,
                 focal_plane_um: 4_250.0,
@@ -158,7 +315,7 @@ impl Default for SimMicroscopeConfig {
     }
 }
 
-impl SimMicroscopeConfig {
+impl SimPlateReaderConfig {
     pub(crate) fn sample_config(&self) -> SimSampleConfig {
         SimSampleConfig {
             seed: self.seed,
@@ -202,7 +359,7 @@ struct SceneState {
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
-pub struct SimMicroscopeSceneSnapshot {
+pub struct SimPlateReaderSceneSnapshot {
     pub x_um: f64,
     pub y_um: f64,
     pub z_um: f64,
@@ -221,6 +378,24 @@ enum SimDevice {
     Z,
     Turret,
     Lamp,
+    Transport,
+    Absorbance,
+    Fluorescence,
+    Luminescence,
+    Temperature,
+    Gas,
+}
+
+/// Which detector a `Measure` is asking for. They differ in what physics answers them,
+/// not in how they are driven, so one code path serves all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Detector {
+    /// Transmitted light through the well: the specimen's optical depth attenuates it.
+    Absorbance,
+    /// Excitation in, emission out — the specimen's emission field.
+    Fluorescence,
+    /// Emission with no excitation at all.
+    Luminescence,
 }
 
 /// A stage move in flight. Progress is interpolated in `poll()`; the lane thread
@@ -242,7 +417,7 @@ struct PendingTurret {
     target: usize,
 }
 
-pub struct SimMicroscopeDriver {
+pub struct SimPlateReaderDriver {
     id: DriverId,
     resource: ResourceId,
     hub: DeviceId,
@@ -251,7 +426,23 @@ pub struct SimMicroscopeDriver {
     z: DeviceId,
     turret: DeviceId,
     lamp: DeviceId,
-    config: Arc<SimMicroscopeConfig>,
+    transport: DeviceId,
+    absorbance: DeviceId,
+    fluorescence: DeviceId,
+    luminescence: DeviceId,
+    temperature: DeviceId,
+    gas: DeviceId,
+    /// Which well the carrier has under the optics.
+    well: String,
+    absorbance_wavelength_nm: f64,
+    fluorescence_wavelength_nm: f64,
+    fluorescence_enabled: bool,
+    luminescence_enabled: bool,
+    temperature_target_c: f64,
+    temperature_enabled: bool,
+    co2_target_percent: f64,
+    gas_enabled: bool,
+    config: Arc<SimPlateReaderConfig>,
     scene: Arc<Mutex<SceneState>>,
     frames: Arc<AtomicU64>,
     epoch: Instant,
@@ -277,14 +468,15 @@ pub struct SimMicroscopeDriver {
     streams: HashMap<DriverToken, Arc<AtomicBool>>,
 }
 
-impl SimMicroscopeDriver {
-    pub fn new(id: DriverId, config: SimMicroscopeConfig) -> Self {
+impl SimPlateReaderDriver {
+    pub fn new(id: DriverId, config: SimPlateReaderConfig) -> Self {
         let node = |offset: u64| NodeId(id.0 * 1000 + offset);
         let (worker_tx, worker_rx) = mpsc::channel();
         let objective = config.objectives.len().min(2).saturating_sub(1);
+        let (start_x, start_y) = config.plate.well_center_um(0, 0).unwrap_or((0.0, 0.0));
         let scene = SceneState {
-            x_um: 0.0,
-            y_um: 0.0,
+            x_um: start_x,
+            y_um: start_y,
             z_um: config.focal_plane.micrometers(),
             objective,
             light_path_open: true,
@@ -306,6 +498,21 @@ impl SimMicroscopeDriver {
             z: DeviceId(node(Z_OFFSET)),
             turret: DeviceId(node(TURRET_OFFSET)),
             lamp: DeviceId(node(LAMP_OFFSET)),
+            transport: DeviceId(node(TRANSPORT_OFFSET)),
+            absorbance: DeviceId(node(ABSORBANCE_OFFSET)),
+            fluorescence: DeviceId(node(FLUORESCENCE_OFFSET)),
+            luminescence: DeviceId(node(LUMINESCENCE_OFFSET)),
+            temperature: DeviceId(node(TEMPERATURE_OFFSET)),
+            gas: DeviceId(node(GAS_OFFSET)),
+            well: config.plate.well_label(0, 0),
+            absorbance_wavelength_nm: config.absorbance_wavelength.nanometers(),
+            fluorescence_wavelength_nm: config.fluorescence_wavelength.nanometers(),
+            fluorescence_enabled: false,
+            luminescence_enabled: false,
+            temperature_target_c: config.temperature_target.celsius(),
+            temperature_enabled: true,
+            co2_target_percent: config.co2_target.percent(),
+            gas_enabled: true,
             x_um: scene.x_um,
             y_um: scene.y_um,
             z_um: scene.z_um,
@@ -333,7 +540,7 @@ impl SimMicroscopeDriver {
     }
 
     pub fn simulated(id: DriverId) -> Self {
-        Self::new(id, SimMicroscopeConfig::default())
+        Self::new(id, SimPlateReaderConfig::default())
     }
 
     fn classify(&self, device: DeviceId) -> Option<SimDevice> {
@@ -349,9 +556,183 @@ impl SimMicroscopeDriver {
             Some(SimDevice::Turret)
         } else if device == self.lamp {
             Some(SimDevice::Lamp)
+        } else if device == self.transport {
+            Some(SimDevice::Transport)
+        } else if device == self.absorbance {
+            Some(SimDevice::Absorbance)
+        } else if device == self.fluorescence {
+            Some(SimDevice::Fluorescence)
+        } else if device == self.luminescence {
+            Some(SimDevice::Luminescence)
+        } else if device == self.temperature {
+            Some(SimDevice::Temperature)
+        } else if device == self.gas {
+            Some(SimDevice::Gas)
         } else {
             None
         }
+    }
+
+    /// Drive the carrier so `label` sits under the optics.
+    ///
+    /// A plate reader addresses wells, not coordinates — but underneath it is still a
+    /// stage, so this sets XY to the well centre and Z to the well bottom. That is what
+    /// lets one simulator serve both the `PlateMove` path a reader uses and the
+    /// `StageMove` path a microscope with no carrier uses.
+    fn move_to_well(&mut self, label: &str) -> Result<()> {
+        let Some((row, column)) = self.config.plate.parse_well(label) else {
+            return Err(Error::new(
+                ErrorCode::InvalidProperty,
+                format!(
+                    "well {label:?} is not on a {}x{} plate",
+                    self.config.plate.rows, self.config.plate.columns
+                ),
+            ));
+        };
+        let (x_um, y_um) = self
+            .config
+            .plate
+            .well_center_um(row, column)
+            .expect("parse_well already bounds-checked");
+        self.well = self.config.plate.well_label(row, column);
+        self.x_um = x_um;
+        self.y_um = y_um;
+        self.supersede(self.xy, StageAxis::X);
+        self.supersede(self.xy, StageAxis::Y);
+        self.publish_scene();
+        Ok(())
+    }
+
+    /// Chamber temperature. Control pulls it toward the setpoint; with control off it
+    /// decays toward ambient, which is what makes leaving the incubator disabled visible
+    /// in the data rather than silent.
+    fn actual_temperature_c(&self) -> f64 {
+        const AMBIENT_C: f64 = 21.5;
+        if !self.temperature_enabled {
+            return AMBIENT_C;
+        }
+        // A tenth of a degree of ripple, deterministic in the setpoint so repeated reads
+        // of an unchanged instrument agree.
+        let ripple = sim_sample::unit01(sim_sample::mix64(
+            (self.temperature_target_c * 100.0) as i64 as u64,
+        )) - 0.5;
+        self.temperature_target_c + ripple * 0.2
+    }
+
+    fn actual_co2_percent(&self) -> f64 {
+        if !self.gas_enabled {
+            return 0.04; // room air
+        }
+        let ripple = sim_sample::unit01(sim_sample::mix64(
+            (self.co2_target_percent * 1000.0) as i64 as u64 ^ 0x9E37,
+        )) - 0.5;
+        (self.co2_target_percent + ripple * 0.1).max(0.0)
+    }
+
+    /// Read the current well with one detector, in raw counts.
+    ///
+    /// Counts, not OD or RFU — turning them into a physical quantity needs assay context
+    /// this instrument does not have, and keeping the counts is what lets a run be
+    /// recomputed when the photometry is corrected. See NUMANAGER_PLAN.md §4.1.
+    ///
+    /// The light path is the whole well, not a camera field: the detector integrates over
+    /// the well aperture, so this asks the specimen for one coarse pixel covering the well
+    /// rather than rendering an image and averaging it. That is the level-of-detail
+    /// property the radiometric interface exists for.
+    fn measure(&self, detector: Detector, integration_s: f64) -> Result<MeasuredCounts> {
+        let plate = &self.config.plate;
+        let Some((row, column)) = plate.parse_well(&self.well) else {
+            return Err(Error::new(
+                ErrorCode::Driver,
+                format!("carrier is at {:?}, which is not a well", self.well),
+            ));
+        };
+        let (cx, cy) = plate
+            .well_center_um(row, column)
+            .expect("parse_well already bounds-checked");
+
+        // One pixel, one well aperture wide. The specimen decides how to answer a footprint
+        // this coarse; a cell-based one enumerates, a plate model answers analytically.
+        let aperture_um = plate.well_diameter_um;
+        let wavelength_nm = match detector {
+            Detector::Absorbance => self.absorbance_wavelength_nm,
+            Detector::Fluorescence => self.fluorescence_wavelength_nm,
+            // Luminescence has no excitation; the band is whatever the reaction emits, and
+            // a broad mid-visible value stands in for it.
+            Detector::Luminescence => 560.0,
+        };
+        let field = self
+            .config
+            .specimen
+            .render_field(&sim_sample::FieldRequest {
+                origin_x_um: cx - aperture_um / 2.0,
+                origin_y_um: cy - aperture_um / 2.0,
+                pixel_um: aperture_um,
+                width: 1,
+                height: 1,
+                focus_z_um: plate.well_bottom_um,
+                numerical_aperture: 0.25,
+                wavelength_um: wavelength_nm / 1_000.0,
+                // Fluorescence needs a lamp; luminescence emits in the dark and absorbance
+                // reads transmitted light. Passing the excitation band is what keeps the
+                // specimen from reporting fluorescence to a luminescence read.
+                excitation_um: match detector {
+                    Detector::Fluorescence => Some(self.fluorescence_wavelength_nm / 1_000.0),
+                    Detector::Absorbance | Detector::Luminescence => None,
+                },
+                blur_limit_px: 1.0,
+                time_s: self.epoch.elapsed().as_secs_f64(),
+            });
+
+        let full_scale = self.config.detector_full_scale_counts;
+        let dark = self.config.detector_dark_counts;
+        let integration = (integration_s / 0.02).clamp(0.01, 50.0);
+
+        let (reference, measurement) = match detector {
+            Detector::Absorbance => {
+                // Reference is the lamp through an empty path; measurement is the same
+                // light after Beer-Lambert attenuation by whatever is in the well.
+                let transmitted = (-(field.optical_depth_at(0) as f64)).exp();
+                (
+                    dark + full_scale,
+                    dark + full_scale * transmitted.clamp(0.0, 1.0),
+                )
+            }
+            Detector::Fluorescence => {
+                if !self.fluorescence_enabled {
+                    return Err(Error::new(
+                        ErrorCode::Driver,
+                        "fluorescence detector is disabled",
+                    ));
+                }
+                // The reference channel watches the excitation source, so a lamp that
+                // drifts is visible in the data instead of silently scaling the result.
+                let emission = field.emission_at(0) as f64 * integration;
+                (
+                    dark + full_scale * 0.85,
+                    dark + (full_scale * emission).min(full_scale),
+                )
+            }
+            Detector::Luminescence => {
+                if !self.luminescence_enabled {
+                    return Err(Error::new(
+                        ErrorCode::Driver,
+                        "luminescence detector is disabled",
+                    ));
+                }
+                // No excitation, so no reference channel at all: a luminescence read is a
+                // photon count and nothing else.
+                let emission = field.emission_at(0) as f64 * integration;
+                (0.0, dark + (full_scale * emission).min(full_scale))
+            }
+        };
+
+        Ok(MeasuredCounts {
+            reference: reference.round().max(0.0) as u64,
+            measurement: measurement.round().max(0.0) as u64,
+            wavelength_nm,
+            integration_s,
+        })
     }
 
     fn objective(&self) -> &SimObjective {
@@ -365,8 +746,8 @@ impl SimMicroscopeDriver {
     }
 
     #[doc(hidden)]
-    pub fn runtime_scene_snapshot(&self) -> SimMicroscopeSceneSnapshot {
-        SimMicroscopeSceneSnapshot {
+    pub fn runtime_scene_snapshot(&self) -> SimPlateReaderSceneSnapshot {
+        SimPlateReaderSceneSnapshot {
             x_um: self.x_um,
             y_um: self.y_um,
             z_um: self.z_um,
@@ -450,9 +831,32 @@ impl SimMicroscopeDriver {
         let config = &self.config;
         let value = match (logical, key) {
             (SimDevice::Hub, "model") => {
-                Value::String("composed brightfield microscope simulation".into())
+                Value::String("composed multiwell plate reader simulation".into())
             }
             (SimDevice::Hub, "sample_seed") => Value::I64(config.seed as i64),
+            (SimDevice::Transport, "well") => Value::String(self.well.clone()),
+            (SimDevice::Absorbance, "wavelength") => {
+                Value::Wavelength(Wavelength::from_nanometers(self.absorbance_wavelength_nm))
+            }
+            (SimDevice::Fluorescence, "wavelength") => {
+                Value::Wavelength(Wavelength::from_nanometers(self.fluorescence_wavelength_nm))
+            }
+            (SimDevice::Fluorescence, "enabled") => Value::Bool(self.fluorescence_enabled),
+            (SimDevice::Luminescence, "enabled") => Value::Bool(self.luminescence_enabled),
+            (SimDevice::Temperature, "target") => {
+                Value::Temperature(Temperature::from_celsius(self.temperature_target_c))
+            }
+            (SimDevice::Temperature, "enabled") => Value::Bool(self.temperature_enabled),
+            (SimDevice::Temperature, "actual") => {
+                Value::Temperature(Temperature::from_celsius(self.actual_temperature_c()))
+            }
+            (SimDevice::Gas, "co2_target") => {
+                Value::GasConcentration(GasConcentration::from_percent(self.co2_target_percent))
+            }
+            (SimDevice::Gas, "co2_actual") => {
+                Value::GasConcentration(GasConcentration::from_percent(self.actual_co2_percent()))
+            }
+            (SimDevice::Gas, "enabled") => Value::Bool(self.gas_enabled),
             (SimDevice::Camera, "exposure") => {
                 Value::TimeInterval(TimeInterval::from_seconds(self.exposure_s))
             }
@@ -519,6 +923,42 @@ impl SimMicroscopeDriver {
             ));
         };
         match (logical, key) {
+            (SimDevice::Transport, "well") => {
+                let label = match value {
+                    Value::String(text) => text.clone(),
+                    other => {
+                        return Err(Error::new(
+                            ErrorCode::InvalidProperty,
+                            format!("well must be a string, got {other:?}"),
+                        ))
+                    }
+                };
+                self.move_to_well(&label)?;
+            }
+            (SimDevice::Absorbance, "wavelength") => {
+                self.absorbance_wavelength_nm = wavelength_nm(value)?;
+            }
+            (SimDevice::Fluorescence, "wavelength") => {
+                self.fluorescence_wavelength_nm = wavelength_nm(value)?;
+            }
+            (SimDevice::Fluorescence, "enabled") => {
+                self.fluorescence_enabled = bool_value(value)?;
+            }
+            (SimDevice::Luminescence, "enabled") => {
+                self.luminescence_enabled = bool_value(value)?;
+            }
+            (SimDevice::Temperature, "target") => {
+                self.temperature_target_c = temperature_celsius(value)?;
+            }
+            (SimDevice::Temperature, "enabled") => {
+                self.temperature_enabled = bool_value(value)?;
+            }
+            (SimDevice::Gas, "co2_target") => {
+                self.co2_target_percent = gas_percent(value)?;
+            }
+            (SimDevice::Gas, "enabled") => {
+                self.gas_enabled = bool_value(value)?;
+            }
             (SimDevice::Camera, "exposure") => {
                 self.exposure_s = time_seconds(value)?;
             }
@@ -843,14 +1283,13 @@ impl SimMicroscopeDriver {
     }
 }
 
-impl Driver for SimMicroscopeDriver {
+impl Driver for SimPlateReaderDriver {
     fn id(&self) -> DriverId {
         self.id
     }
 
     fn descriptors(&self) -> Vec<DeviceDescriptor> {
         let config = &self.config;
-        let half_travel = config.xy_travel.micrometers() / 2.0;
         let objective_values = config
             .objectives
             .iter()
@@ -864,9 +1303,9 @@ impl Driver for SimMicroscopeDriver {
             DeviceDescriptor {
                 id: self.hub,
                 driver: self.id,
-                label: "sim-microscope".into(),
+                label: "sim-plate-reader".into(),
                 vendor: Some("numanager".into()),
-                model: Some("composed brightfield microscope".into()),
+                model: Some("composed multiwell plate reader".into()),
                 serial: None,
                 kinds: vec!["hub".into(), "simulator".into()],
                 properties: vec![
@@ -876,7 +1315,7 @@ impl Driver for SimMicroscopeDriver {
                 metadata: BTreeMap::from([
                     (
                         "model".into(),
-                        Value::String("procedural adherent cell culture".into()),
+                        Value::String("multiwell plate over a pluggable specimen".into()),
                     ),
                     (
                         "objective_role".into(),
@@ -887,7 +1326,7 @@ impl Driver for SimMicroscopeDriver {
             DeviceDescriptor {
                 id: self.camera,
                 driver: self.id,
-                label: "sim-microscope-camera".into(),
+                label: "sim-plate-camera".into(),
                 vendor: Some("numanager".into()),
                 model: Some("composed brightfield camera".into()),
                 serial: None,
@@ -957,14 +1396,14 @@ impl Driver for SimMicroscopeDriver {
             DeviceDescriptor {
                 id: self.xy,
                 driver: self.id,
-                label: "sim-microscope-xy".into(),
+                label: "sim-plate-xy".into(),
                 vendor: Some("numanager".into()),
                 model: Some("composed sample-plane xy stage".into()),
                 serial: None,
                 kinds: vec!["stage.xy".into(), "axis.xy".into(), "simulator".into()],
                 properties: vec![
-                    axis_property("x", "X position", half_travel),
-                    axis_property("y", "Y position", half_travel),
+                    plate_axis_property("x", "X position", config.plate.x_extent_um()),
+                    plate_axis_property("y", "Y position", config.plate.y_extent_um()),
                     speed_property(),
                     volatile_property("busy", "Busy", ValueType::Bool, None),
                 ],
@@ -973,7 +1412,7 @@ impl Driver for SimMicroscopeDriver {
             DeviceDescriptor {
                 id: self.z,
                 driver: self.id,
-                label: "sim-microscope-z".into(),
+                label: "sim-plate-z".into(),
                 vendor: Some("numanager".into()),
                 model: Some("composed focus drive".into()),
                 serial: None,
@@ -988,7 +1427,7 @@ impl Driver for SimMicroscopeDriver {
             DeviceDescriptor {
                 id: self.turret,
                 driver: self.id,
-                label: "sim-microscope-objective".into(),
+                label: "sim-plate-objective".into(),
                 vendor: Some("numanager".into()),
                 model: Some("composed objective turret".into()),
                 serial: None,
@@ -1013,7 +1452,7 @@ impl Driver for SimMicroscopeDriver {
             DeviceDescriptor {
                 id: self.lamp,
                 driver: self.id,
-                label: "sim-microscope-lamp".into(),
+                label: "sim-plate-lamp".into(),
                 vendor: Some("numanager".into()),
                 model: Some("composed transmitted-light lamp".into()),
                 serial: None,
@@ -1035,6 +1474,131 @@ impl Driver for SimMicroscopeDriver {
                     Value::Wavelength(config.illumination_wavelength),
                 )]),
             },
+            DeviceDescriptor {
+                id: self.transport,
+                driver: self.id,
+                label: "sim-plate-transport".into(),
+                vendor: Some("numanager".into()),
+                model: Some("simulated plate carrier".into()),
+                serial: None,
+                kinds: vec!["plate.transport".into(), "simulator".into()],
+                properties: vec![{
+                    let mut schema =
+                        sequenceable_property("well", "Well", ValueType::String, None, true);
+                    // Every well is enumerated rather than range-checked, so a client can
+                    // populate a picker and a bad label is rejected by the schema before it
+                    // ever reaches the carrier.
+                    schema.enum_values = config
+                        .plate
+                        .well_labels()
+                        .into_iter()
+                        .map(|label| EnumValue {
+                            value: Value::String(label.clone()),
+                            label,
+                        })
+                        .collect();
+                    schema
+                }],
+                metadata: BTreeMap::from([
+                    ("rows".into(), Value::I64(config.plate.rows as i64)),
+                    ("columns".into(), Value::I64(config.plate.columns as i64)),
+                    (
+                        "well_pitch".into(),
+                        Value::Position(Position::from_micrometers(config.plate.well_pitch_um)),
+                    ),
+                    (
+                        "well_diameter".into(),
+                        Value::Position(Position::from_micrometers(config.plate.well_diameter_um)),
+                    ),
+                ]),
+            },
+            DeviceDescriptor {
+                id: self.absorbance,
+                driver: self.id,
+                label: "sim-plate-absorbance".into(),
+                vendor: Some("numanager".into()),
+                model: Some("simulated absorbance detector".into()),
+                serial: None,
+                kinds: vec!["detector.absorbance".into(), "simulator".into()],
+                properties: vec![wavelength_property(
+                    "wavelength",
+                    "Wavelength",
+                    200.0,
+                    1000.0,
+                )],
+                metadata: BTreeMap::new(),
+            },
+            DeviceDescriptor {
+                id: self.fluorescence,
+                driver: self.id,
+                label: "sim-plate-fluorescence".into(),
+                vendor: Some("numanager".into()),
+                model: Some("simulated fluorescence detector".into()),
+                serial: None,
+                kinds: vec![
+                    "detector.fluorescence".into(),
+                    "light.source".into(),
+                    "simulator".into(),
+                ],
+                properties: vec![
+                    wavelength_property("wavelength", "Excitation wavelength", 200.0, 1000.0),
+                    sequenceable_property("enabled", "Enabled", ValueType::Bool, None, true),
+                ],
+                metadata: BTreeMap::new(),
+            },
+            DeviceDescriptor {
+                id: self.luminescence,
+                driver: self.id,
+                label: "sim-plate-luminescence".into(),
+                vendor: Some("numanager".into()),
+                model: Some("simulated luminescence detector".into()),
+                serial: None,
+                kinds: vec!["detector.luminescence".into(), "simulator".into()],
+                properties: vec![sequenceable_property(
+                    "enabled",
+                    "Enabled",
+                    ValueType::Bool,
+                    None,
+                    true,
+                )],
+                metadata: BTreeMap::new(),
+            },
+            DeviceDescriptor {
+                id: self.temperature,
+                driver: self.id,
+                label: "sim-plate-temperature".into(),
+                vendor: Some("numanager".into()),
+                model: Some("simulated incubator".into()),
+                serial: None,
+                kinds: vec!["environment.temperature".into(), "simulator".into()],
+                properties: vec![
+                    temperature_property("target", "Target", 4.0, 45.0),
+                    sequenceable_property("enabled", "Enabled", ValueType::Bool, None, true),
+                    property("actual", "Actual", ValueType::Temperature, None, false),
+                ],
+                metadata: BTreeMap::new(),
+            },
+            DeviceDescriptor {
+                id: self.gas,
+                driver: self.id,
+                label: "sim-plate-gas".into(),
+                vendor: Some("numanager".into()),
+                model: Some("simulated gas controller".into()),
+                serial: None,
+                kinds: vec!["environment.gas".into(), "simulator".into()],
+                properties: vec![
+                    gas_property("co2_target", "CO2 target", 0.0, 20.0),
+                    property(
+                        "co2_actual",
+                        "CO2 actual",
+                        ValueType::GasConcentration,
+                        None,
+                        false,
+                    ),
+                    sequenceable_property("enabled", "Enabled", ValueType::Bool, None, true),
+                ],
+                metadata: BTreeMap::new(),
+            },
         ]
     }
 
@@ -1042,12 +1606,12 @@ impl Driver for SimMicroscopeDriver {
         vec![ResourceDescriptor {
             id: self.resource,
             driver: self.id,
-            label: "sim-microscope-sample".into(),
+            label: "sim-plate-specimen".into(),
             kind: "simulated.biological_scene".into(),
             metadata: BTreeMap::from([
                 (
                     "model".into(),
-                    Value::String("procedural adherent cell culture".into()),
+                    Value::String("multiwell plate over a pluggable specimen".into()),
                 ),
                 ("seed".into(), Value::I64(self.config.seed as i64)),
                 (
@@ -1063,12 +1627,12 @@ impl Driver for SimMicroscopeDriver {
         let _ = graph.insert_node(GraphNode {
             id: self.resource.0,
             kind: NodeKind::Resource,
-            label: "sim-microscope-sample".into(),
+            label: "sim-plate-specimen".into(),
         });
         let _ = graph.insert_node(GraphNode {
             id: self.hub.0,
             kind: NodeKind::Hub,
-            label: "sim-microscope".into(),
+            label: "sim-plate-reader".into(),
         });
         let _ = graph.insert_edge(GraphEdge {
             from: self.resource.0,
@@ -1118,6 +1682,14 @@ impl Driver for SimMicroscopeDriver {
                 capability(8, device, CapabilityKind::StageStop),
             ],
             Some(SimDevice::Turret) => vec![capability(9, device, CapabilityKind::FilterSelect)],
+            Some(SimDevice::Transport) => vec![capability(10, device, CapabilityKind::PlateMove)],
+            Some(SimDevice::Absorbance) => vec![capability(11, device, CapabilityKind::Measure)],
+            Some(SimDevice::Fluorescence) => vec![capability(12, device, CapabilityKind::Measure)],
+            Some(SimDevice::Luminescence) => vec![capability(13, device, CapabilityKind::Measure)],
+            Some(SimDevice::Temperature) => {
+                vec![capability(14, device, CapabilityKind::TemperatureControl)]
+            }
+            Some(SimDevice::Gas) => vec![capability(15, device, CapabilityKind::GasControl)],
             _ => Vec::new(),
         }
     }
@@ -1130,7 +1702,7 @@ impl Driver for SimMicroscopeDriver {
                     let _ = self.read_property(*device, key)?;
                     physical_transactions.push(PhysicalTransaction {
                         resource: Some(self.resource),
-                        description: format!("sim microscope read {key}"),
+                        description: format!("sim plate reader read {key}"),
                         payload: Value::String(key.clone()),
                     });
                 }
@@ -1138,7 +1710,7 @@ impl Driver for SimMicroscopeDriver {
                     self.validate_write(*device, key, value)?;
                     physical_transactions.push(PhysicalTransaction {
                         resource: Some(self.resource),
-                        description: format!("sim microscope write {key}"),
+                        description: format!("sim plate reader write {key}"),
                         payload: value.clone(),
                     });
                 }
@@ -1232,6 +1804,103 @@ impl Driver for SimMicroscopeDriver {
                     deferred = self.turret_move.is_some();
                 }
                 Command::Invoke {
+                    request: CapabilityRequest::PlateMove(request),
+                    ..
+                } => {
+                    self.move_to_well(&request.well)?;
+                    self.announce(self.transport, "well", Value::String(self.well.clone()));
+                    completion = Value::Map(BTreeMap::from([
+                        ("well".into(), Value::String(self.well.clone())),
+                        (
+                            "x".into(),
+                            Value::Position(Position::from_micrometers(self.x_um)),
+                        ),
+                        (
+                            "y".into(),
+                            Value::Position(Position::from_micrometers(self.y_um)),
+                        ),
+                    ]));
+                }
+                Command::Invoke {
+                    device,
+                    request: CapabilityRequest::Measure(request),
+                    ..
+                } => {
+                    let detector = match self.classify(device) {
+                        Some(SimDevice::Absorbance) => Detector::Absorbance,
+                        Some(SimDevice::Fluorescence) => Detector::Fluorescence,
+                        Some(SimDevice::Luminescence) => Detector::Luminescence,
+                        _ => {
+                            return Err(Error::new(
+                                ErrorCode::Unsupported,
+                                format!("{} is not a detector", self.label_of(device)),
+                            ))
+                        }
+                    };
+                    let integration_s = request
+                        .integration_time
+                        .map(|interval| interval.seconds())
+                        .unwrap_or(0.02);
+                    let counts = self.measure(detector, integration_s)?;
+                    completion = counts.completion(&self.well);
+                }
+                Command::Invoke {
+                    request: CapabilityRequest::TemperatureControl(request),
+                    ..
+                } => {
+                    if let Some(target) = request.target {
+                        self.temperature_target_c = target.celsius();
+                        self.announce(self.temperature, "target", Value::Temperature(target));
+                    }
+                    if let Some(enabled) = request.enabled {
+                        self.temperature_enabled = enabled;
+                        self.announce(self.temperature, "enabled", Value::Bool(enabled));
+                    }
+                    completion = Value::Map(BTreeMap::from([
+                        (
+                            "target".into(),
+                            Value::Temperature(Temperature::from_celsius(
+                                self.temperature_target_c,
+                            )),
+                        ),
+                        (
+                            "actual".into(),
+                            Value::Temperature(Temperature::from_celsius(
+                                self.actual_temperature_c(),
+                            )),
+                        ),
+                        ("enabled".into(), Value::Bool(self.temperature_enabled)),
+                    ]));
+                }
+                Command::Invoke {
+                    request: CapabilityRequest::GasControl(request),
+                    ..
+                } => {
+                    if let Some(target) = request.co2_target {
+                        self.co2_target_percent = target.percent();
+                        self.announce(self.gas, "co2_target", Value::GasConcentration(target));
+                    }
+                    if let Some(enabled) = request.enabled {
+                        self.gas_enabled = enabled;
+                        self.announce(self.gas, "enabled", Value::Bool(enabled));
+                    }
+                    completion = Value::Map(BTreeMap::from([
+                        (
+                            "co2_target".into(),
+                            Value::GasConcentration(GasConcentration::from_percent(
+                                self.co2_target_percent,
+                            )),
+                        ),
+                        (
+                            "co2_actual".into(),
+                            Value::GasConcentration(GasConcentration::from_percent(
+                                self.actual_co2_percent(),
+                            )),
+                        ),
+                        ("enabled".into(), Value::Bool(self.gas_enabled)),
+                    ]));
+                }
+                Command::Invoke {
                     device,
                     request: CapabilityRequest::None,
                     capability,
@@ -1292,7 +1961,7 @@ impl Driver for SimMicroscopeDriver {
     }
 }
 
-impl SimMicroscopeDriver {
+impl SimPlateReaderDriver {
     fn label_of(&self, device: DeviceId) -> String {
         self.descriptors()
             .into_iter()
@@ -1526,7 +2195,7 @@ struct RenderedImage {
 /// belongs to the [`Specimen`](sim_sample::Specimen) and reaches this function as a field
 /// of means. Everything from here down is the camera.
 fn render_image(
-    config: &SimMicroscopeConfig,
+    config: &SimPlateReaderConfig,
     scene: SceneState,
     frame_index: u64,
 ) -> RenderedImage {
@@ -1549,7 +2218,8 @@ fn render_image(
         focus_z_um: scene.z_um,
         numerical_aperture: objective.numerical_aperture,
         wavelength_um,
-        // Transmitted light: the specimen attenuates, it does not emit.
+        // The imaging camera is transmitted-light here; a fluorescence channel would set
+        // an excitation band.
         excitation_um: None,
         blur_limit_px: BLUR_PIXEL_LIMIT,
         time_s: scene.epoch.elapsed().as_secs_f64(),
@@ -1607,7 +2277,7 @@ fn render_image(
 }
 
 fn render_frame(
-    config: &SimMicroscopeConfig,
+    config: &SimPlateReaderConfig,
     scene: SceneState,
     frame_index: u64,
     camera: DeviceId,
@@ -1825,12 +2495,19 @@ fn sequenceable_property(
     schema
 }
 
-fn axis_property(key: &str, display_name: &str, half_travel_um: f64) -> PropertySchema {
+/// A plate-reader stage axis, in *plate* coordinates.
+///
+/// The origin is the plate's own corner rather than the middle of the stage's travel, so a
+/// well centre computed from [`PlateGeometry`] is directly writable. A range centred on
+/// zero — which is what a microscope advertises — would reject every well past the middle
+/// of the plate while `PlateMove` to the same place succeeded, and a stage that accepts a
+/// coordinate one way and refuses it the other is worse than one that simply cannot reach.
+fn plate_axis_property(key: &str, display_name: &str, extent_um: f64) -> PropertySchema {
     let mut schema =
         sequenceable_property(key, display_name, ValueType::Position, Some("um"), true);
     schema.range = Some(Range {
-        min: Value::Position(Position::from_micrometers(-half_travel_um)),
-        max: Value::Position(Position::from_micrometers(half_travel_um)),
+        min: Value::Position(Position::from_micrometers(0.0)),
+        max: Value::Position(Position::from_micrometers(extent_um)),
     });
     schema.increment = Some(Value::Position(Position::from_micrometers(0.1)));
     schema
@@ -1869,6 +2546,122 @@ fn time_property(
         max: Value::TimeInterval(max),
     });
     schema.sequenceable = key == "exposure";
+    schema
+}
+
+/// One detector read, in the instrument's own raw counts.
+#[derive(Debug, Clone, Copy)]
+struct MeasuredCounts {
+    /// Reference-channel counts. Zero for luminescence, which has no reference.
+    reference: u64,
+    /// Signal-channel counts.
+    measurement: u64,
+    wavelength_nm: f64,
+    integration_s: f64,
+}
+
+impl MeasuredCounts {
+    /// The completion map a client reads. Raw counts plus the settings they were taken
+    /// under — never a calibrated value, because deciding what a count means is the
+    /// application's job (NUMANAGER_PLAN.md §4.1).
+    fn completion(&self, well: &str) -> Value {
+        Value::Map(BTreeMap::from([
+            ("well".into(), Value::String(well.into())),
+            ("reference".into(), Value::I64(self.reference as i64)),
+            ("measurement".into(), Value::I64(self.measurement as i64)),
+            (
+                "wavelength".into(),
+                Value::Wavelength(Wavelength::from_nanometers(self.wavelength_nm)),
+            ),
+            (
+                "integration_time".into(),
+                Value::TimeInterval(TimeInterval::from_seconds(self.integration_s)),
+            ),
+        ]))
+    }
+}
+
+fn wavelength_nm(value: &Value) -> Result<f64> {
+    match value {
+        Value::Wavelength(wavelength) => Ok(wavelength.nanometers()),
+        Value::F64(nm) => Ok(*nm),
+        Value::I64(nm) => Ok(*nm as f64),
+        other => Err(Error::new(
+            ErrorCode::InvalidProperty,
+            format!("expected a wavelength, got {other:?}"),
+        )),
+    }
+}
+
+fn temperature_celsius(value: &Value) -> Result<f64> {
+    match value {
+        Value::Temperature(temperature) => Ok(temperature.celsius()),
+        Value::F64(celsius) => Ok(*celsius),
+        other => Err(Error::new(
+            ErrorCode::InvalidProperty,
+            format!("expected a temperature, got {other:?}"),
+        )),
+    }
+}
+
+fn gas_percent(value: &Value) -> Result<f64> {
+    match value {
+        Value::GasConcentration(gas) => Ok(gas.percent()),
+        Value::F64(percent) => Ok(*percent),
+        other => Err(Error::new(
+            ErrorCode::InvalidProperty,
+            format!("expected a gas concentration, got {other:?}"),
+        )),
+    }
+}
+
+fn bool_value(value: &Value) -> Result<bool> {
+    match value {
+        Value::Bool(flag) => Ok(*flag),
+        other => Err(Error::new(
+            ErrorCode::InvalidProperty,
+            format!("expected a boolean, got {other:?}"),
+        )),
+    }
+}
+
+fn wavelength_property(key: &str, display_name: &str, min: f64, max: f64) -> PropertySchema {
+    let mut schema =
+        sequenceable_property(key, display_name, ValueType::Wavelength, Some("nm"), true);
+    schema.range = Some(Range {
+        min: Value::Wavelength(Wavelength::from_nanometers(min)),
+        max: Value::Wavelength(Wavelength::from_nanometers(max)),
+    });
+    schema
+}
+
+fn temperature_property(key: &str, display_name: &str, min: f64, max: f64) -> PropertySchema {
+    let mut schema = sequenceable_property(
+        key,
+        display_name,
+        ValueType::Temperature,
+        Some("degC"),
+        true,
+    );
+    schema.range = Some(Range {
+        min: Value::Temperature(Temperature::from_celsius(min)),
+        max: Value::Temperature(Temperature::from_celsius(max)),
+    });
+    schema
+}
+
+fn gas_property(key: &str, display_name: &str, min: f64, max: f64) -> PropertySchema {
+    let mut schema = sequenceable_property(
+        key,
+        display_name,
+        ValueType::GasConcentration,
+        Some("percent"),
+        true,
+    );
+    schema.range = Some(Range {
+        min: Value::GasConcentration(GasConcentration::from_percent(min)),
+        max: Value::GasConcentration(GasConcentration::from_percent(max)),
+    });
     schema
 }
 
