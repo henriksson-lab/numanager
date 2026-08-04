@@ -2670,8 +2670,13 @@ mod live_velleman {
                 .detach_and_claim_interface(endpoint.interface)
                 .map_err(|error| {
                     usb_error(format!(
-                        "claim Velleman USB interface {} failed: {error}",
-                        endpoint.interface
+                        "claim Velleman USB interface {} failed: {error}{}",
+                        endpoint.interface,
+                        crate::usb_discovery::usb_claim_hint(
+                            endpoint.vendor_id,
+                            endpoint.product_id,
+                            endpoint.interface
+                        )
                     ))
                 })?;
             Ok(Self {

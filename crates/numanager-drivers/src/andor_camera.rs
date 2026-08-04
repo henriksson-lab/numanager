@@ -3217,9 +3217,12 @@ mod live_sdk2 {
         let device = device
             .open()
             .map_err(|error| usb_error(format!("Andor SDK2 USB open failed: {error}")))?;
-        let interface = device
-            .detach_and_claim_interface(0)
-            .map_err(|error| usb_error(format!("Andor SDK2 claim interface 0 failed: {error}")))?;
+        let interface = device.detach_and_claim_interface(0).map_err(|error| {
+            usb_error(format!(
+                "Andor SDK2 claim interface 0 failed: {error}{}",
+                crate::usb_discovery::usb_claim_hint(vendor_id, product_id, 0)
+            ))
+        })?;
         let _ = interface.set_alt_setting(0);
 
         vendor_in(&interface, SDK2_IDENTITY_REQUEST, 0, 0, 6)?;
@@ -3320,9 +3323,12 @@ mod live_sdk2 {
         let device = device
             .open()
             .map_err(|error| usb_error(format!("Andor USB open failed: {error}")))?;
-        let interface = device
-            .detach_and_claim_interface(0)
-            .map_err(|error| usb_error(format!("Andor claim interface 0 failed: {error}")))?;
+        let interface = device.detach_and_claim_interface(0).map_err(|error| {
+            usb_error(format!(
+                "Andor claim interface 0 failed: {error}{}",
+                crate::usb_discovery::usb_claim_hint(vendor_id, product_id, 0)
+            ))
+        })?;
         let _ = interface.set_alt_setting(0);
         Ok(interface)
     }
@@ -3390,12 +3396,14 @@ mod live_sdk2 {
         })?;
         let segments = parse_ihex(&text)?;
         let device = select_fx2_loader(identity)?;
+        let (vendor_id, product_id) = (device.vendor_id(), device.product_id());
         let device = device.open().map_err(|error| {
             usb_error(format!("Andor FX2 firmware-loader open failed: {error}"))
         })?;
         let interface = device.detach_and_claim_interface(0).map_err(|error| {
             usb_error(format!(
-                "Andor FX2 firmware-loader claim interface 0 failed: {error}"
+                "Andor FX2 firmware-loader claim interface 0 failed: {error}{}",
+                crate::usb_discovery::usb_claim_hint(vendor_id, product_id, 0)
             ))
         })?;
         raw_vendor_out(&interface, 0xa0, 0xe600, 0, &[0x01])?;
@@ -3421,12 +3429,14 @@ mod live_sdk2 {
         })?;
         let image = parse_fx3_image(&bytes)?;
         let device = select_loader(identity, CYPRESS_FX3_PID, "FX3")?;
+        let (vendor_id, product_id) = (device.vendor_id(), device.product_id());
         let device = device.open().map_err(|error| {
             usb_error(format!("Andor FX3 firmware-loader open failed: {error}"))
         })?;
         let interface = device.detach_and_claim_interface(0).map_err(|error| {
             usb_error(format!(
-                "Andor FX3 firmware-loader claim interface 0 failed: {error}"
+                "Andor FX3 firmware-loader claim interface 0 failed: {error}{}",
+                crate::usb_discovery::usb_claim_hint(vendor_id, product_id, 0)
             ))
         })?;
         for (base, data) in image.sections {

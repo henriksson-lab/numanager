@@ -2408,14 +2408,18 @@ mod live_toupcam {
                         "no Toupcam USB device found for configured index",
                     )
                 })?;
+            let (vendor_id, product_id) = (device.vendor_id(), device.product_id());
             let device = device.open().map_err(|error| {
                 usb_error(format!(
                     "open failed; another application may hold the camera: {error}"
                 ))
             })?;
-            let iface = device
-                .detach_and_claim_interface(0)
-                .map_err(|error| usb_error(format!("claim interface 0 failed: {error}")))?;
+            let iface = device.detach_and_claim_interface(0).map_err(|error| {
+                usb_error(format!(
+                    "claim interface 0 failed: {error}{}",
+                    crate::usb_discovery::usb_claim_hint(vendor_id, product_id, 0)
+                ))
+            })?;
             let _ = iface.set_alt_setting(0);
             let live = Self { iface };
             live.init()?;

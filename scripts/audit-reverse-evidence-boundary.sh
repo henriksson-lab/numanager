@@ -152,7 +152,9 @@ exported_driver_modules() {
     /^pub mod [a-z0-9_]+;/ {
       module=$3
       sub(/;$/, "", module)
-      if (module == "usb_discovery") {
+      # Host-side USB support modules, not device drivers: they describe no
+      # hardware, so they have no device page or index row.
+      if (module == "usb_discovery" || module == "winusb_access") {
         next
       }
       print module

@@ -1517,8 +1517,13 @@ mod live_mcl {
                 .detach_and_claim_interface(probe.interface)
                 .map_err(|error| {
                     usb_error(format!(
-                        "claim MCL USB interface {} failed: {error}",
-                        probe.interface
+                        "claim MCL USB interface {} failed: {error}{}",
+                        probe.interface,
+                        crate::usb_discovery::usb_claim_hint(
+                            probe.vendor_id,
+                            probe.product_id,
+                            probe.interface
+                        )
                     ))
                 })?;
             Ok(Self { iface })

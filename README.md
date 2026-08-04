@@ -23,6 +23,31 @@ differs from the device page, capture the device model, firmware version,
 configuration, command output, and any hardware log or trace that can anchor a
 fix.
 
+## USB host access
+
+A userspace USB driver can only claim a device the host has granted it. On
+Linux that is a udev rule per vendor id — generate them from
+`numanager_drivers::usb_discovery::builtin_usb_vendor_claims()` rather than
+keeping a list that goes stale. On Windows it is a kernel driver binding: the
+device must be bound to the inbox **WinUSB** driver, which is what Zadig is
+normally used for.
+
+Windows binding is not something numanager does behind your back. A failed
+interface claim reports which driver owns the node and what to do about it, and
+binding WinUSB is a separate, explicit action:
+`numanager_drivers::winusb_access::ensure_access` prompts through an approval
+callback, refuses to proceed without it, and warns loudly when the binding would
+take the device away from a driver that already owns it — including the
+`usbccgp` parent of a composite device, where the right target is one interface
+node (`…&MI_xx`) rather than the whole device. Installing requires an elevated
+process.
+
+It must be WinUSB specifically: the USB backend calls `winusb.dll`'s
+`WinUsb_Initialize` and rejects a node bound to anything else, so libusbK is not
+an alternative. The module is compiled into `numanager-drivers` on Windows
+always; the `winusb` feature builds the same code elsewhere (where every entry
+point reports `Unsupported`) so it can be checked from a non-Windows host.
+
 ## Run Examples
 
 Example commands and recorded outputs are listed in

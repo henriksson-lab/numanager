@@ -39,11 +39,15 @@ cargo run -p numanager-examples --features gui --bin software_gui -- --smoke   #
 `README.md` has the full example table. Feature flags: `os-serial`, `os-hid`,
 and `os-usb` gate real OS transports (default off; drivers otherwise run configured/fixture
 paths), `gui` gates the Slint software-test GUI, and `numanager-spectra` has
-`store` (polars/parquet) and `fetch` (network download).
+`store` (polars/parquet) and `fetch` (network download). `numanager-drivers` also
+has `winusb`, which is needed only off Windows: `numanager-winusb` is a
+target-`cfg` dependency there, so `winusb_access` is always compiled on Windows
+and the feature exists to build it elsewhere against the `Unsupported` entry
+points.
 
 ## Architecture
 
-Four workspace crates, strictly layered:
+Five workspace crates, strictly layered:
 
 - **`numanager-core`** — the whole model and runtime. `lib.rs` (~100k) holds the
   device graph, typed `Value` quantities, `PropertySchema`, `CapabilityKind`/
@@ -56,6 +60,10 @@ Four workspace crates, strictly layered:
 - **`numanager-drivers`** — one flat module per device family (~50 modules), all
   re-exported from `lib.rs`. Deliberately a single consolidated crate; the audit
   script rejects re-splitting it into per-driver crates.
+- **`numanager-winusb`** — Windows USB host access: report which kernel driver
+  owns a device node (SetupAPI), and bind the inbox WinUSB driver to it behind
+  an approval gate (generated INF + self-signed catalog + `newdev`). Depends only
+  on `numanager-core`; `numanager-drivers` consumes it through `winusb_access`.
 - **`numanager-spectra`** — independent: filter/fluorophore spectral curves,
   parquet store, FPbase fetcher. Not part of the device runtime.
 - **`numanager-examples`** — user-facing API documentation in executable form,

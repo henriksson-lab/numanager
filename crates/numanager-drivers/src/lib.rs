@@ -37,7 +37,9 @@ pub mod sim_lsm;
 mod sim_lsm_model;
 pub mod sim_microscope;
 pub mod sim_microscope_lsm;
-mod sim_sample;
+pub mod sim_plate_reader;
+pub mod sim_sample;
+pub mod spark;
 pub mod spark_cyto;
 pub mod spectral_lmm5;
 pub mod squid;
@@ -57,6 +59,10 @@ pub mod trinamic_tmcl;
 pub mod usb3_vision;
 pub mod usb_discovery;
 pub mod velleman;
+/// Windows USB access provisioning. Always compiled on Windows; elsewhere it
+/// needs the `winusb` feature (see the module docs).
+#[cfg(any(windows, feature = "winusb"))]
+pub mod winusb_access;
 pub mod wosm;
 pub mod xeryon;
 pub mod xeryon_canopen;
