@@ -1,22 +1,25 @@
-//! Instrument command-language vocabulary — the typed enum ↔ firmware-keyword
-//! command catalog of the Tecan Spark Cyto (TDCL).
+//! The Spark Cyto command vocabulary: typed enums paired with the exact ASCII tokens the
+//! instrument's command parser accepts.
 //!
-//! Every string here is the exact ASCII token the instrument emits/parses on
-//! the wire, tagged with a `[FirmwareName("…")]`-style attribute in the
-//! protocol definition. Do **not** edit a keyword to "look nicer": the byte
-//! sequence is the contract.
+//! **These are protocol keywords, not firmware.** Nothing here is a firmware image, a
+//! loader or a vendor package; it is the spelling of the words that go over the wire. The
+//! naming says `wire_token` rather than `firmware_name` so that distinction survives being
+//! read quickly in a repository where "firmware" means redistributable vendor binaries.
 //!
-//! Each enum below mirrors one firmware vocabulary: the `Unit` scales, the
-//! module-info/config keyword literals, and the per-subsystem command groupings. This module reproduces that mapping statically, with no
-//! runtime dependency on reflection.
+//! Every string is the exact byte sequence the instrument emits or parses. Do **not** edit
+//! a keyword to look nicer: the bytes are the contract.
 //!
-//! Dependency-free by design (no serde / strum). Each enum offers
-//! `firmware_name(&self) -> &'static str` and `from_firmware_name(&str) -> Option<Self>`.
+//! Dependency-free by design (no serde, no strum). Each enum offers
+//! `wire_token(&self) -> &'static str` and `from_wire_token(&str) -> Option<Self>`.
 
-// Internal helper: generate a firmware-keyword enum with a bidirectional map.
-// `from_firmware_name` returns the first matching variant; enums with a keyword
-// that repeats across variants are written by hand instead (see FluorescenceCarrier).
-macro_rules! fw_enum {
+// Generate a wire-token enum with a bidirectional map.
+//
+// Both directions come from one declaration because writing them separately is how they
+// drift: a token corrected on the encode side and missed on the decode side is a bug that
+// only shows up against hardware. `from_wire_token` returns the first matching variant;
+// enums whose token repeats across variants are written by hand instead (see
+// FluorescenceCarrier).
+macro_rules! wire_enum {
  (
  $(#[$emeta:meta])*
  pub enum $name:ident { $( $(#[$vmeta:meta])* $variant:ident = $fw:literal ),* $(,)? }
@@ -26,12 +29,12 @@ macro_rules! fw_enum {
  pub enum $name { $( $(#[$vmeta])* $variant ),* }
 
  impl $name {
- /// Exact on-wire keyword (from the `[FirmwareName]` attribute).
- pub fn firmware_name(&self) -> &'static str {
+ /// The exact token this variant is spelled as on the wire.
+ pub fn wire_token(&self) -> &'static str {
  match self { $( $name::$variant => $fw ),* }
  }
- /// Parse an on-wire keyword back to its variant.
- pub fn from_firmware_name(s: &str) -> Option<Self> {
+ /// Parse a wire token back to its variant.
+ pub fn from_wire_token(s: &str) -> Option<Self> {
  match s { $( $fw => Some($name::$variant), )* _ => None }
  }
  }
@@ -41,7 +44,7 @@ macro_rules! fw_enum {
 // =============================================================================
 // § Measurement mode — the top-level `MODE=` value
 // =============================================================================
-fw_enum! {
+wire_enum! {
  /// Measurement mode.
  pub enum MeasurementMode {
  Absorbance = "ABS",
@@ -63,7 +66,7 @@ fw_enum! {
 // § Optics — filters / mirrors / carriers / objective / areas
 // =============================================================================
 
-fw_enum! {
+wire_enum! {
  /// Optical filter type.
  /// Filter type.
  pub enum FilterType {
@@ -78,7 +81,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Temperature-controlled devices addressed by `TEMPERATURE DEVICE=…` and
  /// `?SENSORVALUE TEMPERATURE {device}`.
  pub enum TemperatureDevice {
@@ -93,7 +96,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// The two injector pumps, addressed by `PUMP=`.
  pub enum InjectorPump {
  A = "A",
@@ -101,7 +104,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Optical mirror type.
  /// Mirror type.
  pub enum MirrorType {
@@ -116,8 +119,8 @@ fw_enum! {
 
 ///
 ///
-/// Hand-written (not via `fw_enum!`) because `MONO` maps to **two** variants
-/// (`MonochromatorExcitation` and `MonochromatorEmission`); `from_firmware_name`
+/// Hand-written (not via `wire_enum!`) because `MONO` maps to **two** variants
+/// (`MonochromatorExcitation` and `MonochromatorEmission`); `from_wire_token`
 /// resolves `MONO` to `MonochromatorExcitation` (the lower enum value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FluorescenceCarrier {
@@ -129,7 +132,7 @@ pub enum FluorescenceCarrier {
 }
 
 impl FluorescenceCarrier {
-    pub fn firmware_name(&self) -> &'static str {
+    pub fn wire_token(&self) -> &'static str {
         match self {
             FluorescenceCarrier::FilterExcitation => "FILTER_EX",
             FluorescenceCarrier::FilterEmission => "FILTER_EM1",
@@ -138,7 +141,7 @@ impl FluorescenceCarrier {
             FluorescenceCarrier::MonochromatorEmission => "MONO",
         }
     }
-    pub fn from_firmware_name(s: &str) -> Option<Self> {
+    pub fn from_wire_token(s: &str) -> Option<Self> {
         match s {
             "FILTER_EX" => Some(FluorescenceCarrier::FilterExcitation),
             "FILTER_EM1" => Some(FluorescenceCarrier::FilterEmission),
@@ -150,7 +153,7 @@ impl FluorescenceCarrier {
     }
 }
 
-fw_enum! {
+wire_enum! {
  /// Fluorescence measurement direction. Keywords coincide with
  /// `MeasurementMode::FluorescenceTop/Bottom`.
  ///
@@ -160,7 +163,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Physically movable optics carriers.
  pub enum MoveableCarrier {
  ExcitationFilter = "FILTER_EX",
@@ -172,7 +175,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Position of a moveable carrier (in/out).
  /// Moveable carrier position.
  pub enum MoveableCarrierPosition {
@@ -181,7 +184,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// A retractable hardware component.
  /// Retractable.
  pub enum Retractable {
@@ -189,7 +192,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Imaging objective magnification.
  /// Objective type.
  pub enum ObjectiveType {
@@ -200,7 +203,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Microtiter-plate scan area size.
  /// Microtiter-plate scan area size.
  pub enum MtpAreaType {
@@ -214,7 +217,7 @@ fw_enum! {
 // § Light sources
 // =============================================================================
 
-fw_enum! {
+wire_enum! {
  /// Excitation light source. The "colour" names are dual-band excitation
  /// labels, not literal colours.
  ///
@@ -228,7 +231,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// LED hardware class.
  /// LED hardware class.
  pub enum LightingType {
@@ -238,7 +241,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Status-LED colour.
  pub enum LedColor {
  Red = "RED",
@@ -252,7 +255,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Status-LED / instrument state.
  pub enum LedState {
  Off = "OFF",
@@ -272,7 +275,7 @@ fw_enum! {
 // § Plate transport / positions
 // =============================================================================
 
-fw_enum! {
+wire_enum! {
  /// Plate transport position.
  /// Plate position.
  pub enum PlatePosition {
@@ -291,7 +294,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Barcode reader position.
  /// Barcode position.
  pub enum BarcodePosition {
@@ -304,7 +307,7 @@ fw_enum! {
 // § Motion
 // =============================================================================
 
-fw_enum! {
+wire_enum! {
  /// Microtiter-plate stage axis.
  pub enum MtpMotor {
  X = "X",
@@ -313,7 +316,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Stage movement speed.
  /// Movement speed.
  pub enum MovementSpeed {
@@ -330,7 +333,7 @@ fw_enum! {
 // § Temperature / gas / power state
 // =============================================================================
 
-fw_enum! {
+wire_enum! {
  /// Temperature target mode.
  pub enum TargetMode {
  Ambient = "AMBIENT",
@@ -338,7 +341,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Generic on/off state.
  /// Generic on/off.
  pub enum State {
@@ -351,7 +354,7 @@ fw_enum! {
 // § Camera
 // =============================================================================
 
-fw_enum! {
+wire_enum! {
  /// Defines the token order of `CAMERA AOI =x =y =w =h`.
  ///
  pub enum AreaOfInterestProperty {
@@ -362,7 +365,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Camera frame-capture execution result.
  /// Camera execution details.
  pub enum CameraExecutionDetails {
@@ -375,7 +378,7 @@ fw_enum! {
 // § Hardware buttons
 // =============================================================================
 
-fw_enum! {
+wire_enum! {
  /// Front-panel buttons.
  pub enum HardwareButtons {
  StartStop = "START_STOP",
@@ -391,7 +394,7 @@ fw_enum! {
 // § Counters
 // =============================================================================
 
-fw_enum! {
+wire_enum! {
  /// Leading keyword of `?COUNTER …`.
  /// Counter type — the leading keyword of `?COUNTER …`.
  pub enum CounterType {
@@ -400,7 +403,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Hardware wear/usage counters.
  pub enum FirmwareCounter {
  LidLifted = "LIDLIFT_TAKEN",
@@ -424,7 +427,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Driver-side usage counters.
  pub enum SoftwareCounter {
  Plate0001Well = "PLATE_1",
@@ -462,7 +465,7 @@ fw_enum! {
 // § Messages / errors
 // =============================================================================
 
-fw_enum! {
+wire_enum! {
  /// The `MESSAGE TYPE=` value.
  /// Instrument message type — the `MESSAGE TYPE=` value.
  pub enum InstrumentMessageType {
@@ -483,7 +486,7 @@ pub enum DeviceError {
 }
 
 impl DeviceError {
-    pub fn firmware_name(&self) -> &'static str {
+    pub fn wire_token(&self) -> &'static str {
         match self {
             DeviceError::TemperatureSensorReading => "ERR_READING_TEMP_SENSOR",
             DeviceError::InjectorCarrierInserted => "ERR_INJ_CARRIER_INSERTED",
@@ -500,7 +503,7 @@ impl DeviceError {
             DeviceError::GasSignalCorrupt => 1242,
         }
     }
-    pub fn from_firmware_name(s: &str) -> Option<Self> {
+    pub fn from_wire_token(s: &str) -> Option<Self> {
         match s {
             "ERR_READING_TEMP_SENSOR" => Some(DeviceError::TemperatureSensorReading),
             "ERR_INJ_CARRIER_INSERTED" => Some(DeviceError::InjectorCarrierInserted),
@@ -520,11 +523,11 @@ impl DeviceError {
     }
 }
 
-fw_enum! {
+wire_enum! {
  /// The command operation prefix.
  ///
  /// Mirrors [`crate::spark::commands::Op`] (which is the builder-facing form); kept here
- /// for catalog completeness with the exact `[FirmwareName]` tokens.
+ /// for catalog completeness with the exact wire tokens.
  /// The command operation prefix.
  pub enum Prefix {
  /// SET / execute — no prefix character.
@@ -542,7 +545,7 @@ fw_enum! {
 // mode-configuration range reads (`#CONFIG …`-style). Kept for completeness.
 // =============================================================================
 
-fw_enum! {
+wire_enum! {
  /// Absorbance config-range parameter names.
  /// Config-range parameter names.
  pub enum AbsorbanceParam {
@@ -555,7 +558,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Luminescence config-range parameter names.
  /// `TEMP_SLOPE`/`TEMP_INTERCEPT` are the ALPHA temperature-correction terms.
  /// Luminescence config-range parameter names.
@@ -569,7 +572,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Fluorescence config-range parameter names.
  /// Config-range parameter names.
  pub enum FluorescenceParam {
@@ -600,7 +603,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Camera config-range parameter names.
  /// Config-range parameter names.
  pub enum CameraParam {
@@ -612,7 +615,7 @@ fw_enum! {
  }
 }
 
-fw_enum! {
+wire_enum! {
  /// Plate-transport config-range parameter names.
  /// Config-range parameter names.
  pub enum PlateTransportParam {
@@ -632,7 +635,7 @@ fw_enum! {
 // noted below.
 // =============================================================================
 
-/// Physical unit of a range/value reply. `firmware_name` returns the exact
+/// Physical unit of a range/value reply. `wire_token` returns the exact
 /// token the firmware places inside `[...]` (e.g. `ang`, `c100`, `ulPerS`).
 ///
 /// See the per-variant docs for the scale/divisor.
@@ -690,7 +693,7 @@ pub enum Unit {
 
 impl Unit {
     /// Exact on-wire unit token.
-    pub fn firmware_name(&self) -> &'static str {
+    pub fn wire_token(&self) -> &'static str {
         match self {
             Unit::None => "None",
             Unit::Seconds => "s",
@@ -719,7 +722,7 @@ impl Unit {
         }
     }
     /// Parse an on-wire unit token (case-sensitive).
-    pub fn from_firmware_name(s: &str) -> Option<Self> {
+    pub fn from_wire_token(s: &str) -> Option<Self> {
         match s {
             "None" => Some(Unit::None),
             "s" => Some(Unit::Seconds),
@@ -826,8 +829,3 @@ pub mod literals {
         MODULE,
     ];
 }
-
-// =============================================================================
-// § Tests — round-trip firmware_name → from_firmware_name over a representative
-// subset of every enum family.
-// =============================================================================

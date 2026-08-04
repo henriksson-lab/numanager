@@ -18,8 +18,10 @@
 //! Per this repository's rules the modules here carry no inline tests. They are exercised
 //! from `brunnim`'s integration suite, which owns the captures they were derived from.
 
+pub mod backend;
 pub mod catalog;
 pub mod commands;
 pub mod data;
 pub mod parse;
+pub mod session;
 pub mod tdcl;

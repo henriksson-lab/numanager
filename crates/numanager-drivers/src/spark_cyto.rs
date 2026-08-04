@@ -11,11 +11,28 @@
 
 use numanager_core::config::{DeviceConfig, HardwareConfig};
 use numanager_core::runtime::{DriverCandidate, DriverDiscovery};
+use crate::spark::backend::{self, Detector, Intent};
+use crate::spark::session::{BoxedTransport, Progress, SparkSession};
 use numanager_core::*;
 use std::collections::{BTreeMap, VecDeque};
 
+/// The live half of the driver: a session over a real transport, plus what each outstanding
+/// command was for.
+///
+/// Absent by default. Without it the driver answers from its own modeled state, which is
+/// what every existing example relies on; with it, capability requests become TDCL commands
+/// and completion arrives from the instrument instead of immediately.
+struct Backend {
+    session: SparkSession<BoxedTransport, DriverToken>,
+    /// Commands sent and not yet answered, in submission order per token. A token completes
+    /// when its *last* transaction does — setting a wavelength and then measuring is one
+    /// operation to a client, not three.
+    outstanding: VecDeque<(DriverToken, Intent, bool)>,
+}
+
 pub struct SparkCytoDriver {
     id: DriverId,
+    backend: Option<Backend>,
     next_token: u64,
     events: VecDeque<DriverEvent>,
     devices: Vec<DeviceDescriptor>,
@@ -344,6 +361,7 @@ impl SparkCytoDriver {
         ];
         Self {
             id,
+            backend: None,
             next_token: 1,
             events: VecDeque::new(),
             devices,
@@ -394,6 +412,153 @@ impl SparkCytoDriver {
             }
         }
         graph
+    }
+
+    /// Attach a transport, so capability requests become TDCL commands.
+    ///
+    /// Until this is called the driver answers from its own modeled state — which is what
+    /// the examples and the device graph exercise, and what keeps this driver useful with
+    /// no instrument present.
+    pub fn attach(&mut self, transport: impl Transport + 'static) {
+        self.backend = Some(Backend {
+            session: SparkSession::new(BoxedTransport::new(transport)),
+            outstanding: VecDeque::new(),
+        });
+    }
+
+    pub fn detach(&mut self) {
+        self.backend = None;
+    }
+
+    /// Is this driver talking to hardware, or answering from its model?
+    pub fn is_live(&self) -> bool {
+        self.backend.is_some()
+    }
+
+    /// Which detector a device is, for the measurement command.
+    fn detector_of(&self, device: DeviceId) -> Option<Detector> {
+        let descriptor = self.devices.iter().find(|d| d.id == device)?;
+        if descriptor.kinds.iter().any(|k| k == "detector.absorbance") {
+            Some(Detector::Absorbance)
+        } else if descriptor.kinds.iter().any(|k| k == "detector.fluorescence") {
+            Some(Detector::Fluorescence)
+        } else if descriptor.kinds.iter().any(|k| k == "detector.luminescence") {
+            Some(Detector::Luminescence)
+        } else {
+            None
+        }
+    }
+
+    /// Send a capability request to the instrument, if there is one attached and it has a
+    /// command for it.
+    ///
+    /// Returns `true` when the request went to the wire, in which case the token completes
+    /// later from [`Driver::poll`] rather than now.
+    fn dispatch_to_instrument(
+        &mut self,
+        token: DriverToken,
+        device: DeviceId,
+        request: &CapabilityRequest,
+    ) -> Result<bool> {
+        let detector = self.detector_of(device);
+        let wavelength_nm = detector.map(|detector| match detector {
+            Detector::Fluorescence => self.fluorescence_wavelength.nanometers().round() as u32,
+            _ => self.absorbance_wavelength.nanometers().round() as u32,
+        });
+        let well = self.well.clone();
+        let Some(transactions) =
+            backend::plan_request(request, detector, &well, wavelength_nm)
+        else {
+            return Ok(false);
+        };
+        if transactions.is_empty() {
+            return Ok(false);
+        }
+        let Some(backend) = self.backend.as_mut() else {
+            return Ok(false);
+        };
+        let last = transactions.len() - 1;
+        for (index, transaction) in transactions.into_iter().enumerate() {
+            backend
+                .outstanding
+                .push_back((token, transaction.intent, index == last));
+            backend.session.submit(token, transaction.line)?;
+        }
+        Ok(true)
+    }
+
+    /// Drain the session and turn finished transactions into driver events.
+    fn poll_instrument(&mut self) {
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        let progress = match backend.session.poll() {
+            Ok(progress) => progress,
+            Err(error) => {
+                let report = ErrorReport {
+                    code: error.code,
+                    message: error.message.clone(),
+                };
+                // A transport failure ends every command riding on it; completing them
+                // individually would leave a client waiting on the ones that never went.
+                for (token, _, terminal) in backend.outstanding.drain(..) {
+                    if terminal {
+                        self.events.push_back(DriverEvent::TokenFailed {
+                            token,
+                            report: report.clone(),
+                        });
+                    }
+                }
+                return;
+            }
+        };
+
+        for event in progress {
+            match event {
+                Progress::Completed(outcome) => {
+                    let Some((token, intent, terminal)) = backend.outstanding.pop_front() else {
+                        continue;
+                    };
+                    if terminal {
+                        let value = backend::completion(&intent, &outcome);
+                        self.events
+                            .push_back(DriverEvent::TokenCompleted { token, value });
+                    }
+                    let _ = token;
+                }
+                Progress::Failed(failure) => {
+                    // Everything queued behind a failed command belongs to operations that
+                    // will now never run as asked, so they fail with it.
+                    if let Some((token, _, _)) = backend.outstanding.pop_front() {
+                        self.events.push_back(DriverEvent::TokenFailed {
+                            token,
+                            report: ErrorReport {
+                                code: ErrorCode::Driver,
+                                message: match failure.number {
+                                    Some(number) => {
+                                        format!("instrument error {number}: {}", failure.text)
+                                    }
+                                    None => failure.text.clone(),
+                                },
+                            },
+                        });
+                    }
+                }
+                Progress::Busy { .. } => {
+                    // Still working. Nothing to report: the operation stays in progress.
+                }
+                Progress::Asynchronous { number, text } => {
+                    self.events
+                        .push_back(DriverEvent::Event(Event::Log(LogEvent {
+                            driver: Some(self.id),
+                            message: match number {
+                                Some(number) => format!("Spark fault {number}: {text}"),
+                                None => format!("Spark fault: {text}"),
+                            },
+                        })));
+                }
+            }
+        }
     }
 
     fn next_token(&mut self) -> DriverToken {
@@ -1131,6 +1296,10 @@ impl Driver for SparkCytoDriver {
         let token = self.next_token();
         let command_count = prepared.commands.len() as i64;
         let mut last = Value::Null;
+        // With an instrument attached, a capability request goes to the wire and the token
+        // completes from `poll` when the instrument says so. Without one, the modeled path
+        // below answers immediately, exactly as it always has.
+        let mut deferred = false;
         for command in prepared.commands {
             match command {
                 Command::ReadProperty { device, key } => {
@@ -1148,7 +1317,15 @@ impl Driver for SparkCytoDriver {
                     capability,
                     request,
                 } => {
-                    last = self.invoke_capability(device, capability, request)?;
+                    if self.dispatch_to_instrument(token, device, &request)? {
+                        // The instrument owns this one now. Local state is still updated so
+                        // property reads stay consistent with what was asked for; the
+                        // completion value comes from the reply, not from here.
+                        let _ = self.invoke_capability(device, capability, request);
+                        deferred = true;
+                    } else {
+                        last = self.invoke_capability(device, capability, request)?;
+                    }
                 }
                 Command::Arm(_) | Command::Start(_) | Command::Stop(_) => unreachable!(),
             }
@@ -1162,21 +1339,24 @@ impl Driver for SparkCytoDriver {
                     prepared.physical_transactions.len()
                 ),
             })));
-        self.events.push_back(DriverEvent::TokenCompleted {
-            token,
-            value: Value::Map(BTreeMap::from([
-                ("commands".into(), Value::I64(command_count)),
-                (
-                    "physical_transactions".into(),
-                    Value::I64(prepared.physical_transactions.len() as i64),
-                ),
-                ("result".into(), last),
-            ])),
-        });
+        if !deferred {
+            self.events.push_back(DriverEvent::TokenCompleted {
+                token,
+                value: Value::Map(BTreeMap::from([
+                    ("commands".into(), Value::I64(command_count)),
+                    (
+                        "physical_transactions".into(),
+                        Value::I64(prepared.physical_transactions.len() as i64),
+                    ),
+                    ("result".into(), last),
+                ])),
+            });
+        }
         Ok(token)
     }
 
     fn poll(&mut self) -> Vec<DriverEvent> {
+        self.poll_instrument();
         self.events.drain(..).collect()
     }
 
