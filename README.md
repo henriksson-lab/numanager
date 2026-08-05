@@ -118,7 +118,7 @@ record enough protocol evidence for an implementation.
 | [Photometrics/QImaging PVCAM cameras](docs/devices/photometrics-pvcam.md) | USB discovery, verified PVCAM runtime discovery, one-shot capture, repeated-capture stream, and temperature setpoint control | - |
 | [PI GCS/GCS2](docs/devices/pi-gcs.md) | Serial stage motion/home/stop, servo/profile/reference/status readback, typed velocity/acceleration settings, and timing endpoint hooks | - |
 | [Prior ProScan/OptiScan](docs/devices/prior.md) | Serial stage, NanoScan Z, filter, shutter, TTL, Lumen, native speed/acceleration, and readback helpers | - |
-| [Spark Cyto](docs/devices/spark-cyto.md) | TDCL/CAN graph and transaction model for plate, detector, environment, imaging-head, and camera-binding workflows | - |
+| [Spark Cyto](docs/devices/spark-cyto.md) | TDCL over USB for plate, detector, environment, motion, optics-carrier, injector, barcode, imaging-head, and camera workflows, including image capture over the TDCL data channel; the reader's USB id is configured because it is not evidenced | - |
 | [Spectral LMM5](docs/devices/spectral-lmm5.md) | Serial light-source control and readback | - |
 | [Standa 8SMC4](docs/devices/standa.md) | Serial single-axis motion, status, and settings readback | - |
 | [Starlight Xpress filter wheels](docs/devices/starlight-xpress.md) | Spec-backed serial and explicit/autodiscovered USB HID control | - |

@@ -9,12 +9,13 @@
 //! What remains here is the part that was always right: the device graph, its typed
 //! capabilities and its properties.
 
+use crate::spark::backend::{self, Detector, Intent};
+use crate::spark::catalog::{MoveableCarrier, MtpMotor};
+use crate::spark::session::{BoxedTransport, Progress, SparkSession};
 use numanager_core::config::{DeviceConfig, HardwareConfig};
 use numanager_core::runtime::{DriverCandidate, DriverDiscovery};
-use crate::spark::backend::{self, Detector, Intent};
-use crate::spark::session::{BoxedTransport, Progress, SparkSession};
 use numanager_core::*;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// The live half of the driver: a session over a real transport, plus what each outstanding
 /// command was for.
@@ -28,6 +29,13 @@ struct Backend {
     /// when its *last* transaction does — setting a wavelength and then measuring is one
     /// operation to a client, not three.
     outstanding: VecDeque<(DriverToken, Intent, bool)>,
+    /// What each in-flight operation has learned so far.
+    ///
+    /// The transaction that *answers* an operation is rarely its last one: a measurement ends
+    /// with `MEASUREMENT END`, which acknowledges and says nothing, while the counts arrived
+    /// two commands earlier. Completing with whatever the final command happened to return
+    /// would hand back `acknowledged: true` and drop the reading.
+    results: HashMap<DriverToken, BTreeMap<String, Value>>,
 }
 
 pub struct SparkCytoDriver {
@@ -46,10 +54,45 @@ pub struct SparkCytoDriver {
     fluorescence_enabled: bool,
     temperature_target: Temperature,
     temperature_enabled: bool,
+    /// Chamber temperature as the instrument last reported it.
+    ///
+    /// `None` means nothing has been read. On a live instrument that is the state until the
+    /// first `SENSORVALUE` reply arrives, and it is reported as `Null` rather than falling
+    /// back to the setpoint — a setpoint presented as a reading is how an incubator that is
+    /// not heating looks exactly like one that is.
+    temperature_actual: Option<Temperature>,
     gas_target: GasConcentration,
-    gas_actual: GasConcentration,
+    gas_actual: Option<GasConcentration>,
+    o2_target: GasConcentration,
+    o2_actual: Option<GasConcentration>,
     gas_enabled: bool,
     gas_fault: bool,
+    /// Which unit each motion axis counts in, once its range reply has said so.
+    axis_units: BTreeMap<StageAxis, backend::AxisUnit>,
+    /// Last position readback per axis, in the unit that axis declared.
+    axis_positions: BTreeMap<StageAxis, f64>,
+    /// Selected position per optics carrier, keyed by device node.
+    carrier_positions: BTreeMap<u64, u8>,
+    /// How many positions each carrier's fitted slide has, keyed by its wire name.
+    carrier_slots: BTreeMap<String, u8>,
+    /// What each carrier reported is fitted to it, verbatim.
+    carrier_inventory: BTreeMap<String, String>,
+    barcode: Option<String>,
+    camera: backend::CameraState,
+    shake_mode: String,
+    shake_amplitude: Position,
+    shake_frequency: Frequency,
+    lid_state: String,
+    autofocus: Option<(f64, f64)>,
+    /// What the instrument said it is, once asked.
+    identity: BTreeMap<String, String>,
+    camera_exposure: TimeInterval,
+    next_frame: u64,
+    modules: backend::Modules,
+    /// The label index a `SCAN` reports its readings under.
+    label_index: u32,
+    /// How to reach the reader over USB, when a configuration says.
+    usb: Option<crate::spark::usb::UsbConfig>,
     fim_objective: i64,
     fim_mode: String,
     fim_interlock_closed: bool,
@@ -124,6 +167,8 @@ pub struct SparkCytoConfiguredProbe {
     temperature_enabled: bool,
     gas_target: GasConcentration,
     gas_actual: GasConcentration,
+    o2_target: GasConcentration,
+    o2_actual: GasConcentration,
     gas_enabled: bool,
     gas_fault: bool,
     fim_objective: i64,
@@ -132,6 +177,12 @@ pub struct SparkCytoConfiguredProbe {
     fim_fault: bool,
     camera_bound: bool,
     imaging_mode: String,
+    /// The reader's USB identity. Absent by default: it is not in the recovered evidence,
+    /// and a driver that guessed one would open whatever device happened to carry it.
+    vendor_id: Option<u16>,
+    product_id: Option<u16>,
+    /// CAN module numbers, which are assigned at enumeration rather than fixed.
+    modules: backend::Modules,
 }
 
 impl SparkCytoConfiguredProbe {
@@ -148,6 +199,9 @@ impl SparkCytoConfiguredProbe {
             temperature_enabled: false,
             gas_target: GasConcentration::from_percent(5.0),
             gas_actual: GasConcentration::from_percent(0.04),
+            // Ambient air, which is where an unpressurised chamber sits.
+            o2_target: GasConcentration::from_percent(21.0),
+            o2_actual: GasConcentration::from_percent(21.0),
             gas_enabled: false,
             gas_fault: false,
             fim_objective: 1,
@@ -156,6 +210,9 @@ impl SparkCytoConfiguredProbe {
             fim_fault: false,
             camera_bound: false,
             imaging_mode: "brightfield".into(),
+            vendor_id: None,
+            product_id: None,
+            modules: backend::Modules::default(),
         }
     }
 
@@ -182,6 +239,8 @@ impl SparkCytoConfiguredProbe {
             bool_prop(device, "temperature_enabled").unwrap_or(configured.temperature_enabled);
         configured.gas_target = gas_prop(device, "co2_target").unwrap_or(configured.gas_target);
         configured.gas_actual = gas_prop(device, "co2_actual").unwrap_or(configured.gas_actual);
+        configured.o2_target = gas_prop(device, "o2_target").unwrap_or(configured.o2_target);
+        configured.o2_actual = gas_prop(device, "o2_actual").unwrap_or(configured.o2_actual);
         configured.gas_enabled = bool_prop(device, "gas_enabled").unwrap_or(configured.gas_enabled);
         configured.gas_fault = bool_prop(device, "gas_fault").unwrap_or(configured.gas_fault);
         configured.fim_objective =
@@ -194,6 +253,16 @@ impl SparkCytoConfiguredProbe {
             bool_prop(device, "camera_bound").unwrap_or(configured.camera_bound);
         configured.imaging_mode =
             string_prop(device, "imaging_mode").unwrap_or(configured.imaging_mode);
+        configured.vendor_id = u16_prop(device, "vendor_id");
+        configured.product_id = u16_prop(device, "product_id");
+        configured.modules = backend::Modules {
+            imaging: u32_prop(device, "imaging_module"),
+            injector: u32_prop(device, "injector_module"),
+            gas: u32_prop(device, "gas_module"),
+            barcode: u32_prop(device, "barcode_module"),
+            // Which imaging module is fitted is discovered, not configured.
+            cell_imaging: false,
+        };
         Ok(configured)
     }
 
@@ -227,6 +296,22 @@ impl SparkCytoDriver {
                         None,
                         false,
                     ),
+                    property(
+                        "instrument_type",
+                        "Instrument type",
+                        ValueType::String,
+                        None,
+                        false,
+                    ),
+                    property(
+                        "hardware_version",
+                        "Hardware version",
+                        ValueType::String,
+                        None,
+                        false,
+                    ),
+                    property("state", "State", ValueType::String, None, false),
+                    property("modules", "Modules", ValueType::String, None, false),
                 ],
             ),
             descriptor(
@@ -288,6 +373,13 @@ impl SparkCytoDriver {
                         Some("degC"),
                         true,
                     ),
+                    property(
+                        "actual",
+                        "Actual",
+                        ValueType::Temperature,
+                        Some("degC"),
+                        false,
+                    ),
                     sequenceable_property("enabled", "Enabled", ValueType::Bool, None, true),
                 ],
             ),
@@ -308,6 +400,20 @@ impl SparkCytoDriver {
                     property(
                         "co2_actual",
                         "CO2 actual",
+                        ValueType::GasConcentration,
+                        Some("percent"),
+                        false,
+                    ),
+                    sequenceable_property(
+                        "o2_target",
+                        "O2 target",
+                        ValueType::GasConcentration,
+                        Some("percent"),
+                        true,
+                    ),
+                    property(
+                        "o2_actual",
+                        "O2 actual",
                         ValueType::GasConcentration,
                         Some("percent"),
                         false,
@@ -358,7 +464,160 @@ impl SparkCytoDriver {
                     ),
                 ],
             ),
+            // The imaging module's axes. Focus is motion on this instrument, not a camera
+            // setting: the objective's height is an ordinary axis addressed with `ABSOLUTE`,
+            // which is why a viewer can drive it by hand.
+            descriptor(
+                id,
+                308,
+                "spark-stage-xy",
+                configured.serial_number.clone(),
+                &["stage.xy", "axis.xy"],
+                vec![
+                    property("x", "X", ValueType::Position, Some("um"), false),
+                    property("y", "Y", ValueType::Position, Some("um"), false),
+                    property("unit", "Axis unit", ValueType::String, None, false),
+                ],
+            ),
+            descriptor(
+                id,
+                309,
+                "spark-stage-z",
+                configured.serial_number.clone(),
+                &["stage.z", "axis.z"],
+                vec![
+                    property("z", "Z", ValueType::Position, Some("um"), false),
+                    property("unit", "Axis unit", ValueType::String, None, false),
+                ],
+            ),
+            descriptor(
+                id,
+                310,
+                "spark-filter-excitation",
+                configured.serial_number.clone(),
+                &["filter.wheel"],
+                vec![
+                    sequenceable_property("position", "Position", ValueType::I64, None, true),
+                    property("slots", "Positions fitted", ValueType::I64, None, false),
+                    property("fitted", "Fitted slide", ValueType::String, None, false),
+                ],
+            ),
+            descriptor(
+                id,
+                311,
+                "spark-mirror",
+                configured.serial_number.clone(),
+                &["mirror.turret"],
+                vec![
+                    sequenceable_property("position", "Position", ValueType::I64, None, true),
+                    property("slots", "Positions fitted", ValueType::I64, None, false),
+                    property("fitted", "Fitted carrier", ValueType::String, None, false),
+                ],
+            ),
+            // One device for both pumps: the request names which pump acts, so a device per
+            // pump would ask the same question twice and let the two answers disagree.
+            descriptor(
+                id,
+                312,
+                "spark-injector",
+                configured.serial_number.clone(),
+                &["injector"],
+                vec![property("pumps", "Pumps", ValueType::String, None, false)],
+            ),
+            // The imaging camera, as the reader presents it. Its pixels come back over the
+            // TDCL data channel in answer to `CAMERA TAKEIMAGE`, the same 0x88 header plus
+            // 0x83 payload framing a measurement package uses — so the camera is reachable
+            // through the reader without touching the vendor camera SDK.
+            descriptor(
+                id,
+                315,
+                "spark-camera",
+                configured.serial_number.clone(),
+                &["camera"],
+                vec![
+                    sequenceable_property(
+                        "exposure",
+                        "Exposure",
+                        ValueType::TimeInterval,
+                        Some("s"),
+                        true,
+                    ),
+                    property("width", "Width", ValueType::PixelCount, None, false),
+                    property("height", "Height", ValueType::PixelCount, None, false),
+                    property(
+                        "pixel_format",
+                        "Pixel format",
+                        ValueType::String,
+                        None,
+                        false,
+                    ),
+                ],
+            ),
+            descriptor(
+                id,
+                316,
+                "spark-shaker",
+                configured.serial_number.clone(),
+                &["shaker"],
+                vec![
+                    sequenceable_property("mode", "Mode", ValueType::String, None, true),
+                    sequenceable_property(
+                        "amplitude",
+                        "Amplitude",
+                        ValueType::Position,
+                        Some("um"),
+                        true,
+                    ),
+                    sequenceable_property(
+                        "frequency",
+                        "Frequency",
+                        ValueType::Frequency,
+                        Some("Hz"),
+                        true,
+                    ),
+                ],
+            ),
+            descriptor(
+                id,
+                317,
+                "spark-lid",
+                configured.serial_number.clone(),
+                &["lid"],
+                vec![sequenceable_property(
+                    "state",
+                    "State",
+                    ValueType::String,
+                    None,
+                    true,
+                )],
+            ),
+            descriptor(
+                id,
+                318,
+                "spark-autofocus",
+                configured.serial_number.clone(),
+                &["autofocus"],
+                vec![
+                    property("max_value", "Peak value", ValueType::F64, None, false),
+                    property("std_dev", "Peak spread", ValueType::F64, None, false),
+                ],
+            ),
+            descriptor(
+                id,
+                314,
+                "spark-barcode",
+                configured.serial_number.clone(),
+                &["barcode.reader"],
+                vec![property(
+                    "barcode",
+                    "Barcode",
+                    ValueType::String,
+                    None,
+                    false,
+                )],
+            ),
         ];
+        let serial = configured.serial_number.clone();
         Self {
             id,
             backend: None,
@@ -376,8 +635,11 @@ impl SparkCytoDriver {
             fluorescence_enabled: configured.fluorescence_enabled,
             temperature_target: configured.temperature_target,
             temperature_enabled: configured.temperature_enabled,
+            temperature_actual: Some(configured.temperature_target),
             gas_target: configured.gas_target,
-            gas_actual: configured.gas_actual,
+            gas_actual: Some(configured.gas_actual),
+            o2_target: configured.o2_target,
+            o2_actual: Some(configured.o2_actual),
             gas_enabled: configured.gas_enabled,
             gas_fault: configured.gas_fault,
             fim_objective: configured.fim_objective,
@@ -386,6 +648,33 @@ impl SparkCytoDriver {
             fim_fault: configured.fim_fault,
             camera_bound: configured.camera_bound,
             imaging_mode: configured.imaging_mode,
+            axis_units: BTreeMap::new(),
+            axis_positions: BTreeMap::new(),
+            carrier_positions: BTreeMap::from([(310, 1), (311, 1)]),
+            carrier_slots: BTreeMap::new(),
+            carrier_inventory: BTreeMap::new(),
+            barcode: None,
+            shake_mode: "LINEAR".into(),
+            shake_amplitude: Position::from_micrometers(2000.0),
+            shake_frequency: Frequency::from_hertz(6.0),
+            lid_state: "DOWN".into(),
+            autofocus: None,
+            identity: BTreeMap::new(),
+            camera: backend::CameraState {
+                exposure_us: Some(10_000),
+                ..backend::CameraState::default()
+            },
+            camera_exposure: TimeInterval::from_milliseconds(10.0),
+            next_frame: 0,
+            modules: configured.modules,
+            label_index: 1,
+            usb: configured
+                .vendor_id
+                .zip(configured.product_id)
+                .map(|(vendor_id, product_id)| crate::spark::usb::UsbConfig {
+                    serial: serial.clone(),
+                    ..crate::spark::usb::UsbConfig::new(vendor_id, product_id)
+                }),
         }
     }
 
@@ -423,7 +712,48 @@ impl SparkCytoDriver {
         self.backend = Some(Backend {
             session: SparkSession::new(BoxedTransport::new(transport)),
             outstanding: VecDeque::new(),
+            results: HashMap::new(),
         });
+        // Everything the model was standing in for is now the instrument's to say. Readings
+        // in particular: a modeled chamber temperature carried past this point would be
+        // presented as a measurement of hardware nobody has asked yet.
+        self.temperature_actual = None;
+        self.gas_actual = None;
+        self.o2_actual = None;
+        self.axis_units.clear();
+        self.axis_positions.clear();
+        self.barcode = None;
+        self.carrier_slots.clear();
+        self.carrier_inventory.clear();
+        self.identity.clear();
+        self.modules = backend::Modules::default();
+        // Ask what this is and which modules it carries first. Everything else is addressed
+        // *at* a module, so the rest of the bring-up waits for the enumeration to answer.
+        let _ = self.identify();
+    }
+
+    /// Open the configured reader over USB and attach it.
+    ///
+    /// Fails when no USB identity is configured, which is the state until someone runs
+    /// `lsusb -v` on an instrument: the id is not in the recovered evidence and this driver
+    /// has none to fall back on.
+    pub fn connect(&mut self) -> Result<()> {
+        let config = self.usb.clone().ok_or_else(|| {
+            Error::new(
+                ErrorCode::InvalidProperty,
+                "this Spark Cyto has no configured USB vendor/product id, so there is nothing \
+                 to open; see docs/devices/spark-cyto.md for the config keys and \
+                 docs/reverse/spark-cyto.md for how to find the id",
+            )
+        })?;
+        let transport = crate::spark::usb::UsbTransport::open(&config)?;
+        self.attach(transport);
+        Ok(())
+    }
+
+    /// How this driver would reach the instrument, for a client that wants to report it.
+    pub fn usb_config(&self) -> Option<&crate::spark::usb::UsbConfig> {
+        self.usb.as_ref()
     }
 
     pub fn detach(&mut self) {
@@ -440,12 +770,100 @@ impl SparkCytoDriver {
         let descriptor = self.devices.iter().find(|d| d.id == device)?;
         if descriptor.kinds.iter().any(|k| k == "detector.absorbance") {
             Some(Detector::Absorbance)
-        } else if descriptor.kinds.iter().any(|k| k == "detector.fluorescence") {
+        } else if descriptor
+            .kinds
+            .iter()
+            .any(|k| k == "detector.fluorescence")
+        {
             Some(Detector::Fluorescence)
-        } else if descriptor.kinds.iter().any(|k| k == "detector.luminescence") {
+        } else if descriptor
+            .kinds
+            .iter()
+            .any(|k| k == "detector.luminescence")
+        {
             Some(Detector::Luminescence)
         } else {
             None
+        }
+    }
+
+    /// What a device is to the instrument, from the kind tags it publishes.
+    fn subject_of(&self, device: DeviceId) -> Option<backend::Subject> {
+        let descriptor = self.devices.iter().find(|d| d.id == device)?;
+        let has = |kind: &str| descriptor.kinds.iter().any(|k| k == kind);
+        if has("plate.transport") {
+            return Some(backend::Subject::PlateTransport);
+        }
+        if let Some(detector) = self.detector_of(device) {
+            return Some(backend::Subject::Detector(detector));
+        }
+        if has("environment.temperature") {
+            return Some(backend::Subject::Temperature);
+        }
+        if has("environment.gas") {
+            return Some(backend::Subject::Gas);
+        }
+        if has("imaging.head") || has("objective.turret") {
+            return Some(backend::Subject::ImagingHead);
+        }
+        if has("camera.binding") {
+            return Some(backend::Subject::CameraBinding);
+        }
+        if has("axis.xy") {
+            return Some(backend::Subject::Axes(vec![MtpMotor::X, MtpMotor::Y]));
+        }
+        if has("axis.z") {
+            return Some(backend::Subject::Axes(vec![MtpMotor::Z]));
+        }
+        if has("filter.wheel") {
+            return Some(backend::Subject::Carrier(MoveableCarrier::ExcitationFilter));
+        }
+        if has("mirror.turret") {
+            return Some(backend::Subject::Carrier(MoveableCarrier::Mirror));
+        }
+        if has("injector") {
+            return Some(backend::Subject::Injector);
+        }
+        if has("barcode.reader") {
+            return Some(backend::Subject::Barcode);
+        }
+        if has("camera") {
+            return Some(backend::Subject::Camera);
+        }
+        if has("shaker") {
+            return Some(backend::Subject::Shaker);
+        }
+        if has("autofocus") {
+            return Some(backend::Subject::Autofocus);
+        }
+        if has("lid") {
+            return Some(backend::Subject::Lid);
+        }
+        None
+    }
+
+    /// Driver-side state the planner needs and a request does not carry.
+    fn plan_state(&self, device: DeviceId) -> backend::PlanState {
+        let wavelength_nm = self
+            .detector_of(device)
+            .and_then(|detector| match detector {
+                Detector::Absorbance => {
+                    Some(self.absorbance_wavelength.nanometers().round() as u32)
+                }
+                Detector::Fluorescence => {
+                    Some(self.fluorescence_wavelength.nanometers().round() as u32)
+                }
+                // Luminescence has no excitation and tunes nothing.
+                Detector::Luminescence => None,
+            });
+        backend::PlanState {
+            well: self.well.clone(),
+            wavelength_nm,
+            label: self.label_index,
+            axis_units: self.axis_units.clone(),
+            carrier_slots: self.carrier_slots.clone(),
+            modules: self.modules.clone(),
+            camera: self.camera,
         }
     }
 
@@ -453,38 +871,170 @@ impl SparkCytoDriver {
     /// command for it.
     ///
     /// Returns `true` when the request went to the wire, in which case the token completes
-    /// later from [`Driver::poll`] rather than now.
+    /// later from [`Driver::poll`] rather than now. An attached instrument that has no
+    /// command for the request is an error, not a fallback: answering it from the model
+    /// would report a state the hardware was never asked to reach.
     fn dispatch_to_instrument(
         &mut self,
         token: DriverToken,
         device: DeviceId,
         request: &CapabilityRequest,
     ) -> Result<bool> {
-        let detector = self.detector_of(device);
-        let wavelength_nm = detector.map(|detector| match detector {
-            Detector::Fluorescence => self.fluorescence_wavelength.nanometers().round() as u32,
-            _ => self.absorbance_wavelength.nanometers().round() as u32,
-        });
-        let well = self.well.clone();
-        let Some(transactions) =
-            backend::plan_request(request, detector, &well, wavelength_nm)
-        else {
+        if self.backend.is_none() {
             return Ok(false);
+        }
+        let Some(subject) = self.subject_of(device) else {
+            return Ok(false);
+        };
+        let state = self.plan_state(device);
+        let transactions = match backend::plan_request(request, &subject, &state) {
+            backend::Planned::Wire(transactions) => transactions,
+            backend::Planned::Local => return Ok(false),
+            backend::Planned::Unsupported(reason) => {
+                return Err(Error::new(ErrorCode::Unsupported, reason))
+            }
         };
         if transactions.is_empty() {
             return Ok(false);
         }
-        let Some(backend) = self.backend.as_mut() else {
+        self.submit(token, transactions)?;
+        Ok(true)
+    }
+
+    /// Send a property write to the instrument, if there is one attached and it has a command
+    /// for that property.
+    ///
+    /// Without this a live driver would accept `wavelength` or `target`, change a number in
+    /// memory and send nothing — the hardware would only find out at the next capability
+    /// request that happened to carry the value along. A write is an instruction, and the
+    /// instrument should hear it when it is given.
+    fn write_to_instrument(
+        &mut self,
+        token: DriverToken,
+        device: DeviceId,
+        key: &str,
+        value: &Value,
+    ) -> Result<bool> {
+        if self.backend.is_none() {
+            return Ok(false);
+        }
+        let Some(subject) = self.subject_of(device) else {
             return Ok(false);
         };
-        let last = transactions.len() - 1;
+        let state = self.plan_state(device);
+        // The lid is a state write with a command of its own rather than a capability.
+        if let (backend::Subject::Lid, Value::String(lid_state)) = (&subject, value) {
+            let transaction = backend::lid_command(&lid_state.trim().to_ascii_uppercase(), None);
+            self.submit(token, vec![transaction])?;
+            return Ok(true);
+        }
+        let transactions = match backend::plan_write(&subject, key, value, &state) {
+            backend::Planned::Wire(transactions) => transactions,
+            backend::Planned::Local => return Ok(false),
+            backend::Planned::Unsupported(reason) => {
+                return Err(Error::new(ErrorCode::Unsupported, reason))
+            }
+        };
+        if transactions.is_empty() {
+            return Ok(false);
+        }
+        self.submit(token, transactions)?;
+        Ok(true)
+    }
+
+    /// Queue transactions on the attached session, completing the token with the last one.
+    fn submit(
+        &mut self,
+        token: DriverToken,
+        transactions: Vec<backend::Transaction>,
+    ) -> Result<()> {
+        let Some(backend) = self.backend.as_mut() else {
+            return Ok(());
+        };
+        let last = transactions.len().saturating_sub(1);
         for (index, transaction) in transactions.into_iter().enumerate() {
             backend
                 .outstanding
                 .push_back((token, transaction.intent, index == last));
             backend.session.submit(token, transaction.line)?;
         }
-        Ok(true)
+        Ok(())
+    }
+
+    /// Ask what the instrument is and which modules it carries.
+    ///
+    /// Submitted under a token nobody waits on. When the enumeration answers, the rest of the
+    /// bring-up follows from [`Self::refresh`] — commands that name a module cannot be built
+    /// before the module numbers are known.
+    pub fn identify(&mut self) -> Result<()> {
+        if self.backend.is_none() {
+            return Ok(());
+        }
+        let token = self.next_token();
+        let mut transactions = backend::identity_reads();
+        transactions.extend(backend::module_reads());
+        self.submit(token, transactions)
+    }
+
+    /// The wire name of the carrier a device stands for.
+    fn carrier_name(&self, device: DeviceId) -> Option<&'static str> {
+        match self.subject_of(device) {
+            Some(backend::Subject::Carrier(carrier)) => Some(carrier.wire_token()),
+            _ => None,
+        }
+    }
+
+    fn identity_value(&self, key: &str) -> Value {
+        optional(self.identity.get(key).cloned().map(Value::String))
+    }
+
+    /// The modules this driver knows the numbers for, for the hub's readback.
+    fn module_summary(&self) -> String {
+        let modules = &self.modules;
+        let mut parts = Vec::new();
+        for (name, number) in [
+            (
+                if modules.cell_imaging { "CELL" } else { "FIM" },
+                modules.imaging,
+            ),
+            ("INJ", modules.injector),
+            ("GCM", modules.gas),
+            ("BARCODE", modules.barcode),
+        ] {
+            if let Some(number) = number {
+                parts.push(format!("{name}:{number}"));
+            }
+        }
+        if parts.is_empty() {
+            // Not "none fitted" — nobody has asked yet, or the answer has not arrived.
+            return "unknown".into();
+        }
+        parts.join("|")
+    }
+
+    /// Ask the instrument what it is doing: the chamber sensors, the axis units and the axis
+    /// positions.
+    ///
+    /// Submitted under a token nobody is waiting on, because these answer properties rather
+    /// than an operation. The axis-unit query is what lets a position be commanded in
+    /// micrometres at all; until it answers, a move is refused rather than guessed.
+    pub fn refresh(&mut self) -> Result<()> {
+        if self.backend.is_none() {
+            return Ok(());
+        }
+        let token = self.next_token();
+        let mut transactions = backend::environment_reads(&self.modules);
+        transactions.extend(backend::axis_range_reads(
+            &[MtpMotor::X, MtpMotor::Y, MtpMotor::Z],
+            &self.modules,
+        ));
+        transactions.push(backend::position_read(&self.modules));
+        transactions.extend(backend::camera_reads(&self.modules));
+        transactions.extend(backend::inventory_reads(&[
+            MoveableCarrier::ExcitationFilter,
+            MoveableCarrier::Mirror,
+        ]));
+        self.submit(token, transactions)
     }
 
     /// Drain the session and turn finished transactions into driver events.
@@ -501,6 +1051,7 @@ impl SparkCytoDriver {
                 };
                 // A transport failure ends every command riding on it; completing them
                 // individually would leave a client waiting on the ones that never went.
+                backend.results.clear();
                 for (token, _, terminal) in backend.outstanding.drain(..) {
                     if terminal {
                         self.events.push_back(DriverEvent::TokenFailed {
@@ -513,23 +1064,109 @@ impl SparkCytoDriver {
             }
         };
 
+        // What the replies said about state, applied after the borrow on the session ends.
+        let mut readbacks: Vec<(backend::Intent, Value)> = Vec::new();
         for event in progress {
             match event {
                 Progress::Completed(outcome) => {
                     let Some((token, intent, terminal)) = backend.outstanding.pop_front() else {
                         continue;
                     };
+                    let value = backend::completion(&intent, &outcome);
+                    // Anything that is not a bare acknowledgement is part of the answer.
+                    // A reference read is nested rather than merged: it reports the same
+                    // `reference`/`measurement` keys as the sample read, and flattening the
+                    // two would silently overwrite the blank with the sample.
+                    match (&intent, &value) {
+                        (backend::Intent::Acknowledge, _) => {}
+                        (backend::Intent::Prepare { .. }, value) => {
+                            backend
+                                .results
+                                .entry(token)
+                                .or_default()
+                                .insert("prepare".into(), value.clone());
+                        }
+                        (_, Value::Map(map)) => {
+                            backend
+                                .results
+                                .entry(token)
+                                .or_default()
+                                .extend(map.clone());
+                        }
+                        (_, value) => {
+                            backend
+                                .results
+                                .entry(token)
+                                .or_default()
+                                .insert("result".into(), value.clone());
+                        }
+                    }
+                    // An acquisition's payload is the raster itself. Publish it as a frame
+                    // before completing the operation, so a client that wakes on the
+                    // completion finds the image already in the store.
+                    if let backend::Intent::Capture {
+                        width,
+                        height,
+                        bits_per_pixel,
+                    } = intent
+                    {
+                        let device = DeviceId(NodeId(315));
+                        match backend::decode_image(&outcome, width, height, bits_per_pixel) {
+                            Ok(data) => {
+                                let frame = self.next_frame;
+                                self.next_frame += 1;
+                                self.events.push_back(DriverEvent::FrameReady(Frame {
+                                    handle: FrameHandle {
+                                        stream: StreamId(315),
+                                        frame: FrameId(frame),
+                                    },
+                                    device,
+                                    width,
+                                    height,
+                                    pixel_format: backend::pixel_format(bits_per_pixel).into(),
+                                    data,
+                                    metadata: BTreeMap::from([
+                                        (
+                                            "exposure".into(),
+                                            Value::TimeInterval(self.camera_exposure),
+                                        ),
+                                        (
+                                            "bits_per_pixel".into(),
+                                            Value::I64(bits_per_pixel as i64),
+                                        ),
+                                    ]),
+                                    buffer: FrameBufferSpec::default(),
+                                }));
+                            }
+                            Err(reason) => {
+                                // A raster that does not match the geometry the camera
+                                // reported is not an image of anything.
+                                self.events.push_back(DriverEvent::TokenFailed {
+                                    token,
+                                    report: ErrorReport {
+                                        code: ErrorCode::Transport,
+                                        message: reason,
+                                    },
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    readbacks.push((intent, value.clone()));
                     if terminal {
-                        let value = backend::completion(&intent, &outcome);
+                        let value = match backend.results.remove(&token) {
+                            Some(collected) if !collected.is_empty() => Value::Map(collected),
+                            _ => value,
+                        };
                         self.events
                             .push_back(DriverEvent::TokenCompleted { token, value });
                     }
-                    let _ = token;
                 }
                 Progress::Failed(failure) => {
                     // Everything queued behind a failed command belongs to operations that
                     // will now never run as asked, so they fail with it.
                     if let Some((token, _, _)) = backend.outstanding.pop_front() {
+                        backend.results.remove(&token);
                         self.events.push_back(DriverEvent::TokenFailed {
                             token,
                             report: ErrorReport {
@@ -559,6 +1196,192 @@ impl SparkCytoDriver {
                 }
             }
         }
+
+        for (intent, value) in readbacks {
+            self.apply_readback(&intent, &value);
+        }
+    }
+
+    /// Fold a reply into driver state, so a property read reports what the instrument said.
+    fn apply_readback(&mut self, intent: &backend::Intent, value: &Value) {
+        match intent {
+            backend::Intent::Read { key } if key == "AOI" => {
+                let Value::Map(map) = value else { return };
+                for (key, target) in [("WIDTH", true), ("HEIGHT", false)] {
+                    if let Some(Value::I64(raw)) = map.get(key) {
+                        let raw = u32::try_from(*raw).ok();
+                        if target {
+                            self.camera.width = raw;
+                        } else {
+                            self.camera.height = raw;
+                        }
+                    }
+                }
+            }
+
+            backend::Intent::Read { key } => {
+                let Value::I64(raw) = value else { return };
+                match key.as_str() {
+                    "TEMPERATURE" => {
+                        let actual = backend::temperature_from_c100(*raw);
+                        self.temperature_actual = Some(actual);
+                        self.emit_property(
+                            DeviceId(NodeId(304)),
+                            "actual",
+                            Value::Temperature(actual),
+                        );
+                    }
+                    "BITSPERPIXEL" => {
+                        self.camera.bits_per_pixel = u8::try_from(*raw).ok();
+                    }
+                    "ACTUAL_CONCENTRATION_CO2" => {
+                        let actual = backend::gas_from_scaled(*raw);
+                        self.gas_actual = Some(actual);
+                        self.emit_property(
+                            DeviceId(NodeId(305)),
+                            "co2_actual",
+                            Value::GasConcentration(actual),
+                        );
+                    }
+                    "ACTUAL_CONCENTRATION_O2" => {
+                        let actual = backend::gas_from_scaled(*raw);
+                        self.o2_actual = Some(actual);
+                        self.emit_property(
+                            DeviceId(NodeId(305)),
+                            "o2_actual",
+                            Value::GasConcentration(actual),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
+            backend::Intent::AxisRange { axis } => {
+                let Value::Map(map) = value else { return };
+                let Some(Value::String(unit)) = map.get("unit") else {
+                    return;
+                };
+                let unit = match unit.as_str() {
+                    "um" => backend::AxisUnit::Micrometres,
+                    _ => backend::AxisUnit::Steps,
+                };
+                self.axis_units.insert(axis.clone(), unit);
+                let device = match axis {
+                    StageAxis::Z => DeviceId(NodeId(309)),
+                    _ => DeviceId(NodeId(308)),
+                };
+                self.emit_property(device, "unit", Value::String(unit_name(unit).into()));
+            }
+
+            backend::Intent::Position => {
+                let Value::Map(map) = value else { return };
+                for (axis, key, device) in [
+                    (StageAxis::X, "x", 308u64),
+                    (StageAxis::Y, "y", 308),
+                    (StageAxis::Z, "z", 309),
+                ] {
+                    let Some(Value::F64(raw)) = map.get(key) else {
+                        continue;
+                    };
+                    self.axis_positions.insert(axis.clone(), *raw);
+                    let Some(unit) = self.axis_units.get(&axis).copied() else {
+                        continue;
+                    };
+                    if let Some(position) = backend::position_from_raw(*raw, unit) {
+                        self.emit_property(
+                            DeviceId(NodeId(device)),
+                            key,
+                            Value::Position(position),
+                        );
+                    }
+                }
+            }
+
+            backend::Intent::Identity { key } => {
+                let Value::String(text) = value else { return };
+                self.identity.insert(key.clone(), text.clone());
+                let property = match key.as_str() {
+                    "INSTRUMENT_TYPE" => "instrument_type",
+                    "HARDWARE_VERSION" => "hardware_version",
+                    "STATE" => "state",
+                    // The serial is descriptor metadata, not a property.
+                    _ => return,
+                };
+                self.emit_property(DeviceId(NodeId(300)), property, value.clone());
+            }
+
+            backend::Intent::ModuleMap { final_bus } => {
+                let Value::Map(map) = value else { return };
+                let enumerated = map
+                    .iter()
+                    .filter_map(|(name, value)| match value {
+                        Value::I64(number) => {
+                            u32::try_from(*number).ok().map(|n| (name.clone(), n))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                self.modules.apply(&enumerated);
+                self.camera.cell_imaging = self.modules.cell_imaging;
+                self.emit_property(
+                    DeviceId(NodeId(300)),
+                    "modules",
+                    Value::String(self.module_summary()),
+                );
+                // Module numbers are what the rest of the bring-up needs to address anything,
+                // so it waits for the last enumeration rather than running once per bus.
+                if *final_bus {
+                    let _ = self.refresh();
+                }
+            }
+
+            backend::Intent::CarrierInventory { carrier } => {
+                let Value::Map(map) = value else { return };
+                let name = carrier.wire_token();
+                let device = match carrier {
+                    MoveableCarrier::Mirror | MoveableCarrier::DualPmtMirror => {
+                        DeviceId(NodeId(311))
+                    }
+                    _ => DeviceId(NodeId(310)),
+                };
+                if let Some(Value::I64(slots)) = map.get("slots") {
+                    if let Ok(slots) = u8::try_from(*slots) {
+                        self.carrier_slots.insert(name.to_string(), slots);
+                        self.emit_property(device, "slots", Value::I64(slots as i64));
+                    }
+                }
+                if let Some(Value::String(fitted)) = map.get("fitted") {
+                    self.carrier_inventory
+                        .insert(name.to_string(), fitted.clone());
+                    self.emit_property(device, "fitted", Value::String(fitted.clone()));
+                }
+            }
+
+            backend::Intent::Autofocus => {
+                let Value::Map(map) = value else { return };
+                let read = |key: &str| match map.get(key) {
+                    Some(Value::F64(raw)) => Some(*raw),
+                    Some(Value::I64(raw)) => Some(*raw as f64),
+                    _ => None,
+                };
+                if let (Some(max), Some(dev)) = (read("maxvalue"), read("stddev")) {
+                    self.autofocus = Some((max, dev));
+                    let device = DeviceId(NodeId(318));
+                    self.emit_property(device, "max_value", Value::F64(max));
+                    self.emit_property(device, "std_dev", Value::F64(dev));
+                }
+            }
+
+            backend::Intent::Barcode => {
+                self.barcode = match value {
+                    Value::String(text) => Some(text.clone()),
+                    _ => None,
+                };
+                self.emit_property(DeviceId(NodeId(314)), "barcode", value.clone());
+            }
+
+            _ => {}
+        }
     }
 
     fn next_token(&mut self) -> DriverToken {
@@ -567,18 +1390,74 @@ impl SparkCytoDriver {
         token
     }
 
+    /// A modeled chamber reaches its setpoint; a real one is asked.
+    ///
+    /// The two are kept apart deliberately: with an instrument attached these readings only
+    /// ever come from it, so a simulator stays useful without a live driver ever reporting a
+    /// number nobody measured.
+    fn settle_temperature(&mut self) {
+        if self.is_live() {
+            return;
+        }
+        self.temperature_actual = Some(if self.temperature_enabled {
+            self.temperature_target
+        } else {
+            Temperature::from_celsius(25.0)
+        });
+    }
+
+    fn settle_gas(&mut self) {
+        if self.is_live() {
+            return;
+        }
+        if self.gas_enabled && !self.gas_fault {
+            self.gas_actual = Some(self.gas_target);
+            self.o2_actual = Some(self.o2_target);
+        }
+    }
+
+    /// An axis position, in the unit the instrument said that axis counts in.
+    ///
+    /// `Null` when the axis has not reported, and when it counts in motor steps: a step is
+    /// not a length until the mechanism says how long one is, and reporting the raw count as
+    /// micrometres would be a wrong number rather than a missing one.
+    fn axis_value(&self, axis: StageAxis) -> Value {
+        let Some(raw) = self.axis_positions.get(&axis).copied() else {
+            return Value::Null;
+        };
+        match self.axis_units.get(&axis).copied() {
+            Some(unit) => optional(backend::position_from_raw(raw, unit).map(Value::Position)),
+            None => Value::Null,
+        }
+    }
+
+    fn axis_unit_value(&self, axis: StageAxis) -> Value {
+        match self.axis_units.get(&axis).copied() {
+            Some(unit) => Value::String(unit_name(unit).into()),
+            None => Value::Null,
+        }
+    }
+
     fn read_property(&self, device: DeviceId, key: &str) -> Result<Value> {
         match (device.0 .0, key) {
             (300, "well") => Ok(Value::String(self.well.clone())),
             (300, "support_level") => Ok(Value::String(self.support_level.clone())),
+            (300, "instrument_type") => Ok(self.identity_value("INSTRUMENT_TYPE")),
+            (300, "hardware_version") => Ok(self.identity_value("HARDWARE_VERSION")),
+            (300, "state") => Ok(self.identity_value("STATE")),
+            (300, "modules") => Ok(Value::String(self.module_summary())),
             (301, "wavelength") => Ok(Value::Wavelength(self.absorbance_wavelength)),
             (302, "wavelength") => Ok(Value::Wavelength(self.fluorescence_wavelength)),
             (302, "enabled") => Ok(Value::Bool(self.fluorescence_enabled)),
             (303, "enabled") => Ok(Value::Bool(self.luminescence_enabled)),
             (304, "target") => Ok(Value::Temperature(self.temperature_target)),
+            // `Null` until something has been read. See `temperature_actual`.
+            (304, "actual") => Ok(optional(self.temperature_actual.map(Value::Temperature))),
             (304, "enabled") => Ok(Value::Bool(self.temperature_enabled)),
             (305, "co2_target") => Ok(Value::GasConcentration(self.gas_target)),
-            (305, "co2_actual") => Ok(Value::GasConcentration(self.gas_actual)),
+            (305, "co2_actual") => Ok(optional(self.gas_actual.map(Value::GasConcentration))),
+            (305, "o2_target") => Ok(Value::GasConcentration(self.o2_target)),
+            (305, "o2_actual") => Ok(optional(self.o2_actual.map(Value::GasConcentration))),
             (305, "enabled") => Ok(Value::Bool(self.gas_enabled)),
             (305, "fault") => Ok(Value::Bool(self.gas_fault)),
             (306, "objective") => Ok(Value::I64(self.fim_objective)),
@@ -587,6 +1466,51 @@ impl SparkCytoDriver {
             (306, "fault") => Ok(Value::Bool(self.fim_fault)),
             (307, "bound") => Ok(Value::Bool(self.camera_bound)),
             (307, "imaging_mode") => Ok(Value::String(self.imaging_mode.clone())),
+            (308, "x") => Ok(self.axis_value(StageAxis::X)),
+            (308, "y") => Ok(self.axis_value(StageAxis::Y)),
+            (308, "unit") => Ok(self.axis_unit_value(StageAxis::X)),
+            (309, "z") => Ok(self.axis_value(StageAxis::Z)),
+            (309, "unit") => Ok(self.axis_unit_value(StageAxis::Z)),
+            (310 | 311, "slots") => Ok(optional(
+                self.carrier_name(device)
+                    .and_then(|name| self.carrier_slots.get(name).copied())
+                    .map(|slots| Value::I64(slots as i64)),
+            )),
+            (310 | 311, "fitted") => Ok(optional(
+                self.carrier_name(device)
+                    .and_then(|name| self.carrier_inventory.get(name).cloned())
+                    .map(Value::String),
+            )),
+            (310 | 311, "position") => Ok(Value::I64(
+                self.carrier_positions
+                    .get(&device.0 .0)
+                    .copied()
+                    .unwrap_or(1) as i64,
+            )),
+            (312, "pumps") => Ok(Value::String("A|B".into())),
+            (314, "barcode") => Ok(optional(self.barcode.clone().map(Value::String))),
+            (315, "exposure") => Ok(Value::TimeInterval(self.camera_exposure)),
+            (316, "mode") => Ok(Value::String(self.shake_mode.clone())),
+            (316, "amplitude") => Ok(Value::Position(self.shake_amplitude)),
+            (316, "frequency") => Ok(Value::Frequency(self.shake_frequency)),
+            (317, "state") => Ok(Value::String(self.lid_state.clone())),
+            (318, "max_value") => Ok(optional(self.autofocus.map(|(max, _)| Value::F64(max)))),
+            (318, "std_dev") => Ok(optional(self.autofocus.map(|(_, dev)| Value::F64(dev)))),
+            (315, "width") => Ok(optional(
+                self.camera
+                    .width
+                    .map(|width| Value::PixelCount(PixelCount::new(width))),
+            )),
+            (315, "height") => Ok(optional(
+                self.camera
+                    .height
+                    .map(|height| Value::PixelCount(PixelCount::new(height))),
+            )),
+            (315, "pixel_format") => {
+                Ok(optional(self.camera.bits_per_pixel.map(|bits| {
+                    Value::String(backend::pixel_format(bits).into())
+                })))
+            }
             _ => Err(Error::new(
                 ErrorCode::InvalidProperty,
                 format!("unknown Spark Cyto property {key}"),
@@ -639,25 +1563,54 @@ impl SparkCytoDriver {
             }
             (304, "target", Value::Temperature(target)) => {
                 self.temperature_target = *target;
+                self.settle_temperature();
                 Ok(Value::Temperature(self.temperature_target))
             }
             (304, "enabled", Value::Bool(enabled)) => {
                 self.temperature_enabled = *enabled;
+                self.settle_temperature();
                 Ok(Value::Bool(self.temperature_enabled))
             }
             (305, "co2_target", Value::GasConcentration(target)) => {
                 self.gas_target = *target;
-                if self.gas_enabled && !self.gas_fault {
-                    self.gas_actual = *target;
-                }
+                self.settle_gas();
                 Ok(Value::GasConcentration(self.gas_target))
+            }
+            (305, "o2_target", Value::GasConcentration(target)) => {
+                self.o2_target = *target;
+                self.settle_gas();
+                Ok(Value::GasConcentration(self.o2_target))
             }
             (305, "enabled", Value::Bool(enabled)) => {
                 self.gas_enabled = *enabled;
-                if self.gas_enabled && !self.gas_fault {
-                    self.gas_actual = self.gas_target;
-                }
+                self.settle_gas();
                 Ok(Value::Bool(self.gas_enabled))
+            }
+            (316, "mode", Value::String(mode)) => {
+                self.shake_mode = mode.trim().to_ascii_uppercase();
+                Ok(Value::String(self.shake_mode.clone()))
+            }
+            (316, "amplitude", Value::Position(amplitude)) => {
+                self.shake_amplitude = *amplitude;
+                Ok(Value::Position(self.shake_amplitude))
+            }
+            (316, "frequency", Value::Frequency(frequency)) => {
+                self.shake_frequency = *frequency;
+                Ok(Value::Frequency(self.shake_frequency))
+            }
+            (317, "state", Value::String(state)) => {
+                self.lid_state = state.trim().to_ascii_uppercase();
+                Ok(Value::String(self.lid_state.clone()))
+            }
+            (315, "exposure", Value::TimeInterval(exposure)) => {
+                self.camera_exposure = *exposure;
+                self.camera.exposure_us = Some((exposure.seconds() * 1e6).round() as i64);
+                Ok(Value::TimeInterval(self.camera_exposure))
+            }
+            (310 | 311, "position", Value::I64(position)) => {
+                let position = (*position).clamp(1, u8::MAX as i64) as u8;
+                self.carrier_positions.insert(device.0 .0, position);
+                Ok(Value::I64(position as i64))
             }
             (306, "objective", Value::I64(objective)) => {
                 self.fim_objective = (*objective).clamp(1, 6);
@@ -706,12 +1659,7 @@ impl SparkCytoDriver {
     fn local_timing_sequences<'a>(&self, plan: &'a TimingPlan) -> Vec<&'a DeviceSequence> {
         plan.sequences
             .iter()
-            .filter(|sequence| {
-                matches!(
-                    sequence.device.0 .0,
-                    300 | 301 | 302 | 303 | 304 | 305 | 306 | 307
-                )
-            })
+            .filter(|sequence| (300..=318).contains(&sequence.device.0 .0))
             .collect()
     }
 
@@ -764,7 +1712,7 @@ impl SparkCytoDriver {
             ),
             (
                 "gas_actual".into(),
-                Value::GasConcentration(self.gas_actual),
+                optional(self.gas_actual.map(Value::GasConcentration)),
             ),
             ("gas_enabled".into(), Value::Bool(self.gas_enabled)),
             ("gas_fault".into(), Value::Bool(self.gas_fault)),
@@ -901,6 +1849,33 @@ impl SparkCytoDriver {
             CapabilityKind::GasControl => self.invoke_gas_control(device, request),
             CapabilityKind::ImagingHead => self.invoke_imaging_head(device, request),
             CapabilityKind::CameraBinding => self.invoke_camera_binding(device, request),
+            CapabilityKind::StageMove => self.invoke_stage_move(device, request),
+            CapabilityKind::StageHome => Ok(Value::Map(BTreeMap::from([(
+                "homed".into(),
+                Value::Bool(true),
+            )]))),
+            CapabilityKind::FilterSelect => self.invoke_filter_select(device, request),
+            CapabilityKind::Inject => self.invoke_inject(device, request),
+            CapabilityKind::CameraCapture => Err(Error::new(
+                ErrorCode::Unsupported,
+                "this driver has no instrument attached and no scene to render, so there are \
+                 no pixels to return; attach a transport, or use a simulator driver for a \
+                 modeled camera",
+            )),
+            CapabilityKind::Shake => Ok(Value::Map(BTreeMap::from([
+                ("mode".into(), Value::String(self.shake_mode.clone())),
+                ("amplitude".into(), Value::Position(self.shake_amplitude)),
+                ("frequency".into(), Value::Frequency(self.shake_frequency)),
+            ]))),
+            CapabilityKind::Autofocus => Err(Error::new(
+                ErrorCode::Unsupported,
+                "an autofocus sweep needs an instrument to sweep; this driver has no scene \
+                 to focus on",
+            )),
+            CapabilityKind::Barcode => Ok(Value::Map(BTreeMap::from([(
+                "barcode".into(),
+                optional(self.barcode.clone().map(Value::String)),
+            )]))),
             CapabilityKind::GenericCommand | CapabilityKind::Custom(_) => {
                 Ok(capability_request_summary(request))
             }
@@ -909,6 +1884,98 @@ impl SparkCytoDriver {
                 format!("Spark Cyto does not implement {}", kind.name()),
             )),
         }
+    }
+
+    /// Move an axis, with no instrument attached.
+    ///
+    /// The modeled path accepts a position in micrometres, which is what a client that has
+    /// only ever seen the model will send. With an instrument attached this is not reached:
+    /// the planner refuses the move unless that axis declared micrometres.
+    fn invoke_stage_move(&mut self, device: DeviceId, request: CapabilityRequest) -> Result<Value> {
+        let CapabilityRequest::StageMove(request) = request else {
+            return Err(Error::new(
+                ErrorCode::InvalidCommand,
+                "StageMove expects StageMoveRequest",
+            ));
+        };
+        let mut moved = BTreeMap::new();
+        for (axis, position) in &request.target {
+            let owned = matches!(
+                (device.0 .0, axis),
+                (308, StageAxis::X | StageAxis::Y) | (309, StageAxis::Z)
+            );
+            if !owned {
+                return Err(Error::new(
+                    ErrorCode::InvalidCommand,
+                    format!("this Spark stage does not carry the {} axis", axis.name()),
+                ));
+            }
+            let micrometers = if request.relative {
+                self.axis_positions.get(axis).copied().unwrap_or(0.0) + position.micrometers()
+            } else {
+                position.micrometers()
+            };
+            self.axis_positions.insert(axis.clone(), micrometers);
+            self.axis_units
+                .insert(axis.clone(), backend::AxisUnit::Micrometres);
+            let value = Value::Position(Position::from_micrometers(micrometers));
+            self.emit_property(device, axis.name(), value.clone());
+            moved.insert(axis.name().to_string(), value);
+        }
+        Ok(Value::Map(moved))
+    }
+
+    fn invoke_filter_select(
+        &mut self,
+        device: DeviceId,
+        request: CapabilityRequest,
+    ) -> Result<Value> {
+        let CapabilityRequest::FilterSelect(request) = request else {
+            return Err(Error::new(
+                ErrorCode::InvalidCommand,
+                "FilterSelect expects FilterSelectRequest",
+            ));
+        };
+        // The same refusal the live path makes: a position the fitted slide does not have is
+        // rejected rather than clamped into whatever glass sits nearest.
+        if let Some(slots) = self
+            .carrier_name(device)
+            .and_then(|name| self.carrier_slots.get(name).copied())
+        {
+            if request.position < 1 || request.position > slots {
+                return Err(Error::new(
+                    ErrorCode::InvalidCommand,
+                    format!(
+                        "this carrier has {slots} positions; there is no position {}",
+                        request.position
+                    ),
+                ));
+            }
+        }
+        let value =
+            self.write_property(device, "position", &Value::I64(request.position as i64))?;
+        self.emit_property(device, "position", value.clone());
+        Ok(Value::Map(BTreeMap::from([("position".into(), value)])))
+    }
+
+    fn invoke_inject(&mut self, device: DeviceId, request: CapabilityRequest) -> Result<Value> {
+        let CapabilityRequest::Inject(request) = request else {
+            return Err(Error::new(
+                ErrorCode::InvalidCommand,
+                "Inject expects InjectRequest",
+            ));
+        };
+        let mut summary = BTreeMap::from([
+            ("pump".into(), Value::I64(request.pump as i64)),
+            ("action".into(), Value::String(request.action.name().into())),
+        ]);
+        if let Some(volume) = request.volume {
+            summary.insert("volume".into(), Value::Volume(volume));
+        }
+        if let Some(speed) = request.speed {
+            summary.insert("speed".into(), Value::FlowRate(speed));
+        }
+        Ok(Value::Map(summary))
     }
 
     fn invoke_gas_control(
@@ -929,7 +1996,17 @@ impl SparkCytoDriver {
                     changed.insert("co2_target".into(), value);
                     changed.insert(
                         "co2_actual".into(),
-                        Value::GasConcentration(self.gas_actual),
+                        optional(self.gas_actual.map(Value::GasConcentration)),
+                    );
+                }
+                if let Some(target) = request.o2_target {
+                    let value =
+                        self.write_property(device, "o2_target", &Value::GasConcentration(target))?;
+                    self.emit_property(device, "o2_target", value.clone());
+                    changed.insert("o2_target".into(), value);
+                    changed.insert(
+                        "o2_actual".into(),
+                        optional(self.o2_actual.map(Value::GasConcentration)),
                     );
                 }
                 if let Some(enabled) = request.enabled {
@@ -938,7 +2015,11 @@ impl SparkCytoDriver {
                     changed.insert("enabled".into(), value);
                     changed.insert(
                         "co2_actual".into(),
-                        Value::GasConcentration(self.gas_actual),
+                        optional(self.gas_actual.map(Value::GasConcentration)),
+                    );
+                    changed.insert(
+                        "o2_actual".into(),
+                        optional(self.o2_actual.map(Value::GasConcentration)),
                     );
                 }
                 if changed.is_empty() {
@@ -948,7 +2029,7 @@ impl SparkCytoDriver {
                     );
                     changed.insert(
                         "co2_actual".into(),
-                        Value::GasConcentration(self.gas_actual),
+                        optional(self.gas_actual.map(Value::GasConcentration)),
                     );
                     changed.insert("enabled".into(), Value::Bool(self.gas_enabled));
                     changed.insert("fault".into(), Value::Bool(self.gas_fault));
@@ -962,7 +2043,7 @@ impl SparkCytoDriver {
                 ),
                 (
                     "co2_actual".into(),
-                    Value::GasConcentration(self.gas_actual),
+                    optional(self.gas_actual.map(Value::GasConcentration)),
                 ),
                 ("enabled".into(), Value::Bool(self.gas_enabled)),
                 ("fault".into(), Value::Bool(self.gas_fault)),
@@ -1214,31 +2295,51 @@ impl Driver for SparkCytoDriver {
         let Some(desc) = self.devices.iter().find(|d| d.id == device) else {
             return Vec::new();
         };
-        let kind = if desc.kinds.iter().any(|k| k == "plate.transport") {
-            CapabilityKind::PlateMove
+        let has = |kind: &str| desc.kinds.iter().any(|k| k == kind);
+        let kinds = if has("plate.transport") {
+            vec![CapabilityKind::PlateMove]
         } else if desc.kinds.iter().any(|k| k.starts_with("detector.")) {
-            CapabilityKind::Measure
-        } else if desc.kinds.iter().any(|k| k == "environment.temperature") {
-            CapabilityKind::TemperatureControl
-        } else if desc.kinds.iter().any(|k| k == "environment.gas") {
-            CapabilityKind::GasControl
-        } else if desc
-            .kinds
-            .iter()
-            .any(|k| k == "imaging.head" || k == "objective.turret")
-        {
-            CapabilityKind::ImagingHead
-        } else if desc.kinds.iter().any(|k| k == "camera.binding") {
-            CapabilityKind::CameraBinding
+            vec![CapabilityKind::Measure]
+        } else if has("environment.temperature") {
+            vec![CapabilityKind::TemperatureControl]
+        } else if has("environment.gas") {
+            vec![CapabilityKind::GasControl]
+        } else if has("imaging.head") || has("objective.turret") {
+            vec![CapabilityKind::ImagingHead]
+        } else if has("camera.binding") {
+            vec![CapabilityKind::CameraBinding]
+        } else if has("axis.xy") || has("axis.z") {
+            // Stop is absent deliberately: no command that halts a move in flight is
+            // recorded, and advertising one that silently did nothing is worse than not
+            // offering it.
+            vec![CapabilityKind::StageMove, CapabilityKind::StageHome]
+        } else if has("filter.wheel") || has("mirror.turret") {
+            vec![CapabilityKind::FilterSelect]
+        } else if has("injector") {
+            vec![CapabilityKind::Inject]
+        } else if has("barcode.reader") {
+            vec![CapabilityKind::Barcode]
+        } else if has("camera") {
+            vec![CapabilityKind::CameraCapture]
+        } else if has("shaker") {
+            vec![CapabilityKind::Shake]
+        } else if has("autofocus") {
+            vec![CapabilityKind::Autofocus]
         } else {
-            CapabilityKind::GenericCommand
+            vec![CapabilityKind::GenericCommand]
         };
-        vec![CapabilityDescriptor::new(
-            CapabilityId(device.0 .0),
-            device,
-            kind,
-            ValueType::Map,
-        )]
+        kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                CapabilityDescriptor::new(
+                    CapabilityId(device.0 .0 + index as u64 * 1000),
+                    device,
+                    kind,
+                    ValueType::Map,
+                )
+            })
+            .collect()
     }
 
     fn prepare(&mut self, batch: &CommandBatch) -> Result<PreparedBatch> {
@@ -1306,11 +2407,28 @@ impl Driver for SparkCytoDriver {
                     last = self.read_property(device, &key)?;
                 }
                 Command::WriteProperty { device, key, value } => {
+                    // The model is updated either way, so a read stays consistent with what
+                    // was asked for; with an instrument attached the completion comes from
+                    // its reply rather than from here.
                     last = self.write_property(device, &key, &value)?;
                     self.emit_property(device, &key, last.clone());
+                    if self.write_to_instrument(token, device, &key, &value)? {
+                        deferred = true;
+                    }
                 }
                 Command::ApplyStateSet(set) => {
+                    let writes = set.writes.clone();
                     last = self.apply_state_set(set)?;
+                    for write in writes {
+                        if self.write_to_instrument(
+                            token,
+                            write.device,
+                            &write.property,
+                            &write.value,
+                        )? {
+                            deferred = true;
+                        }
+                    }
                 }
                 Command::Invoke {
                     device,
@@ -1517,6 +2635,28 @@ fn i64_prop(device: &DeviceConfig, key: &str) -> Option<i64> {
     }
 }
 
+/// A USB id, written either as an integer or as a `0x`-prefixed string.
+fn u16_prop(device: &DeviceConfig, key: &str) -> Option<u16> {
+    match device.properties.get(key) {
+        Some(Value::I64(value)) => u16::try_from(*value).ok(),
+        Some(Value::String(text)) => {
+            let text = text.trim();
+            match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                Some(hex) => u16::from_str_radix(hex, 16).ok(),
+                None => text.parse().ok(),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn u32_prop(device: &DeviceConfig, key: &str) -> Option<u32> {
+    match device.properties.get(key) {
+        Some(Value::I64(value)) => u32::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
 fn f64_prop(device: &DeviceConfig, key: &str) -> Option<f64> {
     match device.properties.get(key) {
         Some(Value::F64(value)) => Some(*value),
@@ -1617,5 +2757,17 @@ fn capability_request_summary(request: CapabilityRequest) -> Value {
             ("params".into(), Value::Map(request.params)),
         ])),
         other => Value::String(format!("{other:?}")),
+    }
+}
+
+/// A value the instrument has not reported yet reads as `Null`, not as a default.
+fn optional(value: Option<Value>) -> Value {
+    value.unwrap_or(Value::Null)
+}
+
+fn unit_name(unit: backend::AxisUnit) -> &'static str {
+    match unit {
+        backend::AxisUnit::Micrometres => "um",
+        backend::AxisUnit::Steps => "step",
     }
 }

@@ -58,9 +58,15 @@ pub enum Progress<K> {
     Completed(Outcome<K>),
     Failed(Failure<K>),
     /// The instrument reported it is still working, with the time it expects to need.
-    Busy { key: K, ticks: Option<u32> },
+    Busy {
+        key: K,
+        ticks: Option<u32>,
+    },
     /// A fault arrived that no outstanding command asked for.
-    Asynchronous { number: Option<u32>, text: String },
+    Asynchronous {
+        number: Option<u32>,
+        text: String,
+    },
 }
 
 /// Non-blocking session over one instrument's command and data channels.
@@ -232,5 +238,8 @@ impl Transport for BoxedTransport {
 }
 
 fn decode_error(error: super::tdcl::DecodeError) -> Error {
-    Error::new(ErrorCode::Transport, format!("TDCL decode failed: {error:?}"))
+    Error::new(
+        ErrorCode::Transport,
+        format!("TDCL decode failed: {error:?}"),
+    )
 }

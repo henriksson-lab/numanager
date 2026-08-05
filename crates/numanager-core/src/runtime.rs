@@ -818,7 +818,25 @@ pub struct LocalRuntime {
     device_descriptors: HashMap<DeviceId, DeviceDescriptor>,
     device_capabilities: HashMap<DeviceId, Vec<CapabilityDescriptor>>,
     lanes: HashMap<DriverId, LaneHandle>,
+    bindings: Vec<DeviceBinding>,
     bus: EventBus,
+}
+
+/// A device serving a role for another device, across driver boundaries.
+///
+/// A driver's own [`Driver::graph`] can only express dependencies between devices it owns,
+/// which is right for a composed device built from one controller's parts. It cannot say
+/// that *this* camera is the one bolted to *that* reader, because the two are different
+/// drivers — and that is the ordinary case for an instrument whose camera enumerates as its
+/// own USB device. The runtime holds those bindings instead, so a client can ask what serves
+/// a role without knowing which driver answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceBinding {
+    /// The device that provides the role.
+    pub provider: DeviceId,
+    /// The device that needs it.
+    pub consumer: DeviceId,
+    pub role: Role,
 }
 
 impl LocalRuntime {
@@ -835,6 +853,7 @@ impl LocalRuntime {
             device_descriptors: HashMap::new(),
             device_capabilities: HashMap::new(),
             lanes: HashMap::new(),
+            bindings: Vec::new(),
             bus: EventBus::new(),
         }
     }
@@ -953,6 +972,12 @@ impl LocalRuntime {
             self.bus.publish(Event::DeviceRemoved(*device));
         }
         self.frames.remove_devices(&removed_devices);
+        // A binding to a device that is gone would answer a role lookup with something the
+        // runtime can no longer reach.
+        self.bindings.retain(|binding| {
+            !removed_devices.contains(&binding.provider)
+                && !removed_devices.contains(&binding.consumer)
+        });
         self.armed_plans
             .lock()
             .expect("armed plans poisoned")
@@ -1004,6 +1029,90 @@ impl LocalRuntime {
     pub fn device(&self, device: impl Into<DeviceId>) -> Option<&DeviceDescriptor> {
         let device = device.into();
         self.device_descriptors.get(&device)
+    }
+
+    /// Record that `provider` serves `role` for `consumer`.
+    ///
+    /// Both devices must already be registered — a binding to something absent would be a
+    /// promise the runtime cannot keep. Re-binding the same role replaces the previous
+    /// provider rather than accumulating two answers to one question.
+    pub fn bind_device(
+        &mut self,
+        provider: impl Into<DeviceId>,
+        consumer: impl Into<DeviceId>,
+        role: Role,
+    ) -> Result<()> {
+        let provider = provider.into();
+        let consumer = consumer.into();
+        for (device, which) in [(provider, "provider"), (consumer, "consumer")] {
+            if !self.device_descriptors.contains_key(&device) {
+                return Err(Error::new(
+                    ErrorCode::InvalidGraph,
+                    format!("binding {which} {:?} is not a registered device", device),
+                ));
+            }
+        }
+        if provider == consumer {
+            return Err(Error::new(
+                ErrorCode::InvalidGraph,
+                "a device cannot serve a role for itself",
+            ));
+        }
+        self.bindings
+            .retain(|binding| !(binding.consumer == consumer && binding.role == role));
+        self.bindings.push(DeviceBinding {
+            provider,
+            consumer,
+            role,
+        });
+        Ok(())
+    }
+
+    /// Apply the dependencies a hardware configuration declares.
+    ///
+    /// The config format has carried these all along; this is what makes them take effect.
+    pub fn apply_config_dependencies(
+        &mut self,
+        config: &crate::config::HardwareConfig,
+    ) -> Result<()> {
+        for dependency in &config.dependencies {
+            self.bind_device(dependency.from, dependency.to, dependency.role.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Every cross-driver binding, in the order it was made.
+    pub fn bindings(&self) -> &[DeviceBinding] {
+        &self.bindings
+    }
+
+    /// The device serving `role` for `consumer`, if one is bound.
+    pub fn bound_device(
+        &self,
+        consumer: impl Into<DeviceId>,
+        role: &Role,
+    ) -> Option<&DeviceDescriptor> {
+        let consumer = consumer.into();
+        let binding = self
+            .bindings
+            .iter()
+            .find(|binding| binding.consumer == consumer && &binding.role == role)?;
+        self.device_descriptors.get(&binding.provider)
+    }
+
+    /// Everything bound to `consumer`, by role.
+    pub fn bound_devices(&self, consumer: impl Into<DeviceId>) -> Vec<(&Role, &DeviceDescriptor)> {
+        let consumer = consumer.into();
+        self.bindings
+            .iter()
+            .filter(|binding| binding.consumer == consumer)
+            .filter_map(|binding| {
+                Some((
+                    &binding.role,
+                    self.device_descriptors.get(&binding.provider)?,
+                ))
+            })
+            .collect()
     }
 
     pub fn safety_summary(

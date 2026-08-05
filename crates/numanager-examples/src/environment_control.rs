@@ -133,6 +133,9 @@ pub fn run() -> numanager_core::Result<()> {
             gas,
             GasControlRequest {
                 co2_target: Some(GasConcentration::from_percent(4.5)),
+                // A chamber with no oxygen line leaves this alone; one that has it reads
+                // the setpoint back on `o2_actual`.
+                o2_target: None,
                 enabled: Some(true),
             },
             Duration::from_secs(1),

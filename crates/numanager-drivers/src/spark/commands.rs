@@ -127,6 +127,18 @@ impl Command {
         self.target(Target::module(n))
     }
 
+    /// Address a module when its number is known.
+    ///
+    /// Module numbers are assigned at enumeration, so a driver that has not read `#MODULE`
+    /// has none to send. Omitting the token is what the grammar allows; sending a guessed
+    /// number would address whichever module happened to hold it.
+    pub fn module_opt(self, n: Option<u32>) -> Self {
+        match n {
+            Some(n) => self.module(n),
+            None => self,
+        }
+    }
+
     /// Render the full ASCII command line.
     pub fn build(&self) -> String {
         let mut s = String::new();

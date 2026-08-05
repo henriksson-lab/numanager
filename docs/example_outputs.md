@@ -2608,14 +2608,17 @@ selected temperature controller: spark-temperature [environment.temperature]
 selected gas controller: spark-gas [environment.gas]
 capabilities: temperature=TemperatureControl request=TemperatureControl; gas=GasControl request=GasControl
 environment property: target type=Temperature writable=true sequenceable=true
+environment property: actual type=Temperature writable=false sequenceable=false
 environment property: enabled type=Bool writable=true sequenceable=true
 environment property: co2_target type=GasConcentration writable=true sequenceable=true
 environment property: co2_actual type=GasConcentration writable=false sequenceable=false
+environment property: o2_target type=GasConcentration writable=true sequenceable=true
+environment property: o2_actual type=GasConcentration writable=false sequenceable=false
 environment property: enabled type=Bool writable=true sequenceable=true
 environment property: fault type=Bool writable=false sequenceable=false
 environment state set completed: map keys=[co2_target, enabled x2, target]
 temperature control completed: map keys=[enabled, target]
-gas control completed: map keys=[co2_actual, co2_target, enabled]
+gas control completed: map keys=[co2_actual, co2_target, enabled, o2_actual]
 temperature safety: safe map keys=[device, enabled, state]
 gas safety: safe map keys=[device, enabled, fault, state]
 target: Temperature(Temperature { value: 36.5, unit: Celsius })
@@ -2625,7 +2628,7 @@ co2_actual: GasConcentration(GasConcentration { value: 4.5, unit: Percent })
 enabled: Bool(true)
 fault: Bool(false)
 event: operation on [spark-temperature, spark-gas] running
-event: spark-temperature.target changed to Temperature(Temperature { value: 37.0, unit: Celsius })
+event: spark-temperature.target changed to Temperature(Temperature { value: 36.5, unit: Celsius })
 event: spark-temperature.enabled changed to Bool(true)
 event: spark-gas.co2_target changed to GasConcentration(GasConcentration { value: 5.0, unit: Percent })
 event: spark-gas.enabled changed to Bool(true)
@@ -2637,7 +2640,7 @@ event: operation on [spark-temperature] completed map keys=[enabled, target]
 event: operation on [spark-gas] running
 event: spark-gas.co2_target changed to GasConcentration(GasConcentration { value: 4.5, unit: Percent })
 event: spark-gas.enabled changed to Bool(true)
-event: operation on [spark-gas] completed map keys=[co2_actual, co2_target, enabled]
+event: operation on [spark-gas] completed map keys=[co2_actual, co2_target, enabled, o2_actual]
 event: operation on [spark-temperature] running
 event: operation on [spark-temperature] completed Bool(true)
 event: operation on [spark-gas] running
@@ -2786,6 +2789,11 @@ selected imaging head: spark-fim [imaging.head, objective.turret]
 selected camera binding: spark-camera-binding [camera.binding]
 capabilities: plate=PlateMove request=PlateMove; detector=Measure request=Measure; imaging=ImagingHead request=ImagingHead; camera=CameraBinding request=CameraBinding
 plate-reader property: spark-mainboard.well type=String writable=true sequenceable=true
+plate-reader property: spark-mainboard.support_level type=String writable=false sequenceable=false
+plate-reader property: spark-mainboard.instrument_type type=String writable=false sequenceable=false
+plate-reader property: spark-mainboard.hardware_version type=String writable=false sequenceable=false
+plate-reader property: spark-mainboard.state type=String writable=false sequenceable=false
+plate-reader property: spark-mainboard.modules type=String writable=false sequenceable=false
 plate-reader property: spark-absorbance.wavelength type=Wavelength writable=true sequenceable=true
 plate-reader property: spark-fim.objective type=I64 writable=true sequenceable=true
 plate-reader property: spark-fim.mode type=String writable=true sequenceable=true
@@ -4333,16 +4341,32 @@ spark devices:
   spark-gas ["environment.gas"] typed caps=[GasControl request=GasControl]
   spark-fim ["imaging.head", "objective.turret"] typed caps=[ImagingHead request=ImagingHead]
   spark-camera-binding ["camera.binding"] typed caps=[CameraBinding request=CameraBinding]
-initialization order has 8 graph nodes
+  spark-stage-xy ["stage.xy", "axis.xy"] typed caps=[StageMove request=StageMove, StageHome request=None]
+  spark-stage-z ["stage.z", "axis.z"] typed caps=[StageMove request=StageMove, StageHome request=None]
+  spark-filter-excitation ["filter.wheel"] typed caps=[FilterSelect request=FilterSelect]
+  spark-mirror ["mirror.turret"] typed caps=[FilterSelect request=FilterSelect]
+  spark-injector ["injector"] typed caps=[Inject request=Inject]
+  spark-camera ["camera"] typed caps=[CameraCapture request=CameraCapture]
+  spark-shaker ["shaker"] typed caps=[Shake request=Shake]
+  spark-lid ["lid"] typed caps=[none]
+  spark-autofocus ["autofocus"] typed caps=[Autofocus request=Autofocus]
+  spark-barcode ["barcode.reader"] typed caps=[Barcode request=Barcode]
+initialization order has 18 graph nodes
 capabilities: plate=PlateMove request=PlateMove; absorbance=Measure request=Measure; temperature=TemperatureControl request=TemperatureControl; gas=GasControl request=GasControl; fim=ImagingHead request=ImagingHead; camera=CameraBinding request=CameraBinding
-added spark driver with 8 device(s)
+added spark driver with 18 device(s)
 state set completed: map keys=[co2_target, enabled, mode, objective, target, wavelength, well]
 plate move completed: map keys=[moved, well]
 absorbance measure completed: map keys=[device, integration_time, signal, wavelength]
 temperature control completed: map keys=[enabled, target]
-gas control completed: map keys=[co2_actual, co2_target, enabled]
+gas control completed: map keys=[co2_actual, co2_target, enabled, o2_actual, o2_target]
 imaging head completed: map keys=[mode, objective]
 camera binding completed: map keys=[bound, imaging_mode]
+focus move completed: map keys=[z]
+excitation filter completed: map keys=[position]
+injector dispense completed: map keys=[action, pump, volume]
+capture refused without an instrument: this driver has no instrument attached and no scene to render, so there are no pixels to return; attach a transport, or use a simulator driver for a modeled camera
+shake completed: map keys=[amplitude, frequency, mode]
+barcode read completed: map keys=[barcode]
 timing arm: map keys=[arm_order, participants, prepared_drivers, routes, sequences, start, state, stop, transition_drivers]
 timing start: map keys=[arm_order, participants, prepared_drivers, routes, sequences, start, state, stop, transition_drivers]
 timing stop: map keys=[arm_order, participants, prepared_drivers, routes, sequences, start, state, stop, transition_drivers]
@@ -4355,5 +4379,5 @@ fim.mode: String("brightfield")
 fim.interlock_closed: Bool(true)
 fim.fault: Bool(false)
 runtime emitted a driver log event
-removed spark driver with 8 device(s)
+removed spark driver with 18 device(s)
 ```

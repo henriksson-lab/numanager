@@ -118,6 +118,8 @@ pub fn run() -> numanager_core::Result<()> {
         &gas,
         GasControlRequest {
             co2_target: Some(GasConcentration::from_percent(4.5)),
+            // The Cyto's chamber controls oxygen too, down to hypoxic levels.
+            o2_target: Some(GasConcentration::from_percent(5.0)),
             enabled: Some(true),
         },
         Duration::from_secs(1),
@@ -143,6 +145,68 @@ pub fn run() -> numanager_core::Result<()> {
         Duration::from_secs(1),
     )?;
     println!("camera binding completed: {}", completion_summary(&value));
+
+    // Focus is motion on this instrument, not a camera setting: the objective's height is an
+    // ordinary axis, so a client drives it the same way it drives any stage.
+    let stage_z = device_by_label(&devices, "spark-stage-z")?;
+    let value = runtime.execute_request(
+        &stage_z,
+        StageMoveRequest::absolute([(StageAxis::Z, Position::from_micrometers(1250.0))]),
+        Duration::from_secs(1),
+    )?;
+    println!("focus move completed: {}", completion_summary(&value));
+
+    let filter = device_by_label(&devices, "spark-filter-excitation")?;
+    let value = runtime.execute_request(
+        &filter,
+        FilterSelectRequest::position(2),
+        Duration::from_secs(1),
+    )?;
+    println!(
+        "excitation filter completed: {}",
+        completion_summary(&value)
+    );
+
+    let injector = device_by_label(&devices, "spark-injector")?;
+    let value = runtime.execute_request(
+        &injector,
+        InjectRequest::dispense(2, Volume::from_microliters(25.0)),
+        Duration::from_secs(1),
+    )?;
+    println!(
+        "injector dispense completed: {}",
+        completion_summary(&value)
+    );
+
+    // The camera is reachable through the reader itself: `CAMERA TAKEIMAGE` uploads the
+    // raster on the TDCL data channel. Without an instrument there are no pixels, and this
+    // driver says so rather than inventing a picture.
+    let camera_device = device_by_label(&devices, "spark-camera")?;
+    match runtime.execute_request(
+        &camera_device,
+        CameraCaptureRequest::default_frame(),
+        Duration::from_secs(1),
+    ) {
+        Ok(value) => println!("capture completed: {}", completion_summary(&value)),
+        Err(error) => println!("capture refused without an instrument: {}", error.message),
+    }
+
+    let shaker = device_by_label(&devices, "spark-shaker")?;
+    let value = runtime.execute_request(
+        &shaker,
+        ShakeRequest::new()
+            .with_mode("orbital")
+            .with_amplitude(Position::from_micrometers(3000.0))
+            .with_frequency(Frequency::from_hertz(8.0))
+            .for_duration(TimeInterval::from_seconds(30.0)),
+        Duration::from_secs(1),
+    )?;
+    println!("shake completed: {}", completion_summary(&value));
+
+    let barcode = device_by_label(&devices, "spark-barcode")?;
+    let value =
+        runtime.execute_request(&barcode, BarcodeRequest::read(), Duration::from_secs(1))?;
+    println!("barcode read completed: {}", completion_summary(&value));
 
     let plan = TimingPlan::from_parts(
         Vec::new(),

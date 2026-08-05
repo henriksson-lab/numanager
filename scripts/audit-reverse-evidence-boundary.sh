@@ -154,7 +154,7 @@ exported_driver_modules() {
       sub(/;$/, "", module)
       # Host-side USB support modules, not device drivers: they describe no
       # hardware, so they have no device page or index row.
-      if (module == "usb_discovery" || module == "winusb_access") {
+      if (module == "usb_discovery" || module == "winusb_access" || module == "spark") {
         next
       }
       print module
@@ -1050,14 +1050,17 @@ require_text "${driver_src_dir}/usb3_vision.rs" "fn live_u3v_command(" "USB3 Vis
 require_text "${driver_src_dir}/usb3_vision.rs" "u3v::decode_ack" "USB3 Vision live command ACK validation"
 require_text "$evidence_file" "live U3V ReadMem/WriteMem for mapped property writes, trigger writes, mapped timing writes, and \`RawRegisterAccess\`" "USB3 Vision live command evidence"
 require_text "${driver_src_dir}/usb3_vision.rs" "usb3_vision_endpoint_summary" "USB3 Vision endpoint summary code"
-require_text "$readme_file" "| [Spark Cyto](docs/devices/spark-cyto.md) | TDCL/CAN graph and transaction model for plate, detector, environment, imaging-head, and camera-binding workflows | - |" "Spark Cyto README index row"
-require_text "$device_index_file" "| \`numanager_drivers::spark_cyto\` | Spark Cyto | TDCL/CAN graph and transaction model for plate, detector, environment, imaging-head, and camera-binding workflows; physical backend is not exposed because transport binding is not evidenced" "Spark Cyto device-index row"
-require_text "$evidence_file" "Reverse engineered TDCL/CAN model; authoritative TDCL/CAN source or hardware traces are still needed" "Spark Cyto evidence row"
+require_text "$readme_file" "| [Spark Cyto](docs/devices/spark-cyto.md) | TDCL over USB for plate, detector, environment, motion, optics-carrier, injector, barcode, imaging-head, and camera workflows, including image capture over the TDCL data channel; the reader's USB id is configured because it is not evidenced | - |" "Spark Cyto README index row"
+require_text "$device_index_file" "| \`numanager_drivers::spark_cyto\` | Spark Cyto | TDCL over USB for plate, detector, environment, motion, optics-carrier, injector, barcode, imaging-head, and camera workflows, with image capture served over the TDCL data channel" "Spark Cyto device-index row"
+require_text "$evidence_file" "image capture is served over the TDCL data channel" "Spark Cyto evidence row"
 require_text "${device_docs_dir}/spark-cyto.md" "Simulated two-stage discovery plus config-backed discovery" "Spark Cyto documented config discovery"
 require_text "${device_docs_dir}/spark-cyto.md" '| `GenericCommand` | Hub/gateway metadata devices | `CapabilityRequest::GenericCommand` | Echoed command/parameter summary | Runtime token completion | No |' "Spark Cyto documented GenericCommand summary capability"
 require_text "${driver_src_dir}/spark_cyto.rs" "generic_command_value_is_hidden_maintenance(value)" "Spark Cyto custom hidden-maintenance request gate"
 require_text "${driver_src_dir}/spark_cyto.rs" "pub fn from_config(next_id: DriverId, config: &HardwareConfig) -> Result<Self>" "Spark Cyto config discovery constructor"
 require_text "${driver_src_dir}/spark_cyto.rs" "TDCL/CAN graph and transaction model with typed state operations" "Spark Cyto runtime support summary"
+require_text "${device_docs_dir}/spark-cyto.md" "Null\` until the instrument answers" "Spark Cyto temperature readback boundary"
+require_text "${device_docs_dir}/spark-cyto.md" "how many steps make a micrometre is a property of the mechanism" "Spark Cyto axis-unit boundary"
+require_text "${driver_src_dir}/spark/usb.rs" "the id is not in the recovered evidence" "Spark Cyto USB identity boundary"
 require_text "$run_examples_file" "light_source [coolled\\|pe4000\\|pe340\\|agilent\\|obis\\|omicron\\|lumencor\\|lmm5" "run examples light-source selector list"
 require_text "$run_examples_file" "digital_io\` for the Arduino/Arduino Counter/ASI Tiger/Teensy workflow" "run examples default digital-IO workflow"
 require_text "$run_examples_file" "digital_io [arduino\\|arduino_counter\\|esp32\\|teensy_pulse\\|triggerscope\\|wosm\\|modbus\\|velleman]" "run examples configured digital-IO selector list"
@@ -1159,6 +1162,11 @@ require_reverse_index_row "MCL MicroDrive/NanoDrive" mcl.md "typed motion/contro
 require_reverse_index_row "Mightex / Mightex_BLS" mightex.md "camera one-shot capture and repeated one-shot stream can use the verified vendor runtime"
 require_reverse_index_row "Okolab" okolab.md "Reverse engineered serial/configured runtime support"
 require_reverse_index_row "Photometrics PVCAM" photometrics-pvcam.md "runtime temperature read/setpoint control exist"
+require_reverse_index_row "Tecan Spark Cyto" spark-cyto.md "no command spelling has met hardware"
+require_reverse_note_shape spark-cyto.md
+require_file "${reverse_docs_dir}/spark-cyto-protocol.md"
+require_text "${reverse_docs_dir}/spark-cyto-protocol.md" "usbmon/USBPcap capture of a live session exists" "Spark Cyto protocol capture boundary"
+require_text "${reverse_docs_dir}/spark-cyto.md" "payload length matches the geometry the camera" "Spark Cyto camera evidence boundary"
 
 require_export andor_camera
 require_export agilent_laser_combiner
@@ -2016,7 +2024,7 @@ require_text "$example_outputs_file" "selected filter family: kurios" "KURIOS ge
 require_text "$example_outputs_file" "selected tunable filter: thorlabs-kurios-lctf" "KURIOS tunable-filter output"
 require_text "$example_outputs_file" "tunable filter disable completed: map keys=[output_enabled, steps]" "KURIOS disable completion output"
 require_text "$example_outputs_file" "selected temperature controller: spark-temperature" "environment generic workflow output"
-require_text "$example_outputs_file" "gas control completed: map keys=[co2_actual, co2_target, enabled]" "environment gas control output"
+require_text "$example_outputs_file" "gas control completed: map keys=[co2_actual, co2_target, enabled, o2_actual]" "environment gas control output"
 require_text "$example_outputs_file" "target: Temperature(Temperature { value: 36.5, unit: Celsius })" "environment typed temperature readback"
 require_text "$example_outputs_file" "selected environment family: andor_sdk2" "Andor SDK2 environment workflow output"
 require_text "$example_outputs_file" "selected environment family: andor_sdk3" "Andor SDK3 environment workflow output"

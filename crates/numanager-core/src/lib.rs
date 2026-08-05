@@ -247,6 +247,7 @@ pub enum Value {
     Pressure(Pressure),
     GasConcentration(GasConcentration),
     FlowRate(FlowRate),
+    Volume(Volume),
     String(String),
     Bytes(Vec<u8>),
     List(Vec<Value>),
@@ -280,6 +281,7 @@ pub enum ValueType {
     Pressure,
     GasConcentration,
     FlowRate,
+    Volume,
     String,
     Bytes,
     List,
@@ -1263,6 +1265,81 @@ impl GasConcentration {
     }
 }
 
+/// A liquid volume — what an injector dispenses, what a syringe holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Volume {
+    pub value: f64,
+    pub unit: VolumeUnit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeUnit {
+    Liters,
+    Milliliters,
+    Microliters,
+    Nanoliters,
+}
+
+impl Volume {
+    pub fn from_liters(value: f64) -> Self {
+        Self {
+            value,
+            unit: VolumeUnit::Liters,
+        }
+    }
+
+    pub fn from_milliliters(value: f64) -> Self {
+        Self {
+            value,
+            unit: VolumeUnit::Milliliters,
+        }
+    }
+
+    pub fn from_microliters(value: f64) -> Self {
+        Self {
+            value,
+            unit: VolumeUnit::Microliters,
+        }
+    }
+
+    pub fn from_nanoliters(value: f64) -> Self {
+        Self {
+            value,
+            unit: VolumeUnit::Nanoliters,
+        }
+    }
+
+    pub fn liters(self) -> f64 {
+        self.microliters() * 1e-6
+    }
+
+    pub fn milliliters(self) -> f64 {
+        self.microliters() * 1e-3
+    }
+
+    pub fn microliters(self) -> f64 {
+        match self.unit {
+            VolumeUnit::Liters => self.value * 1e6,
+            VolumeUnit::Milliliters => self.value * 1e3,
+            VolumeUnit::Microliters => self.value,
+            VolumeUnit::Nanoliters => self.value * 1e-3,
+        }
+    }
+
+    pub fn nanoliters(self) -> f64 {
+        self.microliters() * 1e3
+    }
+
+    pub fn unit_symbol(self) -> &'static str {
+        match self.unit {
+            VolumeUnit::Liters => "L",
+            VolumeUnit::Milliliters => "mL",
+            VolumeUnit::Microliters => "uL",
+            VolumeUnit::Nanoliters => "nL",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlowRate {
     pub value: f64,
@@ -1387,6 +1464,7 @@ impl PropertySchema {
             Value::Pressure(_) => ValueType::Pressure,
             Value::GasConcentration(_) => ValueType::GasConcentration,
             Value::FlowRate(_) => ValueType::FlowRate,
+            Value::Volume(_) => ValueType::Volume,
             Value::String(_) => ValueType::String,
             Value::Bytes(_) => ValueType::Bytes,
             Value::List(_) => ValueType::List,
@@ -1546,6 +1624,7 @@ impl Value {
             Value::Pressure(_) => ValueType::Pressure,
             Value::GasConcentration(_) => ValueType::GasConcentration,
             Value::FlowRate(_) => ValueType::FlowRate,
+            Value::Volume(_) => ValueType::Volume,
             Value::String(_) => ValueType::String,
             Value::Bytes(_) => ValueType::Bytes,
             Value::List(_) => ValueType::List,
@@ -1580,6 +1659,7 @@ fn canonical_range_value(value: &Value) -> Option<f64> {
         Value::Pressure(value) => Some(value.pascals()),
         Value::GasConcentration(value) => Some(value.fraction()),
         Value::FlowRate(value) => Some(value.milliliters_per_minute()),
+        Value::Volume(value) => Some(value.microliters()),
         Value::Bool(_)
         | Value::String(_)
         | Value::Bytes(_)
@@ -1805,6 +1885,12 @@ pub enum CapabilityKind {
     StageStop,
     ValveSelect,
     FilterSelect,
+    /// Shake a plate.
+    Shake,
+    /// Dispense, prime, rinse or refill a liquid injector.
+    Inject,
+    /// Read a barcode or other machine-readable label.
+    Barcode,
     /// A general focus-control surface. Implementations may be firmware
     /// autofocus units, laser triangulation gates, contrast autofocus services,
     /// or composed devices that depend on a camera, Z stage, and light source.
@@ -1839,6 +1925,9 @@ impl CapabilityKind {
             CapabilityKind::StageStop => "StageStop",
             CapabilityKind::ValveSelect => "ValveSelect",
             CapabilityKind::FilterSelect => "FilterSelect",
+            CapabilityKind::Shake => "Shake",
+            CapabilityKind::Inject => "Inject",
+            CapabilityKind::Barcode => "Barcode",
             CapabilityKind::Autofocus => "Autofocus",
             CapabilityKind::GenericCommand => "GenericCommand",
             CapabilityKind::Custom(name) => name.as_str(),
@@ -1869,6 +1958,9 @@ impl CapabilityKind {
             CapabilityKind::StageHome | CapabilityKind::StageStop => CapabilityRequestKind::None,
             CapabilityKind::ValveSelect => CapabilityRequestKind::ValveSelect,
             CapabilityKind::FilterSelect => CapabilityRequestKind::FilterSelect,
+            CapabilityKind::Shake => CapabilityRequestKind::Shake,
+            CapabilityKind::Inject => CapabilityRequestKind::Inject,
+            CapabilityKind::Barcode => CapabilityRequestKind::Barcode,
             CapabilityKind::Autofocus => CapabilityRequestKind::Autofocus,
             CapabilityKind::RawRegisterAccess
             | CapabilityKind::GenericCommand
@@ -2132,6 +2224,9 @@ pub enum CapabilityRequest {
     GasControl(GasControlRequest),
     ImagingHead(ImagingHeadRequest),
     CameraBinding(CameraBindingRequest),
+    Shake(ShakeRequest),
+    Inject(InjectRequest),
+    Barcode(BarcodeRequest),
     PulseProgram(PulseProgramRequest),
     ValveSelect(ValveSelectRequest),
     FilterSelect(FilterSelectRequest),
@@ -2159,6 +2254,9 @@ pub enum CapabilityRequestKind {
     GasControl,
     ImagingHead,
     CameraBinding,
+    Shake,
+    Inject,
+    Barcode,
     PulseProgram,
     ValveSelect,
     FilterSelect,
@@ -2187,6 +2285,9 @@ impl CapabilityRequestKind {
             | CapabilityRequestKind::GasControl
             | CapabilityRequestKind::ImagingHead
             | CapabilityRequestKind::CameraBinding
+            | CapabilityRequestKind::Shake
+            | CapabilityRequestKind::Inject
+            | CapabilityRequestKind::Barcode
             | CapabilityRequestKind::PulseProgram
             | CapabilityRequestKind::ValveSelect
             | CapabilityRequestKind::FilterSelect
@@ -2224,6 +2325,9 @@ impl CapabilityRequestKind {
             | (CapabilityRequestKind::GasControl, CapabilityRequest::GasControl(_))
             | (CapabilityRequestKind::ImagingHead, CapabilityRequest::ImagingHead(_))
             | (CapabilityRequestKind::CameraBinding, CapabilityRequest::CameraBinding(_))
+            | (CapabilityRequestKind::Shake, CapabilityRequest::Shake(_))
+            | (CapabilityRequestKind::Inject, CapabilityRequest::Inject(_))
+            | (CapabilityRequestKind::Barcode, CapabilityRequest::Barcode(_))
             | (CapabilityRequestKind::PulseProgram, CapabilityRequest::PulseProgram(_))
             | (CapabilityRequestKind::ValveSelect, CapabilityRequest::ValveSelect(_))
             | (CapabilityRequestKind::FilterSelect, CapabilityRequest::FilterSelect(_))
@@ -2258,6 +2362,9 @@ impl CapabilityRequest {
             CapabilityRequest::ScanSignalStream(_) => CapabilityRequestKind::ScanSignalStream,
             CapabilityRequest::TemperatureControl(_) => CapabilityRequestKind::TemperatureControl,
             CapabilityRequest::GasControl(_) => CapabilityRequestKind::GasControl,
+            CapabilityRequest::Shake(_) => CapabilityRequestKind::Shake,
+            CapabilityRequest::Inject(_) => CapabilityRequestKind::Inject,
+            CapabilityRequest::Barcode(_) => CapabilityRequestKind::Barcode,
             CapabilityRequest::ImagingHead(_) => CapabilityRequestKind::ImagingHead,
             CapabilityRequest::CameraBinding(_) => CapabilityRequestKind::CameraBinding,
             CapabilityRequest::PulseProgram(_) => CapabilityRequestKind::PulseProgram,
@@ -2288,6 +2395,9 @@ impl CapabilityRequest {
             CapabilityRequest::GasControl(_) => Some(CapabilityKind::GasControl),
             CapabilityRequest::ImagingHead(_) => Some(CapabilityKind::ImagingHead),
             CapabilityRequest::CameraBinding(_) => Some(CapabilityKind::CameraBinding),
+            CapabilityRequest::Shake(_) => Some(CapabilityKind::Shake),
+            CapabilityRequest::Inject(_) => Some(CapabilityKind::Inject),
+            CapabilityRequest::Barcode(_) => Some(CapabilityKind::Barcode),
             CapabilityRequest::PulseProgram(_) => Some(CapabilityKind::PulseProgram),
             CapabilityRequest::ValveSelect(_) => Some(CapabilityKind::ValveSelect),
             CapabilityRequest::FilterSelect(_) => Some(CapabilityKind::FilterSelect),
@@ -2323,6 +2433,9 @@ impl_capability_request_from!(ConfocalImageStreamRequest, ConfocalImageStream);
 impl_capability_request_from!(ScanSignalStreamRequest, ScanSignalStream);
 impl_capability_request_from!(TemperatureControlRequest, TemperatureControl);
 impl_capability_request_from!(GasControlRequest, GasControl);
+impl_capability_request_from!(ShakeRequest, Shake);
+impl_capability_request_from!(InjectRequest, Inject);
+impl_capability_request_from!(BarcodeRequest, Barcode);
 impl_capability_request_from!(ImagingHeadRequest, ImagingHead);
 impl_capability_request_from!(CameraBindingRequest, CameraBinding);
 impl_capability_request_from!(PulseProgramRequest, PulseProgram);
@@ -2762,7 +2875,161 @@ pub struct TemperatureControlRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GasControlRequest {
     pub co2_target: Option<GasConcentration>,
+    /// Oxygen setpoint, for chambers that control O2 as well as CO2 — hypoxia work needs
+    /// it, and a device that offers only CO2 leaves `None` here and reports no `o2_actual`.
+    pub o2_target: Option<GasConcentration>,
     pub enabled: Option<bool>,
+}
+
+impl GasControlRequest {
+    /// Set the CO2 concentration, leaving every other line alone.
+    pub fn co2(target: GasConcentration) -> Self {
+        Self {
+            co2_target: Some(target),
+            o2_target: None,
+            enabled: None,
+        }
+    }
+
+    /// Set the O2 concentration, leaving every other line alone.
+    pub fn o2(target: GasConcentration) -> Self {
+        Self {
+            co2_target: None,
+            o2_target: Some(target),
+            enabled: None,
+        }
+    }
+
+    /// Turn gas control on or off.
+    pub fn enabled(enabled: bool) -> Self {
+        Self {
+            co2_target: None,
+            o2_target: None,
+            enabled: Some(enabled),
+        }
+    }
+}
+
+/// What an injector should do. Priming, rinsing and backflushing take no volume; dispensing
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectAction {
+    Prime,
+    Dispense,
+    Refill,
+    Rinse,
+    Backflush,
+}
+
+impl InjectAction {
+    pub fn name(&self) -> &str {
+        match self {
+            InjectAction::Prime => "prime",
+            InjectAction::Dispense => "dispense",
+            InjectAction::Refill => "refill",
+            InjectAction::Rinse => "rinse",
+            InjectAction::Backflush => "backflush",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InjectRequest {
+    pub action: InjectAction,
+    /// Which pump, one-based, in the order the instrument carries them.
+    pub pump: u8,
+    /// Volume to dispense. Required by [`InjectAction::Dispense`] and meaningless to the
+    /// others, which a driver should reject rather than silently ignore.
+    pub volume: Option<Volume>,
+    pub speed: Option<FlowRate>,
+}
+
+impl InjectRequest {
+    /// An action that takes no volume.
+    pub fn action(action: InjectAction, pump: u8) -> Self {
+        Self {
+            action,
+            pump,
+            volume: None,
+            speed: None,
+        }
+    }
+
+    /// Dispense a volume from a pump.
+    pub fn dispense(pump: u8, volume: Volume) -> Self {
+        Self {
+            action: InjectAction::Dispense,
+            pump,
+            volume: Some(volume),
+            speed: None,
+        }
+    }
+
+    pub fn at_speed(mut self, speed: FlowRate) -> Self {
+        self.speed = Some(speed);
+        self
+    }
+}
+
+/// Shake a plate: how far, how fast, how long.
+///
+/// Submitting one configures the shaker and starts it. Fields left `None` keep whatever the
+/// device is already set to, so a caller that only wants to change the speed says so.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ShakeRequest {
+    /// Pattern name, in the device's vocabulary (e.g. linear, orbital).
+    pub mode: Option<String>,
+    /// Travel of the shaking motion.
+    pub amplitude: Option<Position>,
+    pub frequency: Option<Frequency>,
+    /// How long to shake for. A device with no timed mode runs until stopped.
+    pub duration: Option<TimeInterval>,
+}
+
+impl ShakeRequest {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = Some(mode.into());
+        self
+    }
+
+    pub fn with_amplitude(mut self, amplitude: Position) -> Self {
+        self.amplitude = Some(amplitude);
+        self
+    }
+
+    pub fn with_frequency(mut self, frequency: Frequency) -> Self {
+        self.frequency = Some(frequency);
+        self
+    }
+
+    pub fn for_duration(mut self, duration: TimeInterval) -> Self {
+        self.duration = Some(duration);
+        self
+    }
+}
+
+/// Read a label. Which label — plate, carrier, tube — is the device's business.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BarcodeRequest {
+    /// Where to read from, for a reader that serves more than one position. `None` reads
+    /// wherever the device reads by default.
+    pub position: Option<String>,
+}
+
+impl BarcodeRequest {
+    pub fn read() -> Self {
+        Self::default()
+    }
+
+    pub fn at(position: impl Into<String>) -> Self {
+        Self {
+            position: Some(position.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

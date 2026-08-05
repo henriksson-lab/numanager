@@ -628,6 +628,7 @@ fn value_to_toml(value: &Value) -> String {
         Value::Pressure(v) => format!("\"{} {}\"", v.value, v.unit_symbol()),
         Value::GasConcentration(v) => format!("\"{} {}\"", v.value, v.unit_symbol()),
         Value::FlowRate(v) => format!("\"{} {}\"", v.value, v.unit_symbol()),
+        Value::Volume(v) => format!("\"{} {}\"", v.value, v.unit_symbol()),
         Value::String(v) => format!("\"{}\"", escape(v)),
         Value::Bytes(v) => format!("\"{} bytes\"", v.len()),
         Value::List(_) | Value::Map(_) | Value::Null => "\"unsupported\"".to_string(),
