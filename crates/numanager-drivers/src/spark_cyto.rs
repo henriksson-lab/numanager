@@ -10,6 +10,7 @@
 //! capabilities and its properties.
 
 use crate::spark::backend::{self, Detector, Intent};
+use crate::spark::catalog::MoveableCarrier;
 use crate::spark::session::{BoxedTransport, Progress, SparkSession};
 use numanager_core::config::{DeviceConfig, HardwareConfig};
 use numanager_core::runtime::{DriverCandidate, DriverDiscovery};
@@ -115,6 +116,15 @@ impl DriverDiscovery for SparkCytoDiscovery {
 pub struct SparkCytoConfiguredProbe {
     label: String,
     serial_number: Option<String>,
+    // --- fitted options ---
+    // A Spark is configured per order: injectors, a barcode reader and the filter and
+    // mirror carriers are all things a given machine may simply not have. Zero (or false)
+    // means not fitted, and the device is left out of the graph entirely rather than
+    // published as something that would fail on first use.
+    injector_pumps: i64,
+    barcode_fitted: bool,
+    filter_positions: i64,
+    mirror_positions: i64,
     well: String,
     absorbance_wavelength: Wavelength,
     fluorescence_wavelength: Wavelength,
@@ -156,6 +166,10 @@ impl SparkCytoConfiguredProbe {
             fim_fault: false,
             camera_bound: false,
             imaging_mode: "brightfield".into(),
+            injector_pumps: 2,
+            barcode_fitted: true,
+            filter_positions: 4,
+            mirror_positions: 2,
         }
     }
 
@@ -194,6 +208,14 @@ impl SparkCytoConfiguredProbe {
             bool_prop(device, "camera_bound").unwrap_or(configured.camera_bound);
         configured.imaging_mode =
             string_prop(device, "imaging_mode").unwrap_or(configured.imaging_mode);
+        configured.injector_pumps =
+            i64_prop(device, "injector_pumps").unwrap_or(configured.injector_pumps);
+        configured.barcode_fitted =
+            bool_prop(device, "barcode_fitted").unwrap_or(configured.barcode_fitted);
+        configured.filter_positions =
+            i64_prop(device, "filter_positions").unwrap_or(configured.filter_positions);
+        configured.mirror_positions =
+            i64_prop(device, "mirror_positions").unwrap_or(configured.mirror_positions);
         Ok(configured)
     }
 
@@ -211,7 +233,7 @@ impl SparkCytoDriver {
     }
 
     pub fn configured(id: DriverId, configured: SparkCytoConfiguredProbe) -> Self {
-        let devices = vec![
+        let mut devices = vec![
             descriptor(
                 id,
                 300,
@@ -359,6 +381,65 @@ impl SparkCytoDriver {
                 ],
             ),
         ];
+
+        // Optional hardware. Each is appended only when the instrument has it, so an
+        // application asking what this machine can do gets an answer it can act on rather
+        // than a list of everything the model line has ever been sold with.
+        if configured.injector_pumps > 0 {
+            let mut injector = descriptor(
+                id,
+                308,
+                "spark-injector",
+                configured.serial_number.clone(),
+                &["injector"],
+                vec![
+                    sequenceable_property("pump", "Pump", ValueType::I64, None, true),
+                    sequenceable_property("volume", "Volume", ValueType::F64, Some("ul"), true),
+                    sequenceable_property("speed", "Speed", ValueType::F64, Some("ul/s"), true),
+                ],
+            );
+            injector.metadata.insert(
+                "pumps".into(),
+                Value::I64(configured.injector_pumps),
+            );
+            devices.push(injector);
+        }
+        if configured.barcode_fitted {
+            devices.push(descriptor(
+                id,
+                309,
+                "spark-barcode",
+                configured.serial_number.clone(),
+                &["barcode.reader"],
+                vec![property(
+                    "last_read",
+                    "Last read",
+                    ValueType::String,
+                    None,
+                    false,
+                )],
+            ));
+        }
+        if configured.filter_positions > 0 {
+            devices.push(carrier_descriptor(
+                id,
+                310,
+                "spark-filter-slide",
+                configured.serial_number.clone(),
+                "filter.wheel",
+                configured.filter_positions,
+            ));
+        }
+        if configured.mirror_positions > 0 {
+            devices.push(carrier_descriptor(
+                id,
+                311,
+                "spark-mirror-carrier",
+                configured.serial_number.clone(),
+                "mirror.turret",
+                configured.mirror_positions,
+            ));
+        }
         Self {
             id,
             backend: None,
@@ -436,6 +517,22 @@ impl SparkCytoDriver {
     }
 
     /// Which detector a device is, for the measurement command.
+    /// Which physical carrier a position-selecting device drives.
+    ///
+    /// A `FilterSelectRequest` carries only a number, so the carrier has to come from the
+    /// device it was addressed to — the filter slide and the dichroic carrier both select
+    /// positions and must not be confused for one another.
+    fn carrier_of(&self, device: DeviceId) -> Option<MoveableCarrier> {
+        let descriptor = self.devices.iter().find(|d| d.id == device)?;
+        if descriptor.kinds.iter().any(|k| k == "filter.wheel") {
+            Some(MoveableCarrier::ExcitationFilter)
+        } else if descriptor.kinds.iter().any(|k| k == "mirror.turret") {
+            Some(MoveableCarrier::Mirror)
+        } else {
+            None
+        }
+    }
+
     fn detector_of(&self, device: DeviceId) -> Option<Detector> {
         let descriptor = self.devices.iter().find(|d| d.id == device)?;
         if descriptor.kinds.iter().any(|k| k == "detector.absorbance") {
@@ -462,19 +559,66 @@ impl SparkCytoDriver {
     ///
     /// Returns `true` when the request went to the wire, in which case the token completes
     /// later from [`Driver::poll`] rather than now.
+    /// Refuse a request the addressed device cannot serve, before it reaches either the wire
+    /// or the model.
+    ///
+    /// This has to sit ahead of both paths. Validating inside the modeled handler left the
+    /// live path unguarded: the command was planned and written to the instrument first, and
+    /// firmware that clamps an out-of-range position into a slot holding different glass
+    /// would have reported success.
+    fn validate_request(&self, device: DeviceId, request: &CapabilityRequest) -> Result<()> {
+        let metadata = |key: &str| {
+            self.devices
+                .iter()
+                .find(|d| d.id == device)
+                .and_then(|d| match d.metadata.get(key) {
+                    Some(Value::I64(count)) => Some(*count),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        match request {
+            CapabilityRequest::FilterSelect(select) => {
+                let positions = metadata("positions");
+                let position = select.position as i64;
+                if positions > 0 && !(1..=positions).contains(&position) {
+                    return Err(Error::new(
+                        ErrorCode::InvalidCommand,
+                        format!("this carrier has positions 1..={positions}, not {position}"),
+                    ));
+                }
+            }
+            CapabilityRequest::Inject(inject) => {
+                let pumps = metadata("pumps");
+                let pump = inject.pump as i64;
+                if pumps > 0 && !(1..=pumps).contains(&pump) {
+                    return Err(Error::new(
+                        ErrorCode::InvalidCommand,
+                        format!("this injector has pumps 1..={pumps}, not {pump}"),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn dispatch_to_instrument(
         &mut self,
         token: DriverToken,
         device: DeviceId,
         request: &CapabilityRequest,
     ) -> Result<bool> {
+        self.validate_request(device, request)?;
         let detector = self.detector_of(device);
         let wavelength_nm = detector.map(|detector| match detector {
             Detector::Fluorescence => self.fluorescence_wavelength.nanometers().round() as u32,
             _ => self.absorbance_wavelength.nanometers().round() as u32,
         });
         let well = self.well.clone();
-        let Some(transactions) = backend::plan_request(request, detector, &well, wavelength_nm)
+        let carrier = self.carrier_of(device);
+        let Some(transactions) =
+            backend::plan_request(request, detector, &well, wavelength_nm, carrier)
         else {
             return Ok(false);
         };
@@ -908,12 +1052,82 @@ impl SparkCytoDriver {
             CapabilityKind::GasControl => self.invoke_gas_control(device, request),
             CapabilityKind::ImagingHead => self.invoke_imaging_head(device, request),
             CapabilityKind::CameraBinding => self.invoke_camera_binding(device, request),
+            CapabilityKind::FilterSelect => self.invoke_filter_select(device, request),
+            CapabilityKind::Inject => self.invoke_inject(device, request),
+            CapabilityKind::Barcode => self.invoke_barcode(device, request),
             CapabilityKind::GenericCommand | CapabilityKind::Custom(_) => {
                 Ok(capability_request_summary(request))
             }
             kind => Err(Error::new(
                 ErrorCode::Unsupported,
                 format!("Spark Cyto does not implement {}", kind.name()),
+            )),
+        }
+    }
+
+    /// Move a filter or mirror carrier to a position.
+    ///
+    /// The position is validated against the range the device published, so a request for
+    /// slot 7 on a four-slot slide is refused here rather than sent and left to fail — or,
+    /// worse, silently clamped by firmware into a position holding different glass.
+    fn invoke_filter_select(
+        &mut self,
+        device: DeviceId,
+        request: CapabilityRequest,
+    ) -> Result<Value> {
+        match request {
+            CapabilityRequest::FilterSelect(select) => {
+                self.validate_request(device, &CapabilityRequest::FilterSelect(select.clone()))?;
+                let value = Value::I64(select.position as i64);
+                self.emit_property(device, "position", value.clone());
+                Ok(Value::Map(BTreeMap::from([("position".into(), value)])))
+            }
+            CapabilityRequest::None => Ok(Value::Map(BTreeMap::new())),
+            other => Err(Error::new(
+                ErrorCode::InvalidCommand,
+                format!(
+                    "FilterSelect expects FilterSelectRequest, got {:?}",
+                    other.request_kind()
+                ),
+            )),
+        }
+    }
+
+    fn invoke_inject(&mut self, device: DeviceId, request: CapabilityRequest) -> Result<Value> {
+        match request {
+            CapabilityRequest::Inject(inject) => {
+                self.validate_request(device, &CapabilityRequest::Inject(inject.clone()))?;
+                Ok(Value::Map(BTreeMap::from([
+                    (
+                        "action".into(),
+                        Value::String(format!("{:?}", inject.action)),
+                    ),
+                    ("pump".into(), Value::I64(inject.pump as i64)),
+                ])))
+            }
+            other => Err(Error::new(
+                ErrorCode::InvalidCommand,
+                format!(
+                    "Inject expects InjectRequest, got {:?}",
+                    other.request_kind()
+                ),
+            )),
+        }
+    }
+
+    fn invoke_barcode(&mut self, _device: DeviceId, request: CapabilityRequest) -> Result<Value> {
+        match request {
+            // Modeled path: no label is invented. A barcode nobody read is absent, and a
+            // fabricated one would be indistinguishable from a real plate's.
+            CapabilityRequest::Barcode(_) | CapabilityRequest::None => {
+                Ok(Value::Map(BTreeMap::from([("barcode".into(), Value::Null)])))
+            }
+            other => Err(Error::new(
+                ErrorCode::InvalidCommand,
+                format!(
+                    "Barcode expects BarcodeRequest, got {:?}",
+                    other.request_kind()
+                ),
             )),
         }
     }
@@ -1237,6 +1451,16 @@ impl Driver for SparkCytoDriver {
             CapabilityKind::ImagingHead
         } else if desc.kinds.iter().any(|k| k == "camera.binding") {
             CapabilityKind::CameraBinding
+        } else if desc.kinds.iter().any(|k| k == "injector") {
+            CapabilityKind::Inject
+        } else if desc.kinds.iter().any(|k| k == "barcode.reader") {
+            CapabilityKind::Barcode
+        } else if desc
+            .kinds
+            .iter()
+            .any(|k| k == "filter.wheel" || k == "mirror.turret")
+        {
+            CapabilityKind::FilterSelect
         } else {
             CapabilityKind::GenericCommand
         };
@@ -1444,6 +1668,33 @@ fn descriptor(
         properties,
         metadata: BTreeMap::new(),
     }
+}
+
+/// A carrier that selects one of N positions — a filter slide, a dichroic mirror carrier.
+///
+/// The position property carries the range, so `numanager_core::slots::apply_slot_labels` can
+/// put the operator's names for the glass onto exactly the positions this machine has. The
+/// instrument knows how many slots it has; only a person knows what is in them.
+fn carrier_descriptor(
+    driver: DriverId,
+    node: u64,
+    label: &str,
+    serial: Option<String>,
+    kind: &str,
+    positions: i64,
+) -> DeviceDescriptor {
+    let mut position = property("position", "Position", ValueType::I64, None, true);
+    position.range = Some(Range {
+        min: Value::I64(1),
+        max: Value::I64(positions),
+    });
+    let mut device = descriptor(driver, node, label, serial, &[kind, "state.device"], vec![
+        position,
+    ]);
+    device
+        .metadata
+        .insert("positions".into(), Value::I64(positions));
+    device
 }
 
 fn resource_metadata(driver: &SparkCytoDriver) -> BTreeMap<String, Value> {

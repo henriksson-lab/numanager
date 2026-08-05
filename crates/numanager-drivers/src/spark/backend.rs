@@ -18,14 +18,15 @@
 //! they meet hardware, which is the intent — a wrong-but-declared command is better than a
 //! silently absent one.
 
-use super::catalog::MeasurementMode;
+use super::catalog::{BarcodePosition, MeasurementMode, MoveableCarrier};
 use super::commands::Command;
 use super::data;
 use super::parse::parse_kv_map;
 use super::session::Outcome;
 use super::tdcl::FrameType;
 use numanager_core::{
-    CapabilityRequest, DriverToken, GasConcentration, Temperature, TimeInterval, Value, Wavelength,
+    CapabilityRequest, DriverToken, GasConcentration, InjectAction, Temperature, TimeInterval,
+    Value, Wavelength,
 };
 use std::collections::BTreeMap;
 
@@ -86,8 +87,82 @@ pub fn plan_request(
     detector: Option<Detector>,
     well: &str,
     wavelength_nm: Option<u32>,
+    carrier: Option<MoveableCarrier>,
 ) -> Option<Vec<Transaction>> {
     match request {
+        // Which carrier moves cannot be read off the request — a `FilterSelectRequest` is
+        // just a position — so the device being addressed decides it. Without a carrier
+        // there is no safe default: moving the excitation slide when the caller meant the
+        // dichroic puts the wrong glass in the path and still reports success.
+        CapabilityRequest::FilterSelect(select) => {
+            let carrier = carrier?;
+            Some(vec![Transaction {
+                line: Command::set("CARRIER")
+                    .param("CARRIER", carrier.wire_token())
+                    .param("POSITION", select.position as i64)
+                    .build(),
+                intent: Intent::Acknowledge,
+            }])
+        }
+
+        CapabilityRequest::Inject(inject) => {
+            let keyword = match inject.action {
+                InjectAction::Dispense => "DISPENSE",
+                InjectAction::Prime => "PRIME",
+                InjectAction::Rinse => "RINSE",
+                InjectAction::Backflush => "BACKFLUSH",
+            };
+            let pump = if inject.pump >= 2 { "B" } else { "A" };
+            let mut transactions = Vec::new();
+            // Speed and volume are set on the line before the action that uses them: the
+            // action itself carries no numbers in any trace we have.
+            if let Some(speed) = inject.speed.as_ref().and_then(scalar_of) {
+                transactions.push(Transaction {
+                    line: Command::set("INJECTOR")
+                        .word("SPEED")
+                        .param("PUMP", pump)
+                        .param("VALUE", speed.round() as i64)
+                        .build(),
+                    intent: Intent::Acknowledge,
+                });
+            }
+            if let Some(volume) = inject.volume.as_ref().and_then(scalar_of) {
+                transactions.push(Transaction {
+                    line: Command::set("INJECTOR")
+                        .word("VOLUME")
+                        .param("PUMP", pump)
+                        .param("VALUE", volume.round() as i64)
+                        .build(),
+                    intent: Intent::Acknowledge,
+                });
+            }
+            transactions.push(Transaction {
+                line: Command::set("INJECTOR")
+                    .word(keyword)
+                    .param("PUMP", pump)
+                    .build(),
+                intent: Intent::Acknowledge,
+            });
+            Some(transactions)
+        }
+
+        CapabilityRequest::Barcode(read) => {
+            let position = match read.reader {
+                Some(reader) if reader >= 2 => BarcodePosition::Right,
+                _ => BarcodePosition::Left,
+            };
+            Some(vec![Transaction {
+                line: Command::query("BARCODE")
+                    .word("READ")
+                    .param("POSITION", position.wire_token())
+                    .build(),
+                // The label comes back as the reply's value, so this is a read rather than
+                // an acknowledgement — otherwise the barcode is discarded on arrival.
+                intent: Intent::Read {
+                    key: "BARCODE".to_string(),
+                },
+            }])
+        }
         CapabilityRequest::PlateMove(move_request) => Some(vec![Transaction {
             // To confirm: the notes give `PLATEPOS <position>` for the carrier, but the
             // per-well addressing form has not been seen. A reader that positions by well
@@ -190,6 +265,21 @@ pub fn plan_request(
             Some(transactions)
         }
 
+        _ => None,
+    }
+}
+
+/// The number inside a value, whatever unit wrapper it arrived in.
+///
+/// Injector volumes and speeds are microlitres and microlitres per second on the wire. A
+/// caller may express them as a bare number or as a typed quantity; both mean the same thing
+/// here, and a value that carries no number at all is dropped rather than sent as zero.
+fn scalar_of(value: &Value) -> Option<f64> {
+    match value {
+        Value::F64(v) => Some(*v),
+        Value::I64(v) => Some(*v as f64),
+        Value::Ratio(v) => Some(v.value),
+        Value::FlowRate(v) => Some(v.value),
         _ => None,
     }
 }

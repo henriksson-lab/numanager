@@ -1806,6 +1806,12 @@ pub enum CapabilityKind {
     StageStop,
     ValveSelect,
     FilterSelect,
+    /// Dispense a measured volume of reagent into the addressed well, and the
+    /// priming and washing that keeps a line fit to do so. Distinct from
+    /// [`CapabilityKind::ValveSelect`]: a valve routes flow, an injector meters it.
+    Inject,
+    /// Read a machine-readable label — a plate barcode, a rack tag, a cassette ID.
+    Barcode,
     /// A general focus-control surface. Implementations may be firmware
     /// autofocus units, laser triangulation gates, contrast autofocus services,
     /// or composed devices that depend on a camera, Z stage, and light source.
@@ -1840,6 +1846,8 @@ impl CapabilityKind {
             CapabilityKind::StageStop => "StageStop",
             CapabilityKind::ValveSelect => "ValveSelect",
             CapabilityKind::FilterSelect => "FilterSelect",
+            CapabilityKind::Inject => "Inject",
+            CapabilityKind::Barcode => "Barcode",
             CapabilityKind::Autofocus => "Autofocus",
             CapabilityKind::GenericCommand => "GenericCommand",
             CapabilityKind::Custom(name) => name.as_str(),
@@ -1870,6 +1878,8 @@ impl CapabilityKind {
             CapabilityKind::StageHome | CapabilityKind::StageStop => CapabilityRequestKind::None,
             CapabilityKind::ValveSelect => CapabilityRequestKind::ValveSelect,
             CapabilityKind::FilterSelect => CapabilityRequestKind::FilterSelect,
+            CapabilityKind::Inject => CapabilityRequestKind::Inject,
+            CapabilityKind::Barcode => CapabilityRequestKind::Barcode,
             CapabilityKind::Autofocus => CapabilityRequestKind::Autofocus,
             CapabilityKind::RawRegisterAccess
             | CapabilityKind::GenericCommand
@@ -2136,6 +2146,8 @@ pub enum CapabilityRequest {
     PulseProgram(PulseProgramRequest),
     ValveSelect(ValveSelectRequest),
     FilterSelect(FilterSelectRequest),
+    Inject(InjectRequest),
+    Barcode(BarcodeRequest),
     Autofocus(AutofocusRequest),
     GenericCommand(GenericCommandRequest),
     Custom(Value),
@@ -2163,6 +2175,8 @@ pub enum CapabilityRequestKind {
     PulseProgram,
     ValveSelect,
     FilterSelect,
+    Inject,
+    Barcode,
     Autofocus,
     GenericCommand,
     Custom,
@@ -2191,6 +2205,8 @@ impl CapabilityRequestKind {
             | CapabilityRequestKind::PulseProgram
             | CapabilityRequestKind::ValveSelect
             | CapabilityRequestKind::FilterSelect
+            | CapabilityRequestKind::Inject
+            | CapabilityRequestKind::Barcode
             | CapabilityRequestKind::Autofocus
             | CapabilityRequestKind::GenericCommand
             | CapabilityRequestKind::Custom => ValueType::Map,
@@ -2227,6 +2243,8 @@ impl CapabilityRequestKind {
             | (CapabilityRequestKind::CameraBinding, CapabilityRequest::CameraBinding(_))
             | (CapabilityRequestKind::PulseProgram, CapabilityRequest::PulseProgram(_))
             | (CapabilityRequestKind::ValveSelect, CapabilityRequest::ValveSelect(_))
+            | (CapabilityRequestKind::Inject, CapabilityRequest::Inject(_))
+            | (CapabilityRequestKind::Barcode, CapabilityRequest::Barcode(_))
             | (CapabilityRequestKind::FilterSelect, CapabilityRequest::FilterSelect(_))
             | (CapabilityRequestKind::Autofocus, CapabilityRequest::Autofocus(_))
             | (CapabilityRequestKind::GenericCommand, CapabilityRequest::GenericCommand(_))
@@ -2264,6 +2282,8 @@ impl CapabilityRequest {
             CapabilityRequest::PulseProgram(_) => CapabilityRequestKind::PulseProgram,
             CapabilityRequest::ValveSelect(_) => CapabilityRequestKind::ValveSelect,
             CapabilityRequest::FilterSelect(_) => CapabilityRequestKind::FilterSelect,
+            CapabilityRequest::Inject(_) => CapabilityRequestKind::Inject,
+            CapabilityRequest::Barcode(_) => CapabilityRequestKind::Barcode,
             CapabilityRequest::Autofocus(_) => CapabilityRequestKind::Autofocus,
             CapabilityRequest::GenericCommand(_) => CapabilityRequestKind::GenericCommand,
             CapabilityRequest::Custom(_) => CapabilityRequestKind::Custom,
@@ -2292,6 +2312,8 @@ impl CapabilityRequest {
             CapabilityRequest::PulseProgram(_) => Some(CapabilityKind::PulseProgram),
             CapabilityRequest::ValveSelect(_) => Some(CapabilityKind::ValveSelect),
             CapabilityRequest::FilterSelect(_) => Some(CapabilityKind::FilterSelect),
+            CapabilityRequest::Inject(_) => Some(CapabilityKind::Inject),
+            CapabilityRequest::Barcode(_) => Some(CapabilityKind::Barcode),
             CapabilityRequest::Autofocus(_) => Some(CapabilityKind::Autofocus),
             CapabilityRequest::None
             | CapabilityRequest::Trigger(_)
@@ -2329,6 +2351,8 @@ impl_capability_request_from!(CameraBindingRequest, CameraBinding);
 impl_capability_request_from!(PulseProgramRequest, PulseProgram);
 impl_capability_request_from!(ValveSelectRequest, ValveSelect);
 impl_capability_request_from!(FilterSelectRequest, FilterSelect);
+impl_capability_request_from!(InjectRequest, Inject);
+impl_capability_request_from!(BarcodeRequest, Barcode);
 impl_capability_request_from!(AutofocusRequest, Autofocus);
 impl_capability_request_from!(GenericCommandRequest, GenericCommand);
 
@@ -2820,6 +2844,80 @@ pub struct FilterSelectRequest {
 impl FilterSelectRequest {
     pub fn position(position: u8) -> Self {
         Self { position }
+    }
+}
+
+/// What an injector line should do.
+///
+/// Priming and rinsing are not dispensing with different numbers — they are the operations
+/// that make a dispense trustworthy, and they carry no volume the caller chooses. Keeping
+/// them as separate actions stops "prime" from being expressed as a dispense into no well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectAction {
+    /// Deliver `volume` into the addressed position.
+    Dispense,
+    /// Fill the line with reagent so the first delivery is a full dose.
+    Prime,
+    /// Flush the line with wash solvent.
+    Rinse,
+    /// Push liquid back towards the bottle to recover it.
+    Backflush,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InjectRequest {
+    pub action: InjectAction,
+    /// Which line, on an injector with more than one. Numbered from 1.
+    pub pump: u8,
+    /// Volume to move. `None` for actions the instrument meters itself.
+    pub volume: Option<Value>,
+    /// Delivery rate. `None` leaves the instrument's configured speed alone.
+    pub speed: Option<Value>,
+}
+
+impl InjectRequest {
+    pub fn dispense(pump: u8, volume: Value) -> Self {
+        Self {
+            action: InjectAction::Dispense,
+            pump,
+            volume: Some(volume),
+            speed: None,
+        }
+    }
+
+    /// Prime, rinse or backflush — the maintenance actions, which take no volume.
+    pub fn action(action: InjectAction, pump: u8) -> Self {
+        Self {
+            action,
+            pump,
+            volume: None,
+            speed: None,
+        }
+    }
+
+    pub fn at_speed(mut self, speed: Value) -> Self {
+        self.speed = Some(speed);
+        self
+    }
+}
+
+/// Read the label currently presented to a reader.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BarcodeRequest {
+    /// Which reader, on an instrument with more than one (a SPARK has one per side).
+    /// `None` means whichever the instrument treats as its default.
+    pub reader: Option<u8>,
+}
+
+impl BarcodeRequest {
+    pub fn read() -> Self {
+        Self::default()
+    }
+
+    pub fn reader(reader: u8) -> Self {
+        Self {
+            reader: Some(reader),
+        }
     }
 }
 
