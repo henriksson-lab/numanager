@@ -103,7 +103,7 @@ record enough protocol evidence for an implementation.
 | [GigE Vision cameras](docs/devices/gige-vision.md) | GVCP/GVSP model plus opt-in UDP GVCP mapped-property and raw-register access | - |
 | [Hamilton Serial MVP valves](docs/devices/hamilton-mvp.md) | Serial valve control and readback | - |
 | [Lumencor Spectra/SpectraX/CIA](docs/devices/lumencor.md) | Serial illumination control and readback | - |
-| [Lumenera Lu130 / Bio-Rad Gel Doc EZ cameras](docs/devices/lumenera.md) | USB discovery and hidden firmware initialization; imaging capture/control awaits wire-protocol evidence | - |
+| [Lumenera Lu130 / Bio-Rad Gel Doc EZ cameras](docs/devices/lumenera.md) | USB discovery, hidden firmware initialization, and 1392x1040 Raw16 capture with writable exposure; gain awaits evidence | - |
 | [Marzhauser TANGO/L-Step](docs/devices/marzhauser.md) | Serial stage control and status | - |
 | [Mad City Labs MicroDrive/NanoDrive](docs/devices/mcl.md) | USB descriptor discovery, MicroDrive raw encoder/status readback, fixed-length raw control read/actions, and firmware/runtime package checks | - |
 | [Modbus mapped IO](docs/devices/modbus.md) | Modbus RTU/TCP mapped IO with explicit real transport | - |

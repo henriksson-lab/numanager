@@ -3384,16 +3384,32 @@ mod live_sdk2 {
         Error::new(ErrorCode::Transport, message.into())
     }
 
+    /// Intel-HEX text of an SDK2 firmware package: the configured path, falling
+    /// back to a compiled-in image of the same name. The path stays required —
+    /// this package ships four scoped images and the driver has no evidence for
+    /// which one a given unit needs.
+    fn firmware_package_text(path: &str) -> Result<String> {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return Ok(text);
+        }
+        crate::bundled_firmware::image_by_name(path)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::InvalidProperty,
+                    format!(
+                        "Andor SDK2 firmware package {path} cannot be read and no image of \
+                         that name is bundled"
+                    ),
+                )
+            })
+    }
+
     pub(super) fn upload_fx2_firmware(
         identity: &Option<AndorUsbIdentity>,
         path: &str,
     ) -> Result<()> {
-        let text = std::fs::read_to_string(path).map_err(|error| {
-            Error::new(
-                ErrorCode::InvalidProperty,
-                format!("Andor SDK2 firmware package cannot be read: {error}"),
-            )
-        })?;
+        let text = firmware_package_text(path)?;
         let segments = parse_ihex(&text)?;
         let device = select_fx2_loader(identity)?;
         let (vendor_id, product_id) = (device.vendor_id(), device.product_id());

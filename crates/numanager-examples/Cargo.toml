@@ -20,6 +20,8 @@ ni-daqmx-sdk = ["numanager-imswitch-daqmx/ni-daqmx-sdk"]
 os-hid = ["numanager-drivers/os-hid"]
 os-serial = ["numanager-drivers/os-serial"]
 os-usb = ["numanager-drivers/os-usb"]
+# Only needed off Windows: `winusb_access` is always compiled on Windows.
+winusb = ["numanager-drivers/winusb"]
 
 [[bin]]
 name = "numanager-examples"

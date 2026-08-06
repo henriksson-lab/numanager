@@ -5,6 +5,9 @@ pub mod arduino;
 pub mod arduino_counter;
 pub mod asi;
 pub mod bluebox_niji;
+// Not a device family: third-party firmware images compiled into the binary,
+// shared by the drivers that have to reload a device after a power cycle.
+mod bundled_firmware;
 pub mod chuo_seiki_qt;
 pub mod cobolt;
 pub mod coherent_obis;
@@ -1269,6 +1272,7 @@ pub fn register_builtin_discovery(
     register_config!(hamilton_mvp::HamiltonMvpDiscovery::from_config);
     register_config!(lumencor::LumencorSpectraDiscovery::from_config);
     register_config!(lumencor::LumencorCiaDiscovery::from_config);
+    register_config!(lumenera::LumeneraDiscovery::from_config);
     register_config!(marzhauser::MarzhauserDiscovery::from_config);
     register_config!(mcl::MclDiscovery::from_config);
     register_config!(mightex_bls::MightexBlsDiscovery::from_config);

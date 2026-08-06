@@ -40,6 +40,8 @@ documentation and hardware validation notes, not in user examples.
 | Fluidics | `cargo run -p numanager-examples -- fluidics` ([output](example_outputs.md#fluidics)) |
 | Robot inventory | `cargo run -p numanager-examples -- robot_inventory [opentrons]` ([output](example_outputs.md#robot-inventory)) |
 | Filters | `cargo run -p numanager-examples -- filters [starlight\|prior\|ix85\|kurios]` ([output](example_outputs.md#filters)) |
+| Gel Doc EZ bring-up | `cargo run -p numanager-examples -- gel_doc [configured\|live\|initialize-firmware\|capture]`; every mode but `configured` needs `--features os-usb`, and `initialize-firmware`/`capture` drive real hardware ([output](example_outputs.md#gel-doc-ez-bring-up)) |
+| USB host access | `cargo run -p numanager-examples -- usb_access [claims\|show \<vid:pid\>\|bind \<vid:pid\> --approve]`; `bind` displaces the node's current driver and needs elevation ([output](example_outputs.md#usb-host-access)) |
 | Discovery flow | `cargo run -p numanager-examples -- discover_devices` ([output](example_outputs.md#discovery-flow)) |
 | Discovery with HID devices | `cargo run -p numanager-examples --features os-hid -- discover_devices` ([output](example_outputs.md#discovery-with-hid-devices)) |
 | Autofocus | `cargo run -p numanager-examples -- autofocus` ([output](example_outputs.md#autofocus)) |

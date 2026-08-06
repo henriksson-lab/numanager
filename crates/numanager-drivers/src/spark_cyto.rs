@@ -398,10 +398,9 @@ impl SparkCytoDriver {
                     sequenceable_property("speed", "Speed", ValueType::F64, Some("ul/s"), true),
                 ],
             );
-            injector.metadata.insert(
-                "pumps".into(),
-                Value::I64(configured.injector_pumps),
-            );
+            injector
+                .metadata
+                .insert("pumps".into(), Value::I64(configured.injector_pumps));
             devices.push(injector);
         }
         if configured.barcode_fitted {
@@ -1119,9 +1118,9 @@ impl SparkCytoDriver {
         match request {
             // Modeled path: no label is invented. A barcode nobody read is absent, and a
             // fabricated one would be indistinguishable from a real plate's.
-            CapabilityRequest::Barcode(_) | CapabilityRequest::None => {
-                Ok(Value::Map(BTreeMap::from([("barcode".into(), Value::Null)])))
-            }
+            CapabilityRequest::Barcode(_) | CapabilityRequest::None => Ok(Value::Map(
+                BTreeMap::from([("barcode".into(), Value::Null)]),
+            )),
             other => Err(Error::new(
                 ErrorCode::InvalidCommand,
                 format!(
@@ -1688,9 +1687,14 @@ fn carrier_descriptor(
         min: Value::I64(1),
         max: Value::I64(positions),
     });
-    let mut device = descriptor(driver, node, label, serial, &[kind, "state.device"], vec![
-        position,
-    ]);
+    let mut device = descriptor(
+        driver,
+        node,
+        label,
+        serial,
+        &[kind, "state.device"],
+        vec![position],
+    );
     device
         .metadata
         .insert("positions".into(), Value::I64(positions));
