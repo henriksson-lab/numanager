@@ -161,9 +161,13 @@ success, which turns a failed run into a wrong one. On connect each carrier is a
 fitted to it (`#EXCITATION CARRIER=`, `#MIRROR CARRIER=`), and the `|`-separated reply says how
 many positions exist. A position beyond that is refused before anything is sent.
 
-The check only applies once the carrier has answered. A slide that has not reported is
-`slots: Null`, not zero — refusing against a guessed count would be its own kind of wrong, and
-an unanswered carrier is not an empty one.
+Before the carrier answers, the check falls back to how many positions the machine was
+configured with (`filter_positions`, `mirror_positions`), which is also what the `position`
+property publishes as its range — a client that is offered four slots should not be able to
+send a fifth and have it reach the instrument. The instrument's own reply wins as soon as it
+lands: it is evidence, where the configured count is only a declaration. Readback keeps the
+two apart — a slide that has not reported is `slots: Null`, not zero, because an unanswered
+carrier is not an empty one.
 
 ### Property writes reach the instrument
 
@@ -211,6 +215,9 @@ transport.
 | `o2_target`, `o2_actual` | `GasConcentration` or numeric percent | Initial oxygen setpoint/readback |
 | `vendor_id`, `product_id` | `I64` or `"0x…"` string | The reader's USB identity. **No default**: it is not in the recovered evidence, so `connect()` fails until a bench records it |
 | `imaging_module`, `injector_module`, `gas_module`, `barcode_module` | `I64` | Module numbers, as an override. Normally **discovered** from `#MODULE` on connect; omitted from a command when neither configured nor discovered, rather than guessed |
+| `injector_pumps` | `I64` | Pumps fitted (default `2`). `0` leaves the injector device out of the graph; the count is published as device metadata and bounds the pump a dispense may name |
+| `barcode_fitted` | `Bool` | Whether a barcode reader is fitted (default `true`). `false` leaves the reader out of the graph |
+| `filter_positions`, `mirror_positions` | `I64` | Positions on the excitation slide and the mirror carrier (defaults `4` and `2`). `0` leaves that carrier out of the graph; the count is published as the `position` property's range and bounds a selection until the instrument's own inventory reply supersedes it |
 
 ## Examples
 

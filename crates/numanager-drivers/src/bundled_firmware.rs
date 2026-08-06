@@ -1,0 +1,51 @@
+//! Third-party device firmware compiled into the binary, so a device reloads
+//! after a power cycle without a `data/` directory to locate. A configured
+//! firmware path overrides these; it is never a prerequisite.
+//!
+//! Lookup is by file name only — which image a unit needs is per-driver
+//! evidence (Lumenera's `bcdDevice` selector, Andor's four scoped images), and
+//! this module does not guess.
+//!
+//! These images are **not** covered by this repository's MIT or Apache-2.0
+//! terms. Each `data/third_party/<vendor>/manifest.toml` records identity, size
+//! and SHA-256 per file; Andor's adds "verify redistribution terms before
+//! distribution", which travels with these bytes into any binary built here.
+
+/// `(file name, Intel-HEX text)` for one image under `data/third_party/`.
+macro_rules! bundled {
+    ($package:literal, $name:literal) => {
+        (
+            $name,
+            include_str!(concat!("../../../data/third_party/", $package, "/", $name)),
+        )
+    };
+}
+
+/// Every image compiled in, by originating package.
+///
+/// Keep this in step with the `manifest.toml` files. An image listed in a
+/// manifest but absent here is simply not bundled — a supported state; that
+/// driver then needs a configured path.
+const IMAGES: &[(&str, &str)] = &[
+    bundled!("andor", "fx2_AndorCam.hex"),
+    bundled!("andor", "fx2_temp_prog.hex"),
+    bundled!("andor", "fx2_usbcam.hex"),
+    bundled!("andor", "fx2_vendax.hex"),
+    bundled!("lumenera", "lumenera_fw_img00.hex"),
+    bundled!("lumenera", "lumenera_fw_img01.hex"),
+    bundled!("lumenera", "lumenera_fw_img16.hex"),
+];
+
+/// The compiled-in image with this exact file name, or `None` when it is not
+/// bundled. `name` may be a bare file name or a path — only the final component
+/// is matched, so a driver can pass a configured path straight through.
+pub(crate) fn image_by_name(name: &str) -> Option<&'static str> {
+    let file = name
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(name);
+    IMAGES
+        .iter()
+        .find(|(image, _)| *image == file)
+        .map(|(_, text)| *text)
+}

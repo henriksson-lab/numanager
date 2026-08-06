@@ -7,6 +7,7 @@ pub mod config;
 pub mod hid;
 pub mod runtime;
 pub mod serial;
+pub mod slots;
 pub mod usb;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -1887,9 +1888,11 @@ pub enum CapabilityKind {
     FilterSelect,
     /// Shake a plate.
     Shake,
-    /// Dispense, prime, rinse or refill a liquid injector.
+    /// Dispense a measured volume of reagent into the addressed well, and the
+    /// priming and washing that keeps a line fit to do so. Distinct from
+    /// [`CapabilityKind::ValveSelect`]: a valve routes flow, an injector meters it.
     Inject,
-    /// Read a barcode or other machine-readable label.
+    /// Read a machine-readable label — a plate barcode, a rack tag, a cassette ID.
     Barcode,
     /// A general focus-control surface. Implementations may be firmware
     /// autofocus units, laser triangulation gates, contrast autofocus services,

@@ -5,68 +5,69 @@
 | Field | Value |
 | --- | --- |
 | Target | Photometrics/QImaging PVCAM cameras |
-| Current state | `numanager_drivers::photometrics_pvcam` exposes configured discovery/evidence, explicit vendor-runtime loadability, camera-name discovery, writable exposure setting, one-shot runtime-backed capture, repeated one-shot stream support, and runtime temperature read/setpoint control |
-| Better source status | Reverse engineered notes document the PVCAM C ABI/device contract and native USB/PCIe host-command facts |
-| Next evidence | PVCAM runtime behavior notes, or legal-reviewed native USB/PCIe traces |
-| Feasibility | PVCAM library binding is feasible as an optional SDK/library adapter; SDK-free native transport is not exposed because host-command, completion, and frame-ownership evidence is absent |
+| Evidence class | Reverse engineered notes for the native USB host-command layer; open GPL kernel-driver source for the PCIe ioctl surface |
+| Current state | `numanager_drivers::photometrics_pvcam` exposes configured discovery/evidence, opt-in vendor-runtime loadability, camera-name discovery, writable exposure, one-shot capture, repeated one-shot stream, and temperature read/setpoint |
+| Hardware validation | **None.** No bench run and no captured traffic from a physical device |
+| Next evidence | A documented bench run of the runtime path, or legal-reviewed native USB/PCIe traces |
+| Feasibility | Strong as an optional, user-configured library-backed adapter. SDK-free native transport stays closed while host-command, completion, and frame-ownership evidence is absent |
 
 ## Protocol Evidence Summary
 
 | Area | Finding |
 | --- | --- |
-| PVCAM ABI | Lifecycle/discovery/open APIs include `pl_pvcam_init`, `pl_cam_get_total`, `pl_cam_get_name`, `pl_cam_open`, `pl_get_param`, `pl_set_param`, sequence setup/start/finish, EOF callbacks, and continuous acquisition |
-| Parameter model | Public API requires probing availability, runtime type, access, ranges, increments, and enum choices before using each `PARAM_*` |
-| Native USB | Notes record USB VID `0x1f12`, control OUT request `0xd4`, control IN request `0xd5`, and host-command class/framing constants |
-| Native host command frame | Recorded shape is class `0x3f`, little-endian length, begin byte `0x26`, command code at offset 4, payload/response, and end byte `0x28` |
-| Native PCIe | Notes identify `/dev/pvcam_pcie*`, GPL driver source, ioctl command/status/acquisition surfaces, shared command/response buffers, and EOF/BOF notification concepts |
-| Host command map | Local command map ties many PVCAM parameters to host command codes, including temperature, temperature setpoint, readout port, gain index, exposure time, CCL upload, start sequence, and stop |
+| Device model | Parameter-driven: availability, runtime type, access mode, range, increment, and enum choices are probed per parameter before use |
+| Operation surface | Init/uninit, camera enumeration and open/close, parameter get/set, sequence setup/start/finish, end-of-frame notification, continuous acquisition |
+| Native USB identity | VID `0x1f12`; control OUT request `0xd4`, control IN request `0xd5` |
+| Native USB frame | Class `0x3f`, little-endian length, begin `0x26`, command code at offset 4, payload/response, end `0x28` |
+| Native PCIe | Character devices `/dev/pvcam_pcie*`; ioctl command, status and acquisition surfaces; shared command/response buffers; begin/end-of-frame notification |
+| Host command map | Command codes known for temperature, temperature setpoint, readout port, gain index, exposure time, CCL upload, sequence start, and stop |
+| **Missing wire evidence** | Completion semantics, native frame layout and ownership, fault/safety vocabulary |
 
 ## Evidence To Collect
 
 | Evidence | Required observations |
 | --- | --- |
-| PVCAM library binding | Runtime loadability, library version, init/open behavior, camera name list, parameter probing output, error handling, close/uninit behavior |
-| Single capture | `pl_exp_setup_seq`, `pl_exp_start_seq`, EOF callback or wait path, frame buffer shape, `pl_exp_finish_seq`, abort behavior, and runtime frame-handle output |
-| Continuous stream | Ring-buffer ownership, frame callbacks, dropped-frame behavior, timestamps, buffer recycling, and final stream status |
-| Temperature/cooler | Implemented runtime `PARAM_TEMP` readback and `PARAM_TEMP_SETPOINT` read/write; fan/cooler status and stabilization/fault vocabulary remain to collect |
-| Native USB/PCIe | Legal-reviewed traces that pair raw traffic with public runtime output and hardware output/readback for the same action window |
+| Runtime binding | Loadability, version, init/open behavior, camera-name list, parameter probe output, error handling, close/uninit |
+| Single capture | Sequence setup/start, end-of-frame or wait path, frame buffer shape, sequence finish, abort, returned frame handle |
+| Continuous stream | Ring-buffer ownership, callbacks, dropped frames, timestamps, buffer recycling, final stream status |
+| Cooler | Fan/cooler status plus the stabilization and fault vocabulary. Temperature readback and setpoint are already implemented |
+| Native USB/PCIe | Legal-reviewed traces pairing raw traffic with runtime output and hardware readback over the same action window |
 
 ## Protocol Questions
 
 | Area | Questions |
 | --- | --- |
-| SDK binding | Whether an optional `libpvcam` backend is acceptable under the project no-SDK default policy |
-| Native USB | Whether the host-command map plus traces are enough to safely implement capture without proprietary code |
-| Native PCIe | Whether relying on the GPL kernel driver ioctl ABI is acceptable and portable |
-| Capture | Frame layout, metadata, bit depth, multi-ROI ordering, EOF completion, and abort states |
+| Runtime binding | Whether an optional user-configured PVCAM library backend is acceptable under the no-SDK default policy |
+| Native USB | Whether the host-command map plus traces suffice to implement capture safely without proprietary code |
+| Native PCIe | Whether relying on the GPL kernel driver's ioctl ABI is acceptable and portable |
+| Capture | Frame layout, metadata, bit depth, multi-ROI ordering, end-of-frame completion, abort states |
 | Safety | Cooler/fan/shutter/trigger/EM-gain fault states and safe disable behavior |
 
 ## Candidate Public Surface
 
 | Device | Capabilities | Properties |
 | --- | --- | --- |
-| PVCAM hub | runtime package checks and camera-name discovery through verified optional backend | `camera_name`, `product`, `serial_number`, `firmware_version`, `interface_type`, `support_level` |
-| Camera | `CameraCapture`; repeated one-shot `CameraStream`; native continuous stream after continuous-acquisition evidence | `exposure`, `pixel_format`, `sensor_width`, `sensor_height`, `bit_depth`; ROI, binning, readout-port, speed, and gain require parameter evidence |
-| Cooler | `TemperatureControl` for runtime temperature read/setpoint through verified PVCAM parameter APIs | `sensor_temperature`, `temperature_setpoint`; fan/status later |
+| PVCAM hub | runtime checks, camera-name discovery via the optional backend | `camera_name`, `product`, `serial_number`, `firmware_version`, `interface_type`, `support_level` |
+| Camera | `CameraCapture`; repeated one-shot `CameraStream`; native continuous stream once evidenced | `exposure`, `pixel_format`, `sensor_width`, `sensor_height`, `bit_depth`; ROI, binning, readout port, speed and gain need parameter evidence |
+| Cooler | `TemperatureControl` via the optional backend | `sensor_temperature`, `temperature_setpoint`; fan/status later |
 
-Public values must use typed units such as `TimeInterval`, `PixelCount`, and
-`Temperature`, and canonical pixel formats such as `Mono16`.
+Use typed units — `TimeInterval`, `PixelCount`, `Temperature` — and canonical
+pixel formats such as `Mono16`.
 
 ## Stop/Proceed Decision
 
 | Decision | Condition |
 | --- | --- |
-| Current implemented support | Config-backed discovery/evidence properties plus explicit opt-in vendor-runtime loadability, camera-name discovery, writable exposure setting, one-shot capture, repeated one-shot stream support, and runtime temperature read/setpoint control |
-| Proceed with optional SDK binding | Licensing/deployment policy accepts PVCAM as an optional non-default backend and behavior evidence records discovery, parameters, capture, stream, and safe shutdown |
+| Proceed with optional library binding | Licensing/deployment policy accepts PVCAM as an optional non-default backend, and a bench run records discovery, parameters, capture, stream, and safe shutdown |
 | Proceed with native SDK-free transport | Legal review plus traces prove command framing, acquisition setup, completion, frame layout, and safety behavior |
-| Block capture/control | No accepted backend policy or behavior evidence exists |
+| Block capture/control | Neither an accepted backend policy nor behavior evidence exists |
 
 ## Implementation Gate
 
-Do not advertise native continuous `CameraStream`, broader PVCAM parameter writes, raw host
-commands, CCL/SCCL upload, reset/maintenance operations, or native USB/PCIe
-transport before the corresponding evidence above is recorded in the device page
-and example output. Writable `exposure` only changes the timed-mode value used by
-the verified vendor-runtime one-shot capture and repeated one-shot stream path. Writable
-`temperature_setpoint` uses `PARAM_TEMP_SETPOINT` only after runtime
-availability, access, and range checks.
+Native continuous `CameraStream`, broader parameter writes, raw host commands,
+CCL/SCCL upload, reset/maintenance operations, and native USB/PCIe transport stay
+unadvertised until the evidence above is recorded in the device page and example
+output. Writable `exposure` changes only the timed-mode value used by the
+optional-runtime one-shot capture and repeated one-shot stream path; writable
+`temperature_setpoint` is applied only after availability, access, and range
+checks pass.

@@ -7,121 +7,51 @@ TIRF) and **NanoDrive** (piezo nanopositioners, C-Focus, waveform/sequence).
 
 | Item | Value |
 | --- | --- |
-| Status | Static protocol-evidence specification; no hardware validation yet |
-| MicroDrive evidence | Reverse engineered |
-| NanoDrive evidence | Reverse engineered |
-| Header cross-check | Public error-code declarations only |
-| Evidence class | Reverse engineered; implementation must use only the wire-level facts recorded here |
-| Independent cross-check | The wire-layer error mapping matches the vendor's published `MCL_*` error enum (see §6) |
-| Validation boundary | Transport, endpoint assignment, device identity, vendor-request codes, and the encoder wire format are recorded as candidate wire facts. **Payload field semantics, units, scaling, and completion/limit behavior are not validated** and need a hardware trace. |
-
-Function names below identify protocol roles, not public APIs.
+| Evidence class | Reverse-engineered protocol evidence, plus manufacturer documentation for the published `MCL_*` error enum |
+| Hardware validation | **None.** No captured traffic from a physical device yet |
+| Recorded as candidate wire facts | Transport, endpoint assignment, device identity, vendor-request codes, encoder wire format, error mapping |
+| **Not validated** | Payload field semantics, units, scaling, completion/limit behavior. These need captured traffic from a physical device before any driver relies on them |
 
 ---
 
 ## 1. Transport
 
-MCL talks to both product families over **libusb 1.0.21**, statically linked
-into the observed implementation. There is no kernel IOCTL layer and no vendor kernel driver
-protocol to reverse — the wire format is plain USB.
+Plain USB. There is no kernel IOCTL layer and no vendor kernel-driver protocol —
+both families speak USB vendor control transfers plus bulk endpoints directly.
 
-The entire libusb surface used by MCL code is:
+Device setup is *open + claim interface* only: no `SET_CONFIGURATION`, no device
+reset, no asynchronous transfers. All traffic is synchronous.
 
-```text
-libusb_init            libusb_get_device_list      libusb_get_device
-libusb_get_device_descriptor                       libusb_open
-libusb_claim_interface  libusb_release_interface   libusb_close
-libusb_control_transfer libusb_bulk_transfer
-libusb_free_device_list libusb_exit
-```
+### 1.1 Control transfers
 
-Notably absent: `libusb_set_configuration`, `libusb_reset_device`, and the
-entire async API. Device setup is therefore just *open + claim interface*, and
-all traffic is synchronous.
+Standard 8-byte USB setup packet (`bmRequestType`, `bRequest`, little-endian
+`wValue`/`wIndex`/`wLength`). Transfer length is `wLength`.
 
-Exactly two internal routines touch the wire:
+### 1.2 Bulk endpoints
 
-### 1.1 `RWControlPipe` — control transfers
-
-```c
-int RWControlPipe(libusb_device_handle *h, unsigned char *const setup,
-                  void *data, unsigned int len,
-                  unsigned long *transferred, bool unused, unsigned int timeout);
-```
-
-`setup` is a **raw 8-byte USB setup packet**, unpacked field-by-field and
-forwarded through libusb:
-
-| Setup byte | Field | Passed to `libusb_control_transfer` as |
+| Selector | OUT | IN |
 | --- | --- | --- |
-| `setup[0]` | `bmRequestType` | arg 2 |
-| `setup[1]` | `bRequest` | arg 3 |
-| `setup[2..3]` | `wValue`, little-endian | arg 4 |
-| `setup[4..5]` | `wIndex`, little-endian | arg 5 |
-| `setup[6..7]` | `wLength`, little-endian | arg 7 |
+| axis `N`, `N` = 1..5 | `0x0N` | `0x8N` |
+| device-global | `0x02` | `0x86` |
+| axis outside 1..5 | — | `MCL_INVALID_AXIS` (-7) |
 
-The `len` argument is **ignored** — the transfer length comes from the setup
-packet's own `wLength`. On success `*transferred` receives the byte count and
-the function returns 0.
-
-### 1.2 `RWNAxisPipe` — bulk transfers
-
-```c
-int RWNAxisPipe(libusb_device_handle *h, bool global, void *data,
-                unsigned int len, unsigned long *transferred,
-                int axis, bool in, unsigned int timeout);
-```
-
-Endpoint selection:
-
-| Selector | OUT endpoint (`in == false`) | IN endpoint (`in == true`) |
-| --- | --- | --- |
-| `global == true` | `0x02` | `0x86` |
-| `axis == 1` | `0x01` | `0x81` |
-| `axis == 2` | `0x02` | `0x82` |
-| `axis == 3` | `0x03` | `0x83` |
-| `axis == 4` | `0x04` | `0x84` |
-| `axis == 5` | `0x05` | `0x85` |
-| any other axis | — | returns `MCL_INVALID_AXIS` (-7) |
-
-So each axis owns a matched bulk endpoint pair `0x0N` / `0x8N`, and there is a
-device-global pair that shares the OUT endpoint with axis 2 but reads on a
+The device-global pair shares the OUT endpoint with axis 2 but reads on a
 dedicated IN endpoint `0x86`.
-
-Forwarded to `libusb_bulk_transfer(h, endpoint, data, len, &transferred, timeout)`.
-Returns 0 on success, `MCL_DEV_ERROR` (-2) on any libusb failure.
 
 ---
 
 ## 2. Device identity
 
-Each family records a flat device table of 4-byte entries:
-
-```c
-struct DeviceTable { uint16_t vid; uint16_t pid; };   // 4 bytes
-```
-
-`DeviceTableValidPid(pid)` scans from `supportedTable + 2` in stride 4 — i.e.
-the **second** `uint16` of each entry — confirming the field order above.
-
-### MicroDrive — `DeviceTableSize() == 10`
+### MicroDrive
 
 Vendor ID **`0x1569`** (Mad City Labs) for every entry.
 
-| PID | Two-byte status? (§4.2) |
+| Two-byte status (§4.2) | PIDs |
 | --- | --- |
-| `0x2500` | no |
-| `0x2501` | no |
-| `0x2503` | no |
-| `0x2504` | **yes** |
-| `0x2506` | **yes** |
-| `0x2522` | no |
-| `0x2580` | **yes** |
-| `0x2581` | **yes** |
-| `0x2588` | **yes** |
-| `0x3500` | no |
+| yes | `0x2504`, `0x2506`, `0x2580`, `0x2581`, `0x2588` |
+| no | `0x2500`, `0x2501`, `0x2503`, `0x2522`, `0x3500` |
 
-### NanoDrive — `DeviceTableSize() == 20`
+### NanoDrive
 
 | VID | PIDs |
 | --- | --- |
@@ -130,62 +60,48 @@ Vendor ID **`0x1569`** (Mad City Labs) for every entry.
 | `0x04B4` | `0x2235` |
 
 The last two are Cypress EZ-USB defaults — an un-renumerated device that has not
-yet loaded firmware. A driver that enumerates them must expect a device which
-does not answer MCL vendor requests until firmware load completes.
+yet loaded firmware. Such a device will not answer MCL vendor requests until
+firmware load completes.
 
 ---
 
 ## 3. MicroDrive vendor requests
 
-All are control transfers. `bmRequestType` is `0xC0` (device-to-host, vendor,
-device) for reads and `0x40` (host-to-device, vendor, device) for writes.
-`wValue`/`wIndex` carry the request arguments; `wLength` is the payload size.
+Control transfers. `bmRequestType` is `0xC0` (device-to-host, vendor, device)
+for reads and `0x40` (host-to-device, vendor, device) for writes.
+`wValue`/`wIndex` carry request arguments; `wLength` is the payload size.
 
-Recovered from internal request wrappers, each of which builds the 8-byte setup
-packet inline.
+| `bRequest` | Dir | `wLength` | Function |
+| --- | --- | --- | --- |
+| `0xC9` | IN | 1 | stop motion |
+| `0xCA` | IN | 1 | reset all encoders |
+| `0xCB` | IN | 1 | reset X encoder |
+| `0xCC` | IN | 1 | reset Y encoder |
+| `0xCD` | IN | 1 / 2 | status word (width per §4.2) |
+| `0xCE` | **OUT** | — | move variable load |
+| `0xCF` | IN | 1 | move status poll |
+| `0xD0` | IN | 2 | three-axis move profile (also micro-steps variant) |
+| `0xD1` | IN | varies | steps taken; `wLength` 41 (`0x29`) for MD6, 33 (`0x21`) for MadTweezer |
+| `0xD2` | IN | 2 | move status / previous-move step count |
+| `0xD3` | IN | 1 | reset Z encoder |
+| `0xD4` | IN | — | MD3 start |
+| `0xD5` | IN | 6 | axis assignments |
+| `0xD7` | IN | 4 | wait time |
+| `0xD8` | **OUT** | 8 | move parameters |
+| `0xDA` | IN | 4 | temperature |
+| `0xDC` | IN | 1 | set mode (M360) |
+| `0xDD` | IN | 2 | get mode (M360) |
+| `0xDE` | IN | 10 | rotation count (M360) |
+| `0xDF` | IN | 1 | move until interrupt (M360) |
+| `0xE7` | IN | 24 (`0x18`) | encoder read (§4.1) |
+| `0xE8` | IN | 2 | MD8 encoder reset |
+| `0xE9` | IN | 64 (`0x40`) | Motorized Micromirror TIRF get state, `wValue` low byte = 1 |
+| `0xEA` | **OUT** | 4 | Motorized Micromirror TIRF set state, `wValue` low byte = 1 |
 
-| `bRequest` | Dir | `wLength` | Wrapper | Public API it backs |
-| --- | --- | --- | --- | --- |
-| `0xC9` | IN | 1 | `VR_MDCommand` | `MCL_MicroDriveStop`, `MCL_MDStop` |
-| `0xCA` | IN | 1 | `VR_MDCommand` | `MCL_MicroDriveResetEncoders` |
-| `0xCB` | IN | 1 | `VR_MDCommand` | `MCL_MicroDriveResetXEncoder` |
-| `0xCC` | IN | 1 | `VR_MDCommand` | `MCL_MicroDriveResetYEncoder`, `MCL_MD1ResetEncoder` |
-| `0xCD` | IN | 1 / 2 | `VR_MDCommand`, `VR_MicroDriveCommand` | `MCL_MicroDriveStatus`, `MCL_MDStatus` |
-| `0xCE` | **OUT** | — | `VR_MicroDriveMoveVariables` | move variable load |
-| `0xCF` | IN | 1 | `VR_MicroDrive8MoveStatus` | `CheckMovementStatus`, MoveProfile poll |
-| `0xD0` | IN | 2 | `VR_MicroDriveCommand` | `MCL_MicroDriveMoveProfileXYZ`, `MCL_MicroDriveMoveProfileXYZ_MicroSteps`, `MDMoveThreeAxes` |
-| `0xD1` | IN | varies | `VR_MicroDriveStepsTaken` | steps taken; `wLength` 41 (`0x29`) for MD6, 33 (`0x21`) for MadTweezer |
-| `0xD2` | IN | 2 | `VR_MicroDriveCommand` | `MCL_MicroDriveMoveStatus`, `CountPreviousMoveProfileSteps` |
-| `0xD3` | IN | 1 | `VR_MDCommand` | `MCL_MicroDriveResetZEncoder` |
-| `0xD4` | IN | — | `VR_MD3Start`, `VR_MD3StartPic32` | MD3 start |
-| `0xD5` | IN | 6 | `VR_MicroDriveGetAssignments` | axis assignments |
-| `0xD7` | IN | 4 | `VR_GetWaitTime` | wait time |
-| `0xD8` | **OUT** | 8 | `VR_MicroDriveMoveParams` | move parameters |
-| `0xDA` | IN | 4 | `VR_GetTemperature` | temperature |
-| `0xDC` | IN | 1 | `VR_SetMode` | `SetMode` (M360) |
-| `0xDD` | IN | 2 | `VR_GetMode` | `VR_GetMode` (M360) |
-| `0xDE` | IN | 10 | `VR_GetRotations` | rotation count (M360) |
-| `0xDF` | IN | 1 | — | `MoveUntilInterrupt` (M360) |
-| `0xE7` | IN | 24 (`0x18`) | `VendorRequestEncoderRead` | encoder read (§4.1) |
-| `0xE8` | IN | 2 | `VR_MD8ResetEncoder` | MD8 encoder reset |
-| `0xE9` | IN | 64 (`0x40`) | `VR_MMTGetState` | Motorized Micromirror TIRF state, `wValue` low byte = 1 |
-| `0xEA` | **OUT** | 4 | `VR_MMTSetState` | Motorized Micromirror TIRF set state, `wValue` low byte = 1 |
-
-`VR_MDCommand` / `VR_MicroDriveCommand` / `VR_MDCommandMD6ExtendedResponse` are
-generic wrappers whose `bRequest` is a runtime argument; the table above lists
-the constants their callers actually pass. The generic form is:
-
-```text
-bmRequestType = 0xC0
-bRequest      = <command byte>
-wValue        = 0
-wIndex        = 0
-wLength       = 1  (VR_MDCommand)  |  2  (VR_MDCommandMD6ExtendedResponse)
-```
+Generic short-command form: `bmRequestType 0xC0`, `wValue 0`, `wIndex 0`,
+`wLength 1` (or 2 for the extended-response variant).
 
 ### Timeouts
-
-Two values appear throughout, chosen per request:
 
 | Timeout | Used for |
 | --- | --- |
@@ -198,8 +114,7 @@ Two values appear throughout, chosen per request:
 
 ### 4.1 Encoder values
 
-`BufferToEncoderVals(MicroDrive*, unsigned char *buf, int len, EncoderValues *out)`
-requires `len >= 24` and decodes **8 signed 24-bit little-endian counters**,
+The encoder payload is **24 bytes = 8 signed 24-bit little-endian counters**,
 packed 3 bytes each with no padding:
 
 ```text
@@ -207,122 +122,94 @@ value[k] = (int32_t)( ((int8_t)buf[3k+2] << 16) | (buf[3k+1] << 8) | buf[3k] )
            for k = 0 .. 7            // 8 * 3 = 24 bytes
 ```
 
-The high byte is sign-extended (`movsx`), the lower two are zero-extended
-(`movzx`), so each counter is a signed 24-bit quantity in a 32-bit result.
+The high byte is sign-extended; each counter is a signed 24-bit quantity.
 
-Two paths deliver the same 24-byte payload:
+Two paths deliver the same 24-byte payload, selected by PID:
 
-| Path | Static-library selection | Mechanism |
-| --- | --- | --- |
-| `VendorRequestEncoderRead` | PID `0x2588` | control IN, `bRequest 0xE7`, `wLength 0x18`, 250 ms |
-| `BulkEndpointEncoderRead` | all other MicroDrive PIDs | bulk IN on the global endpoint, into a **512-byte** buffer |
-
-`MicroDriveReadEncoders` compares the device PID at object offset `+0x1C` with
-`0x2588` and calls `VendorRequestEncoderRead` only on equality; the not-equal
-branch calls `BulkEndpointEncoderRead`.
+| PID | Mechanism |
+| --- | --- |
+| `0x2588` | control IN, `bRequest 0xE7`, `wLength 0x18`, 250 ms |
+| all other MicroDrive PIDs | bulk IN on the global endpoint, into a **512-byte** buffer |
 
 ### 4.2 Status word
 
-`HasTwoByteStatus(pid)` returns true for PIDs `0x2504`, `0x2506`, `0x2580`,
-`0x2581`, `0x2588`, and false for the rest. This selects a 1-byte versus 2-byte
-status response — i.e. `wLength` on `bRequest 0xCD` and the `VR_MDCommand` vs
-`VR_MicroDriveCommand` wrapper.
+PIDs `0x2504`, `0x2506`, `0x2580`, `0x2581`, `0x2588` return a **2-byte** status
+word; the remaining MicroDrive PIDs return **1 byte**. This selects `wLength` on
+`bRequest 0xCD`.
 
-`RemoveInvalidAxesFromStatus(MicroDrive*, uint16_t status)` masks the word with
-**two bits per axis**:
+The word carries **two bits per axis**: axis `N` occupies bits `2N-2` and
+`2N-1`, so axes 1..5 occupy bits 0–9. Bits for axes the device does not have are
+masked off (axis 1 → `0xFFFC`, 2 → `0xFFF3`, 3 → `0xFFCF`, 4 → `0xFF3F`,
+5 → `0xFCFF`). The axis complement is per-model, driven by a per-device
+axis-presence bitmask.
 
-| Axis | Status bits | Mask applied when axis absent |
-| --- | --- | --- |
-| 1 | 0–1 | `0xFFFC` |
-| 2 | 2–3 | `0xFFF3` |
-| 3 | 4–5 | `0xFFCF` |
-| 4 | 6–7 | `0xFF3F` |
-| 5 | 8–9 | `0xFCFF` |
-
-Which axes exist is read from a per-device bitmask (bits 1, 2, 4, 8 tested), and
-the whole routine dispatches through a jump table on PID (`pid - 0x2501`, range
-check `> 0x87`), so the axis complement is per-model.
-
-**The meaning of the two bits per axis is not recovered.** Forward/reverse limit
+**The meaning of the two bits per axis is not validated.** Forward/reverse limit
 switch is the obvious reading, but that is an inference and must be confirmed on
 hardware before any driver treats a bit as a limit.
-
-### 4.3 Driver-state layout
-
-Observed driver-state fields used by the wire layer:
-
-| Offset | Contents |
-| --- | --- |
-| `+0x08` | `libusb_device_handle *` |
-| `+0x1C` | `uint16_t` USB PID |
-| `+0x10C` | flags byte; bit `0x10` tested in `BulkEndpointEncoderRead` |
-| `+0x3D2` | per-axis presence bitmask |
 
 ---
 
 ## 5. NanoDrive vendor requests
 
-Same transport. Recovered from internal request wrappers across movement,
-waveform, sequence, focus, clock, encoder, information, and temperature paths.
+Same transport.
 
-| `bRequest` | Dir | Wrapper / API |
+| `bRequest` | Dir | Function |
 | --- | --- | --- |
-| `0xB1` | OUT | `VR_ChangeClock` |
-| `0xBA` | IN | `NanoDrive::VR_GetFWVersion` |
-| `0xC2` | IN | `VR_GetClockFreq` |
-| `0xC3` | OUT | `VR_SetWFFreq` (waveform frequency) |
-| `0xC5` | IN | `VR_MeasureTemp` |
-| `0xC9` | IN | `EncoderReadBuffer` |
-| `0xCD` | IN | `VR_CFocusStatus` |
-| `0xCE` | OUT | `VR_CFocusStep` |
-| `0xCF` | IN | `VR_CFocusIsFocusLocked` |
-| `0xD0` | OUT | `IssBindClockToAxis` |
-| `0xD1` | OUT | `IssConfigurePolarity` |
-| `0xD2` | OUT | `IssSetClock` |
-| `0xD3` | OUT | `IssResetDefaults` |
-| `0xD4` | IN | `AdcReadAxis` (position read) |
-| `0xD5` | IN | `VR_CFocusSetFocus` |
-| `0xD6` | OUT | `MCL_DdsScanIncrement` |
-| `0xD7` | OUT | `VR_WFMA_Setup` (multi-axis waveform) |
-| `0xD8` | IN | `VR_WFMA_Trigger` |
-| `0xD9` | IN | `VR_WFMA_Status` |
-| `0xDA` | IN | `VR_WFMA_Stop` |
-| `0xDB` | IN | `VR_WFMA_DebugStatus` |
-| `0xDC` | IN | `VR_GetDacPosition` |
-| `0xDD` | IN | `VR_SequenceSetup` |
-| `0xDE` | IN | `VR_SequenceStart` |
-| `0xDF` | IN | `VR_SequenceStop` |
-| `0xE0` | OUT | `MCL_SequenceClear` |
-| `0xE1` | IN | `NanoDrive::VR_GetMaxSequence` |
-| `0xE2` | IN | `VR_WFMA_Trigger_UserInt` |
+| `0xB1` | OUT | change clock |
+| `0xBA` | IN | get firmware version |
+| `0xC2` | IN | get clock frequency |
+| `0xC3` | OUT | set waveform frequency |
+| `0xC5` | IN | measure temperature |
+| `0xC9` | IN | encoder read buffer |
+| `0xCD` | IN | C-Focus status |
+| `0xCE` | OUT | C-Focus step |
+| `0xCF` | IN | C-Focus lock state |
+| `0xD0` | OUT | bind clock to axis |
+| `0xD1` | OUT | configure polarity |
+| `0xD2` | OUT | set clock |
+| `0xD3` | OUT | reset defaults |
+| `0xD4` | IN | ADC read axis (position read) |
+| `0xD5` | IN | C-Focus set focus |
+| `0xD6` | OUT | DDS scan increment |
+| `0xD7` | OUT | multi-axis waveform setup |
+| `0xD8` | IN | multi-axis waveform trigger |
+| `0xD9` | IN | multi-axis waveform status |
+| `0xDA` | IN | multi-axis waveform stop |
+| `0xDB` | IN | multi-axis waveform debug status |
+| `0xDC` | IN | get DAC position |
+| `0xDD` | IN | sequence setup |
+| `0xDE` | IN | sequence start |
+| `0xDF` | IN | sequence stop |
+| `0xE0` | OUT | sequence clear |
+| `0xE1` | IN | get max sequence length |
+| `0xE2` | IN | waveform trigger with user interrupt |
 
 > The MicroDrive and NanoDrive request spaces **overlap numerically but are not
 > compatible** — `0xD4` is "MD3 start" on MicroDrive and "ADC read axis" on
 > NanoDrive. Dispatch must be keyed on PID first.
 
-Bulk (`RWNAxisPipe`) is used by movement, encoder, sequence, and waveform paths
--- i.e. per-axis position
-streaming, waveform upload, and sequence data ride the axis bulk endpoints while
-configuration rides control transfers. `DAC()` (position write) and `ADC()`
-(position read) are the primary movement primitives.
+Bulk endpoints carry the movement, encoder, sequence, and waveform data paths —
+per-axis position streaming, waveform upload, and sequence data ride the axis
+bulk endpoints while configuration rides control transfers. DAC (position write)
+and ADC (position read) are the primary movement primitives.
 
 ---
 
 ## 6. Error mapping
 
-`RWControlPipe` translates libusb return codes:
+USB transfer outcomes map to the `MCL_*` result codes as follows:
 
-| libusb result | MCL result |
+| USB outcome | MCL result |
 | --- | --- |
-| `>= 0` | `MCL_SUCCESS` (0), `*transferred` set |
-| `LIBUSB_ERROR_PIPE` (-9), `LIBUSB_ERROR_TIMEOUT` (-7) | `MCL_USAGE_ERROR` (-4) |
-| `LIBUSB_ERROR_NO_DEVICE` (-4), `LIBUSB_ERROR_IO` (-1) | `MCL_DEV_NOT_ATTACHED` (-3) |
+| success | `MCL_SUCCESS` (0), transferred byte count set |
+| pipe/stall or timeout | `MCL_USAGE_ERROR` (-4) |
+| no device, or I/O error | `MCL_DEV_NOT_ATTACHED` (-3) |
 | anything else | `MCL_DEV_ERROR` (-2) |
 
-`RWNAxisPipe` returns `MCL_SUCCESS` (0) on success, `MCL_DEV_ERROR` (-2) on any
-libusb failure, `MCL_INVALID_AXIS` (-7) for an axis outside 1–5.
+Bulk transfers return `MCL_SUCCESS` (0), `MCL_DEV_ERROR` (-2) on any failure, or
+`MCL_INVALID_AXIS` (-7) for an axis outside 1–5.
 
-These land exactly on the vendor's published error enum:
+These land exactly on the manufacturer-published error enum:
 
 ```text
 MCL_SUCCESS 0   MCL_GENERAL_ERROR -1   MCL_DEV_ERROR -2   MCL_DEV_NOT_ATTACHED -3
@@ -331,47 +218,26 @@ MCL_INVALID_AXIS -7  MCL_INVALID_HANDLE -8  MCL_INVALID_DRIVER -9
 MCL_SEQ_NOT_VALID -10   MCL_BLOCKED_BY_TIRFLOCK -11
 ```
 
-Note that a **timeout is reported as `MCL_USAGE_ERROR`**, not as a distinct
-timeout code — a driver cannot distinguish "device busy" from "bad request" by
-return code alone.
+A **timeout is reported as `MCL_USAGE_ERROR`**, not as a distinct timeout code —
+a driver cannot distinguish "device busy" from "bad request" by return code alone.
 
 ---
 
 ## 7. Session sequence
 
-From the recorded startup path and libusb surface:
-
-1. `libusb_init`
-2. `libusb_get_device_list`
-3. For each device: `libusb_get_device_descriptor`, match `idVendor`/`idProduct`
-   against `supportedTable` (§2)
-4. `libusb_open`
-5. `libusb_claim_interface`
-6. Device string descriptors are read for serial/product identification
-7. Traffic per §1
-8. Teardown: `libusb_release_interface`, `libusb_close`,
-   `libusb_free_device_list`, `libusb_exit`
-
-No `SET_CONFIGURATION` and no device reset are issued, so the device is expected
-to be in its default configuration on open.
+Enumerate → match `idVendor`/`idProduct` against §2 → open → claim interface →
+read string descriptors for serial/product identity → traffic per §1 → release
+interface and close. No `SET_CONFIGURATION` and no device reset are issued, so
+the device is expected to be in its default configuration on open.
 
 ---
 
 ## 8. Implementation checklist for an SDK-free driver
 
-Recovered and safe to implement from this document:
+Everything in §1–§7 is safe to implement from this document.
 
-- Full USB transport: control setup-packet layout, per-axis bulk endpoint map,
-  timeouts, and the libusb-to-`MCL_*` error mapping.
-- Device identification: exact VID/PID tables for both families, including the
-  Cypress pre-firmware IDs.
-- Vendor request numbers and directions for both families, tied to the public
-  API each one backs.
-- Encoder wire format (8 × signed 24-bit LE) and status-word axis bit layout.
-- Open/claim/close sequence.
-
-Needs a hardware trace before typed motion/control status
-(`docs/reverse/trace-capture-guide.md`):
+**Untested — needs captured traffic from a physical device**
+(`docs/reverse/trace-capture-guide.md`) before typed motion/control status:
 
 | Gap | What the trace must show |
 | --- | --- |
@@ -379,11 +245,11 @@ Needs a hardware trace before typed motion/control status
 | Move payload fields | `wValue`/`wIndex` field packing for `0xCE` move variables and the 8-byte `0xD8` move parameters, and the units of each field |
 | Completion | Whether `0xCF` / `0xD2` polling is level- or edge-triggered, the poll cadence, and what a completed vs interrupted move looks like |
 | Encoder counter mapping | What the 8 counters map to on a given axis count and device model |
-| Encoder scaling | Counts-to-microns per model; none of the scaling constants have been located yet |
-| Homing / limits | `FindHome` behavior and what the device reports at a hard limit |
+| Encoder scaling | Counts-to-microns per model; no scaling constants are known |
+| Homing / limits | Homing behavior and what the device reports at a hard limit |
 | NanoDrive DAC/ADC | Sample encoding on the axis bulk endpoints, and calibration/range readback |
 | Firmware load | Whether a device enumerating as `0547:8613` / `04B4:2235` needs a host-side firmware download before it answers vendor requests |
 
-Until those exist, expose only the readback/action surface whose wire fields
-are recorded above. Motion hardware can damage itself and its surroundings on a
-bad command, so typed motion/control needs the limit and completion facts above.
+Until those exist, expose only the readback/action surface whose wire fields are
+recorded above. Motion hardware can damage itself and its surroundings on a bad
+command, so typed motion/control needs the limit and completion facts above.

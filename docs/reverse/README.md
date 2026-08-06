@@ -1,16 +1,11 @@
 # Protocol Evidence Notes
 
-This directory tracks protocol targets where the normal source ladder has not
-yet produced enough evidence for a default SDK-free driver.
+Interface facts and validation status per protocol target, used to decide
+whether a target can advance to a driver implementation.
 
-Use these notes to decide whether a target can advance to a clean
-hardware-interface spec and then to a driver implementation.
-
-One entry is the inverse case: the USB3 Vision / GigE Vision / GenICam note
-records a target whose governing standards are public and authoritative, so it is
-blocked on implementation and hardware validation rather than on evidence. It is
-kept here because it is the same decision record — which documents justify which
-behavior, and what still needs a bench run.
+Most entries are evidence-limited. One is the inverse case: USB3 Vision / GigE
+Vision / GenICam is governed by public standards, so it is blocked on
+implementation and hardware validation rather than on evidence.
 
 The current requirement-level status is summarized in
 [`evidence-gate-audit.md`](evidence-gate-audit.md). The source policy and
@@ -18,22 +13,29 @@ clean-room criteria are in [`../protocol_evidence_plan.md`](../protocol_evidence
 
 | Target | Note | Current disposition |
 | --- | --- | --- |
-| ABS Camera | [`abs-camera.md`](abs-camera.md) | Reverse engineered evidence exists; one-shot capture can use the verified CamUSB runtime with explicit async software trigger; native transport, streaming, and broader controls are not exposed because USB protocol evidence is absent |
+| ABS Camera | [`abs-camera.md`](abs-camera.md) | Reverse engineered evidence exists; one-shot capture can use an optional vendor runtime, loaded only through explicit user configuration, with an explicit async software trigger; native transport, streaming, and broader controls are not exposed because USB protocol evidence is absent |
 | Agilent Laser Combiner | [`agilent-laser-combiner.md`](agilent-laser-combiner.md), [`agilent-laser-combiner-protocol.md`](agilent-laser-combiner-protocol.md) | Transport grammar, full opcode table, and output units recorded from external evidence; hardware-support claims wait for a real board to confirm the handshake and the missing interlock/fault surface |
 | MCL MicroDrive/NanoDrive | [`mcl.md`](mcl.md), [`mcl-protocol.md`](mcl-protocol.md) | Reverse engineered USB transport, endpoint map, VID/PID tables, vendor-request codes for both families, encoder format, and error mapping; typed motion/control is not exposed because payload fields, status-bit meaning, units/calibration, and move completion evidence is absent |
-| Mightex / Mightex_BLS | [`mightex.md`](mightex.md) | BLS/SLC has reverse engineered HID output; camera one-shot capture and repeated one-shot stream can use the verified vendor runtime; native frame transport is not exposed because protocol evidence is absent |
-| Okolab | [`okolab.md`](okolab.md) | Reverse engineered serial/configured runtime support exists from the frame grammar, checksum, handshake, error vocabulary, and `okolib.db` command dictionary in [`okolab-protocol.md`](okolab-protocol.md); hardware-support claims wait for ACK/status/fault replies and matching runtime output/readback traces |
+| Mightex / Mightex_BLS | [`mightex.md`](mightex.md) | BLS/SLC has reverse engineered HID output; camera one-shot capture and repeated one-shot stream can use an optional vendor runtime loaded only through explicit user configuration; native frame transport is not exposed because protocol evidence is absent |
+| Okolab | [`okolab.md`](okolab.md) | Reverse engineered serial/configured runtime support exists from the frame grammar, checksum, handshake, error vocabulary, and command dictionary in [`okolab-protocol.md`](okolab-protocol.md); hardware-support claims wait for ACK/status/fault replies and matching runtime output/readback traces |
 | Photometrics PVCAM | [`photometrics-pvcam.md`](photometrics-pvcam.md) | Configured evidence plus runtime-package file-status/digest/loadability/ABI-symbol checks, camera-name discovery, writable exposure setting, one-shot capture, repeated one-shot stream support, and runtime temperature read/setpoint control exist; native continuous streaming and broader control require further validation or validated native USB/PCIe traces |
+| ToupTek USB cameras | [`toupcam-protocol.md`](toupcam-protocol.md), [`toupcam-model-registry.md`](toupcam-model-registry.md), [`toupcam-u3cmos03100kpa.md`](toupcam-u3cmos03100kpa.md) | Interface specification covering device shape, register access, sensor register map, exposure and gain arithmetic, streaming and frame framing, plus a 1337-variant camera catalogue. Models with a specified sensor register map are programmed directly; others fall back to a recorded open sequence. Open, streaming, capture, exposure and gain are hardware-validated on one model; the catalogue is corroborated on two |
 | Squid controller | [`squid-protocol.md`](squid-protocol.md) | Open firmware/controller source protocol spec for the existing simulated protocol-backed fixture; hardware validation note pending |
 | Tecan Spark Cyto | [`spark-cyto.md`](spark-cyto.md), [`spark-cyto-protocol.md`](spark-cyto-protocol.md) | Reverse engineered TDCL 2.0 framing, checksum, frame types, command grammar, data-package field codes, module topology, and endpoint/channel map recorded from the vendor Windows stack; plate, measurement, environment, motion, carrier, injector, and barcode support is written from the recovered command dictionary and reaches a configured USB transport, while no command spelling has met hardware, camera capture rides the TDCL data channel with frame geometry read back from the instrument, and both devices' VID/PID are absent |
-| 3Z Optics IRIS | [`3z-optics-protocol.md`](3z-optics-protocol.md) | Source-backed Modbus-style serial register/coil map exists from Micro-Manager `3Z_Optics`; official product pages confirm IRIS serial/TTL/controller operation, while the official register map and hardware validation are not yet recorded |
+| 3Z Optics IRIS | [`3z-optics-protocol.md`](3z-optics-protocol.md) | A Modbus-style serial register/coil map exists from an audited open adapter source; official product documentation confirms IRIS serial/TTL/controller operation, while the official register map and hardware validation are not yet recorded |
 | USB3 Vision / GigE Vision / GenICam | [`usb3-vision-genicam.md`](usb3-vision-genicam.md) | Not evidence-blocked: the governing standards are public, and GenCP/GenApi/SFNC/PFNC are free from EMVA. Live U3V `ReadMem`/`WriteMem` and UDP GVCP register paths exist, stream framing types are written but unfed, and the GenICam node map is not yet bound to either transport; stream receive plus a real camera are what remain |
 | WOSM MCU | [`wosm-protocol.md`](wosm-protocol.md) | Project-published v0.900 command page documents the current text-command surface for `dig_out`, `dig_in`, `dac_dest`, `stg_out_*`, macro timing, WML macro control, and controller-PC Telnet port `1023`; legacy sequence, blanking, pull-up, and raw analog-input commands remain separately source-backed |
 | Xeryon ASCII and integrated CANopen stages | [`xeryon.md`](xeryon.md) | Manufacturer controller manuals document ASCII serial framing, command/readback tags, units, and status bits; Xeryon integrated-controller materials identify CANopen/CiA 402 and EDS/example paths; native ASCII support exists, and integrated CANopen support includes transaction planning, optional live SocketCAN/SLCAN NMT/SDO execution, and EDS object parsing |
 
-Reverse engineered tooling and raw outputs are kept outside this
-repository. Curate only wire-level facts, artifact hashes, and validation gaps
-into the target note. Do not commit proprietary binaries, analysis tools, or
+These notes are the **specification side** and are kept clean-room. Record what
+the interface is and what has been validated; state evidence by class
+(manufacturer documentation, a public standard, open firmware or an audited open
+adapter source, captured traffic from a physical device, a documented bench run).
+
+Do not record how a fact was obtained from vendor software: no vendor binary
+names, paths, versions or hashes, no addresses or symbol names taken from vendor
+code, no analysis tooling or technique. Analysis records, tooling and raw
+captures live outside this repository. Do not commit proprietary binaries or
 large raw dumps.
 
 When the static pass reaches a serial/HID/USB boundary, use

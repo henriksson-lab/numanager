@@ -2884,6 +2884,84 @@ imaging.mode: String("fluorescence")
 camera.imaging_mode: String("fluorescence")
 ```
 
+## USB host access
+
+Command:
+
+```sh
+cargo run -p numanager-examples -- usb_access claims
+```
+
+Recorded output:
+
+```text
+10 vendor claim(s) across 6 builtin USB driver(s):
+  04b4  andor-camera
+  136e  andor-camera
+  1724  lumenera
+  5354  lumenera
+  1569  mcl
+  1f12  photometrics-pvcam
+  04b4  toupcam
+  0547  toupcam
+  232f  toupcam
+  10cf  velleman
+```
+
+`show` and `bind` inspect and change a real device node, so their output is
+not recorded here. `bind` displaces whatever driver currently owns the node
+and needs an elevated process, so it does nothing without `--approve`.
+
+## Gel Doc EZ bring-up
+
+Command:
+
+```sh
+cargo run -p numanager-examples -- gel_doc
+```
+
+Recorded output:
+
+```text
+configured topology:
+[[devices]]
+id = 4200
+label = "Gel Doc EZ camera"
+driver = "geldoc_ez"
+property.connect = false
+property.firmware_dir = "data/third_party/lumenera"
+property.product_id = 32922
+
+detected 1 candidate driver(s)
+candidate: Gel Doc EZ camera [firmware-loader] (5354:809a)
+device: Gel Doc EZ camera camera, camera.scientific, detector.mono, reverse.engineered
+  model = String("Lu130")
+  serial_number = String("")
+  sensor = String("Sony ICX205")
+  bit_depth = I64(12)
+  width = PixelCount(PixelCount(1392))
+  height = PixelCount(PixelCount(1040))
+  pixel_format = String("Mono16")
+  exposure = TimeInterval(TimeInterval { value: 50.0, unit: Milliseconds })
+  gain = F64(1.0)
+  firmware_loaded = Bool(false)
+  connect = Bool(false)
+  firmware_stage = String("firmware-loader")
+  firmware_dir = String("data/third_party/lumenera")
+  firmware_image = String("lumenera_fw_img01.hex")
+  usb_vendor_id = I64(21332)
+  usb_product_id = I64(32922)
+  usb_identity = Null
+  support_level = USB discovery of both stages, hardware-validated two-stage firmware down…
+  protocol_status = acquisition sequence, geometry, exposure and frame layout recorded from …
+  capture_gate = Lumenera Lu130 capture requires a live USB session: build with numanager…
+  control_gate = Lumenera Lu130 gain control is not evidenced: the per-tap register mappi…
+  capture refused: Lumenera Lu130 capture requires a live USB session: build with numanager-drivers/os-usb and configure connect=true on an imaging-stage device
+```
+
+The `live`, `initialize-firmware` and `capture` modes need `--features os-usb`
+and real hardware, so their output is not recorded here.
+
 ## Fluidics
 
 Command:

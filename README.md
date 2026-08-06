@@ -103,7 +103,7 @@ record enough protocol evidence for an implementation.
 | [GigE Vision cameras](docs/devices/gige-vision.md) | GVCP/GVSP model plus opt-in UDP GVCP mapped-property and raw-register access | - |
 | [Hamilton Serial MVP valves](docs/devices/hamilton-mvp.md) | Serial valve control and readback | - |
 | [Lumencor Spectra/SpectraX/CIA](docs/devices/lumencor.md) | Serial illumination control and readback | - |
-| [Lumenera Lu130 / Bio-Rad Gel Doc EZ cameras](docs/devices/lumenera.md) | USB discovery and hidden firmware initialization; imaging capture/control awaits wire-protocol evidence | - |
+| [Lumenera Lu130 / Bio-Rad Gel Doc EZ cameras](docs/devices/lumenera.md) | USB discovery, hidden firmware initialization, and 1392x1040 Raw16 capture with writable exposure; gain awaits evidence | - |
 | [Marzhauser TANGO/L-Step](docs/devices/marzhauser.md) | Serial stage control and status | - |
 | [Mad City Labs MicroDrive/NanoDrive](docs/devices/mcl.md) | USB descriptor discovery, MicroDrive raw encoder/status readback, fixed-length raw control read/actions, and firmware/runtime package checks | - |
 | [Modbus mapped IO](docs/devices/modbus.md) | Modbus RTU/TCP mapped IO with explicit real transport | - |
@@ -131,7 +131,7 @@ record enough protocol evidence for an implementation.
 | [Thorlabs SC10](docs/devices/thorlabs-sc10.md) | Serial shutter control and readback | - |
 | [TriggerScope](docs/devices/triggerscope.md) | Serial TTL/camera trigger, DAC, focus, and timing-program control | - |
 | [Trinamic TMCL stages](docs/devices/trinamic-tmcl.md) | Serial motion and readback | - |
-| [Toupcam/AmScope cameras](docs/devices/toupcam.md) | Config-backed geometry plus live userspace USB camera backend and local frame source | ✓ |
+| [Toupcam/AmScope cameras](docs/devices/toupcam.md) | Config-backed geometry plus live userspace USB camera backend with per-model profiles and local frame source | ✓ |
 | [USB3 Vision cameras](docs/devices/usb3-vision.md) | U3V command/stream model plus opt-in USB open, endpoint catalog, and live command ReadMem/WriteMem path | - |
 | [Velleman K8055/VM110 and K8061/VM140 IO boards](docs/devices/velleman.md) | USB analog, digital, PWM, and counter IO | - |
 | [Warwick Open-Source Microscope](docs/devices/wosm.md) | v0.900 command-page-backed TCP stage, switch/shutter, light, and digital input plus legacy switch-sequence, blanking, pull-up, and raw analog readback | - |

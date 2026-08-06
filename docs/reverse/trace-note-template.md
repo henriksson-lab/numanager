@@ -20,8 +20,8 @@ logs, or large binary traces into the repository.
 | --- | --- |
 | Hardware identity | Model, serial/asset tag, firmware, modules, channels |
 | Host identity | OS, driver stack, USB/serial adapter, VM/pass-through |
-| Software identity | Micro-Manager build, vendor package, numanager commit |
-| Config identity | Micro-Manager config or numanager discovery/config record |
+| Software identity | Name and version of the host software that drove the device; numanager commit |
+| Config identity | Device configuration used, or the numanager discovery/config record |
 | Capture tool | Tool/version/filter |
 | Operator and date |  |
 | Safety setup | Output limits, motion limits, interlocks, load/sample state |

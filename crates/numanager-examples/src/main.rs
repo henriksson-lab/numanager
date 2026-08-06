@@ -9,6 +9,7 @@ mod discover_devices;
 mod environment_control;
 mod filters;
 mod fluidics;
+mod gel_doc;
 mod laser;
 mod light_source;
 mod lsm_common;
@@ -33,6 +34,7 @@ mod software_gui;
 mod spark_cyto;
 mod squid;
 mod timing_plan;
+mod usb_access;
 
 const EXAMPLES: &[&str] = &[
     "autofocus",
@@ -46,6 +48,7 @@ const EXAMPLES: &[&str] = &[
     "environment_control",
     "filters",
     "fluidics",
+    "gel_doc",
     "laser",
     "light_source",
     "lsm_composed_workflow",
@@ -67,6 +70,7 @@ const EXAMPLES: &[&str] = &[
     "spark_cyto",
     "squid",
     "timing_plan",
+    "usb_access",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -87,6 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "environment_control" => environment_control::run()?,
         "filters" => filters::run()?,
         "fluidics" => fluidics::run()?,
+        "gel_doc" => gel_doc::run()?,
         "laser" => laser::run()?,
         "light_source" => light_source::run()?,
         "lsm_composed_workflow" => lsm_composed_workflow::run()?,
@@ -108,6 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "spark_cyto" => spark_cyto::run()?,
         "squid" => squid::run()?,
         "timing_plan" => timing_plan::run()?,
+        "usb_access" => usb_access::run()?,
         _ => {
             eprintln!("unknown example: {example}");
             print_usage();

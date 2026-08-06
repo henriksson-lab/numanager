@@ -1,59 +1,40 @@
 # Squid Hardware Interface Specification
 
-This document is a first-pass interface specification for a clean-room
-`numanager` driver for the Cephla Squid controller. It is extracted from the
-current Squid repository's active controller firmware and Python host wrapper,
-not from the legacy firmware sketches.
+Interface specification for a clean-room `numanager` driver for the Cephla Squid
+controller.
 
-Primary source files used:
-
-- controller protocol constants
-- serial communication implementation
-- command dispatch implementation
-- stage command implementation
-- light command implementation
-- shared firmware constants
-- `software/control/microcontroller.py`
-- `software/control/_def.py`
+| Item | Value |
+| --- | --- |
+| Evidence class | Open-source controller firmware and its public Python host wrapper (current generation, not the legacy sketches) |
+| Hardware validation | **None recorded.** No captured traffic or bench run from a physical controller yet |
+| Firmware covered | 1.4 |
 
 ## Scope
 
-The Squid controller is a USB serial microcontroller hub. It exposes multiple
-logical devices through one hardware link:
+The Squid controller is a USB-serial microcontroller hub exposing multiple
+logical devices over one link: XY stage, Z stage, theta axis, W and W2
+filter-wheel axes, illumination ports and LED matrix, camera trigger outputs and
+strobe timing, onboard DAC channels, autofocus laser pin control, and
+joystick/switch status.
 
-- XY stage
-- Z stage
-- theta axis
-- W and W2 filter-wheel axes
-- illumination ports and LED matrix
-- camera trigger outputs and strobe timing
-- onboard DAC channels
-- autofocus laser pin control
-- joystick button and switch status
-
-Camera control in Squid software is separate from this controller protocol and
-uses vendor-specific camera modules. A `numanager` Squid driver should model the
-microcontroller as a hub and expose camera trigger synchronization capabilities,
-but camera image acquisition should remain a separate camera driver unless a
-specific camera protocol is implemented.
+Camera image acquisition is **not** part of this protocol. A driver should model
+the microcontroller as a hub exposing camera trigger synchronization, and leave
+image acquisition to a separate camera driver.
 
 ## Transport
 
-- Physical transport: USB serial exposed by the controller board.
-- Default baud rate: `2_000_000`.
-- Existing host detection:
-  - Linux/macOS path filters serial ports with manufacturer `Teensyduino`.
-  - Windows fallback in the Squid wrapper filters manufacturer `Microsoft`.
-  - Older Arduino Due support filters description `Arduino Due`.
-  - Optional serial-number matching is supported by the Squid wrapper.
-- Firmware serial object: `SerialUSB`.
-- Firmware serial timeout: 200 ms.
-- Status update cadence: firmware sends a status frame roughly every 10 ms.
+| Item | Value |
+| --- | --- |
+| Physical | USB serial exposed by the controller board |
+| Baud rate | `2_000_000` |
+| Serial timeout (firmware) | 200 ms |
+| Status cadence | firmware emits a status frame roughly every 10 ms |
+| Port identification | USB manufacturer string `Teensyduino` (Linux/macOS); `Microsoft` on the Windows fallback path; description `Arduino Due` for older boards. Optional serial-number matching |
 
-Discovery for `numanager` should therefore be two-stage:
+Discovery should be two-stage:
 
 1. Detect candidate serial ports by USB metadata and optionally by config file.
-2. Claim one candidate, open it, send a harmless command such as
+2. Claim a candidate, open it, send a harmless command such as
    `TURN_OFF_ALL_PORTS`, and read a valid status frame to identify firmware
    version and protocol support.
 
@@ -61,45 +42,38 @@ Discovery for `numanager` should therefore be two-stage:
 
 All multi-byte integers are big-endian.
 
-### Host Command Frame
-
-Length: 8 bytes.
+### Host Command Frame — 8 bytes
 
 | Byte | Meaning |
 | --- | --- |
 | 0 | command id, wrapping `u8` |
 | 1 | command code |
 | 2-5 | primary payload |
-| 6 | reserved or extended payload byte for selected commands |
+| 6 | reserved, or extended payload byte for selected commands |
 | 7 | CRC-8/CCITT over bytes 0-6 |
 
-Signed 32-bit payloads use two's-complement encoding in bytes 2-5 or 3-6,
-depending on command layout.
+Signed 32-bit payloads use two's-complement in bytes 2-5 or 3-6, depending on
+command layout.
 
-### Controller Status Frame
-
-Length: 24 bytes.
+### Controller Status Frame — 24 bytes
 
 | Byte | Meaning |
 | --- | --- |
 | 0 | last command id seen by controller |
 | 1 | command execution status |
 | 2-5 | X position, signed i32 microsteps or encoder counts |
-| 6-9 | Y position, signed i32 microsteps or encoder counts |
-| 10-13 | Z position, signed i32 microsteps or encoder counts |
-| 14-17 | theta position, signed i32 microsteps or encoder counts |
+| 6-9 | Y position, signed i32 |
+| 10-13 | Z position, signed i32 |
+| 14-17 | theta position, signed i32 |
 | 18 | button/switch bitfield |
 | 19-21 | reserved |
-| 22 | firmware version, high nibble major and low nibble minor |
+| 22 | firmware version, high nibble major, low nibble minor |
 | 23 | CRC-8/CCITT over bytes 0-22 |
 
-Older firmware may send `0` as the response CRC. The existing Squid host accepts
-either a valid CRC or zero. A `numanager` driver should accept zero only in a
-legacy compatibility mode and should mark that device as lower confidence.
+Older firmware may send `0` as the response CRC. A driver should accept zero only
+in a legacy compatibility mode and mark that device as lower confidence.
 
 ## Status Model
-
-Command execution status values:
 
 | Code | Meaning |
 | --- | --- |
@@ -109,32 +83,22 @@ Command execution status values:
 | 3 | invalid command |
 | 4 | command execution error |
 
-The controller continues to emit status frames independently of host commands.
-Movement commands set firmware `in_progress`; atomic commands generally complete
-on the next status frame. The driver should run a dedicated read loop, match
-status frames by command id, and complete `numanager` operations from hardware
-status transitions.
+Status frames are emitted independently of host commands. Movement commands set
+`in_progress`; atomic commands generally complete on the next status frame. The
+driver should run a dedicated read loop, match status frames by command id, and
+complete operations from hardware status transitions
+(`Submitted -> Accepted/InProgress -> Completed | Failed | LostSync`).
 
-The host-side retry policy in Squid is:
-
-- If no matching acknowledgement arrives within 0.5 s, resend.
-- Retry up to 5 times.
-- Resend on checksum error.
-- Fail fast on `CMD_EXECUTION_ERROR`.
-- Treat repeated ack timeout/checksum failure as uncertain motor state.
-
-For `numanager`, this should become a driver-owned operation state machine:
-`Submitted -> Accepted/InProgress -> Completed | Failed | LostSync`.
+Recommended retry policy: resend if no matching acknowledgement arrives within
+0.5 s, up to 5 attempts; resend on checksum error; fail fast on command
+execution error; treat repeated ack timeout or checksum failure as uncertain
+motor state.
 
 ## Firmware Version
-
-The active firmware defines version 1.4. Version byte format:
 
 ```text
 version = (major << 4) | (minor & 0x0f)
 ```
-
-Known version meaning from firmware comments:
 
 | Version | Meaning |
 | --- | --- |
@@ -146,9 +110,8 @@ Known version meaning from firmware comments:
 
 ## Axis Identifiers
 
-Protocol axis identifiers are not the same as firmware internal array indices.
-The driver must use protocol identifiers on the wire and keep internal mapping
-separate.
+Protocol axis identifiers differ from firmware-internal array indices; use the
+protocol ids on the wire.
 
 | Axis | Protocol id |
 | --- | --- |
@@ -160,21 +123,14 @@ separate.
 | W filter wheel | 5 |
 | W2 filter wheel | 6 |
 
-Positions reported by the firmware include X, Y, Z, and theta only. W/W2
-positions are tracked by command completion but are not included in the 24-byte
-status frame.
+The status frame reports X, Y, Z, and theta only. W/W2 positions are tracked by
+command completion, not reported.
 
 ## Homing And Zeroing
 
-`HOME_OR_ZERO` command modes:
-
-| Mode | Code |
-| --- | --- |
-| home positive | 0 |
-| home negative | 1 |
-| zero current position | 2 |
-
-For XY homing, byte 3 carries X direction and byte 4 carries Y direction.
+`HOME_OR_ZERO` modes: `0` home positive, `1` home negative, `2` zero current
+position. For XY homing, byte 3 carries X direction and byte 4 carries Y
+direction.
 
 ## Command Table
 
@@ -202,9 +158,9 @@ For XY homing, byte 3 carries X direction and byte 4 carries Y direction.
 | 9 | `SET_LIM` | byte 2 limit code, bytes 3-6 signed i32 microstep limit |
 | 20 | `SET_LIM_SWITCH_POLARITY` | byte 2 axis, byte 3 polarity |
 | 21 | `CONFIGURE_STEPPER_DRIVER` | byte 2 axis, byte 3 microstepping, bytes 4-5 RMS current mA, byte 6 hold current scaled 0-255 |
-| 22 | `SET_MAX_VELOCITY_ACCELERATION` | byte 2 axis, bytes 3-4 velocity mm/s times 100, bytes 5-6 acceleration mm/s^2 times 10 |
-| 23 | `SET_LEAD_SCREW_PITCH` | byte 2 axis, bytes 3-4 pitch mm times 1000 |
-| 24 | `SET_OFFSET_VELOCITY` | byte 2 axis, bytes 3-6 signed i32 velocity mm/s times 1,000,000 |
+| 22 | `SET_MAX_VELOCITY_ACCELERATION` | byte 2 axis, bytes 3-4 velocity mm/s ×100, bytes 5-6 acceleration mm/s² ×10 |
+| 23 | `SET_LEAD_SCREW_PITCH` | byte 2 axis, bytes 3-4 pitch mm ×1000 |
+| 24 | `SET_OFFSET_VELOCITY` | byte 2 axis, bytes 3-6 signed i32 velocity mm/s ×1,000,000 |
 | 25 | `CONFIGURE_STAGE_PID` | byte 2 axis, byte 3 flip direction, bytes 4-5 transitions per revolution |
 | 26 | `ENABLE_STAGE_PID` | byte 2 axis |
 | 27 | `DISABLE_STAGE_PID` | byte 2 axis |
@@ -214,24 +170,8 @@ For XY homing, byte 3 carries X direction and byte 4 carries Y direction.
 | 252 | `INITFILTERWHEEL_W2` | no payload |
 | 253 | `INITFILTERWHEEL` | no payload |
 
-Limit codes:
-
-| Limit | Code |
-| --- | --- |
-| X positive | 0 |
-| X negative | 1 |
-| Y positive | 2 |
-| Y negative | 3 |
-| Z positive | 4 |
-| Z negative | 5 |
-
-Limit switch polarity:
-
-| Polarity | Code |
-| --- | --- |
-| active low | 0 |
-| active high | 1 |
-| disabled | 2 |
+Limit codes: X+ `0`, X- `1`, Y+ `2`, Y- `3`, Z+ `4`, Z- `5`.
+Limit switch polarity: active low `0`, active high `1`, disabled `2`.
 
 ### Illumination
 
@@ -241,18 +181,17 @@ Limit switch polarity:
 | 11 | `TURN_OFF_ILLUMINATION` | all legacy illumination off |
 | 12 | `SET_ILLUMINATION` | byte 2 legacy source, bytes 3-4 intensity percent mapped to 0-65535 |
 | 13 | `SET_ILLUMINATION_LED_MATRIX` | byte 2 pattern, byte 3 green, byte 4 red, byte 5 blue, each 0-255 |
-| 17 | `SET_ILLUMINATION_INTENSITY_FACTOR` | byte 2 percent factor, clamped to 0-100 |
+| 17 | `SET_ILLUMINATION_INTENSITY_FACTOR` | byte 2 percent factor, clamped 0-100 |
 | 34 | `SET_PORT_INTENSITY` | byte 2 port index, bytes 3-4 intensity percent mapped to 0-65535 |
 | 35 | `TURN_ON_PORT` | byte 2 port index |
 | 36 | `TURN_OFF_PORT` | byte 2 port index |
 | 37 | `SET_PORT_ILLUMINATION` | byte 2 port index, bytes 3-4 intensity, byte 5 on flag |
 | 38 | `SET_MULTI_PORT_MASK` | bytes 2-3 port mask, bytes 4-5 on mask |
 | 39 | `TURN_OFF_ALL_PORTS` | no payload |
-| 40 | `SET_WATCHDOG_TIMEOUT` | bytes 2-5 unsigned timeout milliseconds, 0 means firmware default |
+| 40 | `SET_WATCHDOG_TIMEOUT` | bytes 2-5 unsigned timeout ms, 0 = firmware default |
 | 42 | `HEARTBEAT` | no payload |
 
-Multi-port illumination supports port indices 0-15. Current named Squid ports
-are D1-D5:
+Port indices 0-15 are supported. Named ports:
 
 | Port | Index | Legacy source code |
 | --- | --- | --- |
@@ -262,25 +201,12 @@ are D1-D5:
 | D4 | 3 | 13 |
 | D5 | 4 | 15 |
 
-Legacy wavelength names in Squid map to these D ports, but the actual wavelength
-is a software configuration concern. A `numanager` driver should expose
-illumination ports as named devices or channels with typed wavelength metadata
-only when a config file declares it.
+Wavelength is a software configuration concern, not a protocol fact — expose
+wavelength metadata only when a config file declares it.
 
-LED matrix pattern codes:
-
-| Pattern | Code |
-| --- | --- |
-| full array | 0 |
-| left half | 1 |
-| right half | 2 |
-| left blue/right red | 3 |
-| low NA | 4 |
-| left dot | 5 |
-| right dot | 6 |
-| top half | 7 |
-| bottom half | 8 |
-| external FET | 20 |
+LED matrix patterns: full array `0`, left half `1`, right half `2`, left
+blue/right red `3`, low NA `4`, left dot `5`, right dot `6`, top half `7`,
+bottom half `8`, external FET `20`.
 
 ### Trigger, DAC, GPIO, And System
 
@@ -289,23 +215,19 @@ LED matrix pattern codes:
 | 14 | `ACK_JOYSTICK_BUTTON_PRESSED` | no payload |
 | 15 | `ANALOG_WRITE_ONBOARD_DAC` | byte 2 DAC channel, bytes 3-4 unsigned value |
 | 16 | `SET_DAC80508_REFDIV_GAIN` | byte 2 div, byte 3 gains |
-| 30 | `SEND_HARDWARE_TRIGGER` | byte 2 control-strobe flag in bit 7 plus camera channel in low nibble, bytes 3-6 illumination on-time us |
-| 31 | `SET_STROBE_DELAY` | byte 2 camera channel, bytes 3-6 delay us |
+| 30 | `SEND_HARDWARE_TRIGGER` | byte 2 control-strobe flag in bit 7 plus camera channel in low nibble, bytes 3-6 illumination on-time µs |
+| 31 | `SET_STROBE_DELAY` | byte 2 camera channel, bytes 3-6 delay µs |
 | 33 | `SET_TRIGGER_MODE` | byte 2 mode |
 | 41 | `SET_PIN_LEVEL` | byte 2 MCU pin, byte 3 level |
 
 Maintenance opcodes exist in this range but are intentionally omitted from the
 public command surface.
 
-Known controller pins from the active firmware:
+Controller pins:
 
 | Function | Pin |
 | --- | --- |
-| Illumination D1 | 5 |
-| Illumination D2 | 4 |
-| Illumination D3 | 22 |
-| Illumination D4 | 3 |
-| Illumination D5 | 23 |
+| Illumination D1-D5 | 5, 4, 22, 3, 23 |
 | Illumination interlock | 2 |
 | Autofocus laser | 15 |
 | Camera trigger outputs | 29, 30, 31, 32 |
@@ -314,72 +236,52 @@ Known controller pins from the active firmware:
 ## Safety
 
 The firmware has a serial watchdog for illumination. When enabled by
-`SET_WATCHDOG_TIMEOUT`, every valid serial message resets the watchdog timer. If
-the timeout expires, firmware turns off all illumination and disables the
-watchdog until re-enabled.
+`SET_WATCHDOG_TIMEOUT`, every valid serial message resets the timer; on expiry
+the firmware turns off all illumination and disables the watchdog until
+re-enabled.
 
 Driver requirements:
 
 - Enable the watchdog when controlling illumination-capable devices.
 - Send `HEARTBEAT` at less than half the watchdog interval during active
-  illumination sessions.
-- Stop heartbeat and turn off all ports on driver shutdown.
+  illumination.
+- Stop heartbeat and turn off all ports on shutdown.
 - Surface watchdog support based on firmware version.
-- Refuse or require explicit unsafe mode for direct `SET_PIN_LEVEL` access.
+- Refuse `SET_PIN_LEVEL` outside an explicit unsafe mode.
 
 ## Suggested numanager Model
 
-The Squid microcontroller should be one hub driver that remultiplexes logical
-device commands onto a single serial command queue.
+One hub driver remultiplexing logical device commands onto a single serial
+command queue:
 
-Suggested devices:
+| Device | Role |
+| --- | --- |
+| `squid.controller` | hub, firmware version, raw status stream, watchdog |
+| `squid.xy_stage` / `squid.z_stage` / `squid.theta` | logical stages |
+| `squid.filter_wheel.w` / `.w2` | filter wheels |
+| `squid.illumination.port.N` | one logical device per configured port |
+| `squid.led_matrix` | optional LED matrix source |
+| `squid.trigger.N` | camera trigger output and strobe timing |
+| `squid.dac.N` | DAC channel, diagnostic/raw capability |
+| `squid.autofocus` | provider for core `CapabilityKind::Autofocus` |
 
-- `squid.controller`: hub, firmware version, raw status stream, watchdog.
-- `squid.xy_stage`: X/Y logical stage using X and Y movement commands.
-- `squid.z_stage`: Z logical stage.
-- `squid.theta`: optional rotational axis.
-- `squid.filter_wheel.w`: W filter wheel.
-- `squid.filter_wheel.w2`: W2 filter wheel.
-- `squid.illumination.port.N`: one logical illumination device per configured
-  port.
-- `squid.led_matrix`: optional LED matrix source.
-- `squid.trigger.N`: camera trigger output and strobe timing.
-- `squid.dac.N`: low-level DAC channel, exposed as a diagnostic/raw capability.
-- `squid.autofocus`: provider for the core `CapabilityKind::Autofocus`,   by config. This is one Squid-backed implementation of the general autofocus
-  device model, not the definition of autofocus in `numanager`. The current
-  Squid implementation drives firmware pin 15 internally, but the public device
-  is an autofocus endpoint rather than a raw pin, light gate, or Squid-specific
-  device subtype. Public state should use provider-neutral properties such as
-  `enabled`, `mode`, `status`, and `focus_score`; pin-oriented fields belong in
-  metadata or compatibility diagnostics.
+`squid.autofocus` is one Squid-backed implementation of the general autofocus
+device model, not the definition of autofocus in `numanager`. It drives a
+firmware pin internally, but the public device exposes provider-neutral
+properties (`enabled`, `mode`, `status`, `focus_score`); pin-oriented fields
+belong in metadata.
 
-Properties should use typed quantities and explicit units in the type, not in
-string keys:
+Units belong in the type, not in string keys: stage positions (microsteps
+internally, µm/mm publicly once geometry is configured), typed velocity and
+acceleration, `Value::Wavelength` from config, typed durations for
+exposure/trigger timing.
 
-- stage positions: microsteps internally, micrometers or millimeters in public
-  properties once stage geometry is configured.
-- velocity: typed length/time quantity or a domain enum wrapping mm/s.
-- acceleration: typed length/time^2 quantity or a domain enum wrapping mm/s^2.
-- wavelength: `Value::Wavelength`, provided by config for illumination ports.
-- exposure/trigger timing: typed duration.
+## Untested / Open Before Hardware Control
 
-The first implementation should include:
-
-1. Serial port discovery provider.
-2. Frame encoder/decoder with CRC-8/CCITT.
-3. Dedicated reader thread that publishes status frames and completes
-   operations.
-4. Controller hub plus XY, Z, illumination-port, trigger, and autofocus
-   devices.
-5. Config-driven port-to-wavelength and stage calibration metadata.
-6. Simulator backed by the same frame encoder/decoder.
-
-Open questions before implementing hardware control:
-
-- Confirm USB VID/PID values for the production controller variants.
-- Confirm whether all deployed controllers now emit response CRC, or if zero
-  CRC compatibility is still required.
-- Confirm trigger mode byte values in current software configuration.
-- Confirm stage calibration source of truth for each Squid hardware variant.
-- Decide whether W/W2 positions need an explicit query/telemetry extension or
-  should be tracked as driver-estimated state only.
+- USB VID/PID values for the production controller variants.
+- Whether all deployed controllers now emit a response CRC, or zero-CRC
+  compatibility is still required.
+- Trigger mode byte values.
+- Stage calibration source of truth per hardware variant.
+- Whether W/W2 positions need an explicit query/telemetry extension or should be
+  tracked as driver-estimated state only.
