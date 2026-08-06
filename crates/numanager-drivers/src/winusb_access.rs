@@ -23,6 +23,16 @@ use numanager_core::Result;
 
 pub use numanager_winusb::{InstallApproval, PortState, UsbFunction};
 
+/// Removal of the packages [`ensure_access`] published, behind the
+/// `winusb-uninstall` feature. Off by default: a library should not carry a way
+/// to change which driver owns a device unless the host application asks for
+/// one.
+#[cfg(feature = "winusb-uninstall")]
+pub use numanager_winusb::{
+    installed_packages, remove_bound_nodes, remove_installed_packages, remove_signing_cert,
+    InstalledPackage,
+};
+
 /// Which kernel driver owns the node for `function` right now.
 ///
 /// Read-only. Errors when no matching device is present.

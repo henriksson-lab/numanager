@@ -2,10 +2,14 @@
 
 Follows [`hardware-validation-template.md`](hardware-validation-template.md).
 
-This note promotes **firmware initialization** and the **capability-register
-readback** to hardware-validated, and records that **`CameraCapture` failed** on
-the same unit in the same session. It is deliberately a mixed result: the frame
-path is not promoted, and `hardware_validated` for capture stays false.
+**Superseded in part by the 2026-08-06 run recorded at the end of this note:
+`CameraCapture` is now hardware-validated.** The 2026-08-05 session below failed
+— zero image bytes — and is kept because the failure is what identified the two
+missing stages. Read it as the diagnosis and the 2026-08-06 section as the
+result.
+
+The 2026-08-05 run promotes **firmware initialization** and the
+**capability-register readback**.
 
 Evidence is stated by class. Raw captures and analysis records are kept outside
 this repository, per [`../reverse/README.md`](../reverse/README.md).
@@ -50,7 +54,7 @@ this repository, per [`../reverse/README.md`](../reverse/README.md).
 | --- | --- | --- | --- | --- | --- | --- |
 | Firmware initialization | Anchor download of `img01` | Loader renumerates to the imaging PID; uploaded bytes match the shipped image | Camera present as `5354:009A`, `Lu130`, serial `19020090` | `0xA0 wValue=0xE600 data=01`, **618** `0xA0` record writes, `0xA0 wValue=0xE600 data=00`. All 618 records identical in content and order to `lumenera_fw_img01.hex` | **Pass** | Download performed by the pre-existing third-party driver on this port. numanager's upload path uses the same encoding but was not itself on the wire in this session |
 | Firmware image selection | `bcdDevice` → image | Selector 1 picks `img01` | `firmware_image = "lumenera_fw_img01.hex"` | Device descriptor `bcdDevice = 0x0001` | **Pass** | Selector values 2–15 are unevidenced; the driver's catch-all fallback for them is broader than any recorded evidence supports |
-| Capability readback | 11 read-only `bRequest 0x12` IN transfers at open | Device reports its own geometry | Values reported in the capture error string | `0x1000 = 0x04100570` (1392 x 1040), `0x100c` same, `0x1014 = 0x0c` (12 bpp), `0x101c = 0x04`, `0x1040 = 0x53290299`, `0x0004 = 0x019c = 1`, `0x0280 = 0x0284 = 0x1008 = 0`, `0x1004 = 0x00080004` | **Pass** | Geometry and bit depth confirmed from the device and agree with `width`/`height`/`bit_depth`. `0x1000` is the dimension register; `0x1004` is not |
+| Capability readback | 11 read-only `bRequest 0x12` IN transfers at open | Device reports its own geometry | Values reported in the capture error string | `0x1000 = 0x04100570` (1392 x 1040), `0x100c` same, `0x1014 = 0x0c`, `0x101c = 0x04`, `0x1040 = 0x53290299`, `0x0004 = 0x019c = 1`, `0x0280 = 0x0284 = 0x1008 = 0`, `0x1004 = 0x00080004` | **Pass** | Geometry confirmed from the device and agrees with `width`/`height`. `0x1000` is the dimension register; `0x1004` is not. **Correction:** this run read `0x1014 = 0x0c` and recorded it as "12 bpp"; the same camera later read `0x05`, so `0x1014` is a device state code and the bit-depth reading was a coincidence |
 | `exposure` (write) | 100 ms | Programmed before acquisition | `exposure set to TimeInterval { value: 100.0, unit: Milliseconds }` | `0x12 wIndex 0x0540 data=00000080a0860100` = `0x000186a0` = 100 000 µs | **Pass** | Encoding confirmed; the exposure's *effect* is unvalidated because no frame was produced |
 | `CameraCapture` | One frame, 1392 x 1040 `Raw16` | 2 895 360 bytes on endpoint `0x86` | `Error { code: Transport, message: "Lumenera frame read timed out (0 of 2895360 bytes); camera reports ..." }` | Endpoint `0x86`: 1 URB submitted at `ACQ_START`, completed empty at teardown. **0 bytes** | **Fail** | Not promoted. See Remaining Uncertainty |
 | `gain` (write) | any | Refused | `Unsupported` | none | **Pass** (fails closed as designed) | Register mapping still unevidenced |
@@ -95,3 +99,57 @@ this repository, per [`../reverse/README.md`](../reverse/README.md).
 | Implementation plan | Remaining-work rows narrowed: firmware and geometry no longer open; bench validation of capture still open |
 | Trace/log storage | Raw captures and analysis records are kept outside this repository |
 | Tests | None added — driver tests are prohibited by `AGENTS.md` |
+
+---
+
+# 2026-08-06 — `CameraCapture` validated
+
+Same unit (serial `19020090`), same host, after the two missing bring-up stages
+were implemented. Evidence class: captured traffic from a physical device, plus
+this documented bench run.
+
+## What changed since the failing run
+
+| Stage | Status on 2026-08-05 | Status now |
+| --- | --- | --- |
+| Sensor-pipeline configuration | absent | implemented — 98 KB image to bulk endpoint `0x08`, device accepts it (`0x80` -> `0x40` -> `0x00`) |
+| Register load | absent | implemented — 510 recorded transfers replayed after configuration |
+| Image reads | fixed-size chunks | sized to `min(chunk, remaining)` |
+
+The read sizing was the last fault and the subtlest: a frame's final piece is an
+exact multiple of the endpoint packet size, so it carries no short packet to
+terminate an over-long request. Fixed-size reads collected every chunk but the
+last and then blocked. The symptom was a capture stalling at exactly
+2 621 440 of 2 895 360 bytes, reproducibly.
+
+## Result
+
+| Capability | Request | Runtime output | Hardware output | Result |
+| --- | --- | --- | --- | --- |
+| `CameraCapture` | one frame, 100 ms | `capture: map(frame, height, pixel_format, source, stream, width)`; `frame: 2895360 bytes -> gel_doc_frame.raw (38.7% non-zero)` | 2 895 360 B on `0x86` | **Pass** |
+| `CameraCapture` | one frame, 200 ms | same | 2 895 360 B | **Pass** |
+| `CameraCapture` | one frame, 500 ms | same | 2 895 360 B | **Pass** |
+| Pipeline configuration | 98 023 B image | no error | `0x0008`: `0x80` -> arm -> 98 023 B on `0x08` -> `0x40` -> `0x00` | **Pass** |
+
+Capture-level total on the image endpoint for the session: **17 372 160 bytes =
+exactly 6 x 2 895 360**, i.e. six whole frames and no partial ones.
+
+## Frame validation
+
+| Field | Observation |
+| --- | --- |
+| Pixel format | `Raw16` little-endian, 12-bit right-aligned |
+| Dimensions and stride | 1392 x 1040, stride 2784 B — matches the device's own `0x1000` readback |
+| Decoded image | Uniform read noise, **no shear, no tearing, no row offset** — confirms framing, stride and pixel format |
+| Content | Dark frame at 38.7% non-zero. Expected: the lamp belongs to the enclosure, a separate USB device this driver never touches |
+| Frames captured | 6 of 6 attempted after the fix; 0 of 2 before it |
+
+## Remaining uncertainty
+
+| Behavior | Uncertainty |
+| --- | --- |
+| `exposure` radiometric effect | Encoding and acceptance confirmed at 100/200/500 ms, but every frame is dark, so the effect on image brightness is unverified |
+| Register load semantics | Replayed, not understood. Layout decoded; individual meanings unrecorded. Now testable against a live image |
+| `gain` | Still unevidenced; writes refused |
+| Repeat configuration | An already-configured device reports `0xA0` and refuses another image. Returning to the `0x80` ready state required a power cycle in every attempt; no host-side reset was found |
+| Streaming | Single-frame only; repeated-frame boundary handling untested |

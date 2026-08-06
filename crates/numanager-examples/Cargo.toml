@@ -22,6 +22,9 @@ os-serial = ["numanager-drivers/os-serial"]
 os-usb = ["numanager-drivers/os-usb"]
 # Only needed off Windows: `winusb_access` is always compiled on Windows.
 winusb = ["numanager-drivers/winusb"]
+# Compile the `usb_access uninstall` subcommand, which removes the WinUSB
+# packages numanager published and hands the nodes back to PnP.
+winusb-uninstall = ["numanager-drivers/winusb-uninstall"]
 
 [[bin]]
 name = "numanager-examples"

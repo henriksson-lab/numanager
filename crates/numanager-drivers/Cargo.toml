@@ -42,3 +42,7 @@ os-usb = ["dep:futures-lite", "dep:nusb"]
 # Off Windows only: build the WinUSB access module against the non-Windows
 # entry points. Redundant on Windows, where the module is always compiled.
 winusb = ["dep:numanager-winusb"]
+# Expose removal of the WinUSB packages numanager published. Off by default:
+# this is a library, and unbinding a node changes which driver owns hardware.
+# On Windows `numanager-winusb` is always linked, so this only adds the API.
+winusb-uninstall = ["numanager-winusb/uninstall"]

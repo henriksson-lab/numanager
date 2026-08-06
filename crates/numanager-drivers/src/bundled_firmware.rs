@@ -36,14 +36,42 @@ const IMAGES: &[(&str, &str)] = &[
     bundled!("lumenera", "lumenera_fw_img16.hex"),
 ];
 
+/// Binary (non-Intel-HEX) images compiled in, by originating package. Kept
+/// separate from [`IMAGES`] because these are raw byte streams pushed to an
+/// endpoint rather than address/record text.
+const BLOBS: &[(&str, &[u8])] = &[(
+    "lumenera_fpga_lu130.bin",
+    include_bytes!("../../../data/third_party/lumenera/lumenera_fpga_lu130.bin"),
+)];
+
+/// Recorded control-transfer sequences, replayed verbatim during bring-up where
+/// the individual transfers are not decoded. Same treatment as [`IMAGES`]:
+/// third-party data, compiled in so a device works with no `data/` directory.
+const SEQUENCES: &[(&str, &str)] = &[bundled!("lumenera", "lumenera_init_lu130.jsonl")];
+
+/// The compiled-in recorded sequence with this exact file name.
+pub(crate) fn sequence_by_name(name: &str) -> Option<&'static str> {
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    SEQUENCES
+        .iter()
+        .find(|(seq, _)| *seq == file)
+        .map(|(_, text)| *text)
+}
+
+/// The compiled-in binary image with this exact file name.
+pub(crate) fn blob_by_name(name: &str) -> Option<&'static [u8]> {
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    BLOBS
+        .iter()
+        .find(|(blob, _)| *blob == file)
+        .map(|(_, bytes)| *bytes)
+}
+
 /// The compiled-in image with this exact file name, or `None` when it is not
 /// bundled. `name` may be a bare file name or a path — only the final component
 /// is matched, so a driver can pass a configured path straight through.
 pub(crate) fn image_by_name(name: &str) -> Option<&'static str> {
-    let file = name
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(name);
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
     IMAGES
         .iter()
         .find(|(image, _)| *image == file)

@@ -16,11 +16,26 @@
 //! ## What is and isn't implemented
 //!
 //! Implemented and evidenced: USB discovery of both stages and the two-stage
-//! **firmware download** (validated on hardware 2026-08-03). The acquisition
-//! control sequence, exposure encoding and frame layout are recorded from
-//! vendor traffic (2026-08-05), but numanager's live acquisition attempt
-//! accepted every control transfer and still received 0 bytes, so capture is
-//! experimental and not hardware-validated.
+//! **firmware download** (validated on hardware 2026-08-03).
+//!
+//! Bring-up has three further stages, all recorded from captured traffic and
+//! all implemented, none yet shown to produce a frame:
+//!
+//! 1. **Sensor-pipeline configuration** — a 98 KB image streamed to bulk
+//!    endpoint `0x08` under alternate setting 1, bracketed by arm/finish writes
+//!    on `wIndex 0x0008`. The device reports `0x80` when ready to receive it and
+//!    steps `0x40` -> `0x00` as it takes it; a device already carrying an image
+//!    reports `0xA0` and refuses another. Hardware-confirmed accepted.
+//! 2. **Register load** — 510 recorded transfers, mostly 8-bit writes on
+//!    `wIndex 0x0006` addressed by `wValue`. Replayed as recorded: the layout is
+//!    understood but individual register meanings are not, and inventing names
+//!    for them would be worse than replaying them.
+//! 3. **Acquisition** — the sequence below.
+//!
+//! A run against hardware on 2026-08-05, before stages 1 and 2 existed, accepted
+//! every control transfer and received 0 image bytes. Capture is therefore
+//! **experimental and not hardware-validated**: the stages are evidenced
+//! individually, the chain has not yet been shown to yield a frame.
 //!
 //! The captured acquisition is: configure geometry/exposure, select alternate
 //! setting 2, arm, start, drain one frame off bulk endpoint `0x86`, stop,
@@ -120,6 +135,27 @@ mod protocol {
     pub(super) const IDX_OPAQUE_0610: u16 = 0x0610;
     pub(super) const IDX_OPAQUE_0670: u16 = 0x0670;
 
+    /// Sensor-pipeline configuration, streamed to [`EP_CONFIG`] during
+    /// imaging-stage bring-up. `wIndex 0x0008` is its control/status register.
+    ///
+    /// Recorded from captured hardware traffic (2026-08-06): with the device at
+    /// the imaging id and configuration 1 selected, the host reads `0x0008`
+    /// (`0x80`), selects alternate setting 1, writes `0xFFFFFFFF` to `0x0008`,
+    /// streams the image to endpoint `0x08`, polls `0x0008` until it reads
+    /// zero (`0x80` -> `0x40` -> `0x00`), then writes zero to `0x0008`.
+    ///
+    /// Until this runs, every control transfer is accepted and the image
+    /// endpoint delivers nothing.
+    pub(super) const IDX_CONFIG_STATUS: u16 = 0x0008;
+    /// The only status in which an arm is accepted: ready to receive an image.
+    pub(super) const CONFIG_READY: u32 = 0x80;
+    pub(super) const CONFIG_ARM: u32 = 0xFFFF_FFFF;
+    pub(super) const CONFIG_FINISH: u32 = 0;
+    /// Bulk OUT endpoint carrying the configuration image, and the alternate
+    /// setting that exposes it.
+    pub(super) const EP_CONFIG: u8 = 0x08;
+    pub(super) const ALT_CONFIG: u8 = 1;
+
     /// `wIndex` selectors on [`REQ_REGISTER`].
     pub(super) const IDX_REGISTER_DATA: u16 = 0x0006;
     pub(super) const IDX_FPGA_WRITE: u16 = 0x0000;
@@ -145,10 +181,12 @@ mod protocol {
     /// holds `0x00080004`, so it is something else.
     pub(super) const IDX_CAPABILITY_DIMENSIONS: u16 = 0x1000;
 
-    /// `0x1014` reads back the bit depth: `0x0c` = 12 bits on the ICX205,
-    /// consistent with the 12-bit sensor and with the driver switching on this
-    /// value's low byte. Read live 2026-08-05. **[confirmed]**
-    pub(super) const IDX_CAPABILITY_BIT_DEPTH: u16 = 0x1014;
+    /// `0x1014` is a device **state code**, not bit depth. The same camera read
+    /// `0x0c` on 2026-08-05 and `0x05` on 2026-08-06 after a driver change, and
+    /// a working stack switches on its low byte over a small case set. Reported
+    /// raw; an earlier revision read `0x0c` as "12 bpp", which the second
+    /// reading showed to be a coincidence.
+    pub(super) const IDX_CAPABILITY_STATE: u16 = 0x1014;
 
     /// Values written to [`IDX_ACQUISITION`], in the order the sequence uses
     /// them. Named for their observed position, not a documented meaning.
@@ -1151,6 +1189,48 @@ mod live_imaging {
     use std::time::{Duration, Instant};
 
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Budget for the pipeline image write and the status poll after it. The
+    /// vendor's own write took ~0.7 s for 98 KB.
+    const CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Compiled-in sensor-pipeline configuration image.
+    const FPGA_IMAGE_FILE: &str = "lumenera_fpga_lu130.bin";
+    /// Compiled-in post-configuration transfer sequence.
+    const INIT_SEQUENCE_FILE: &str = "lumenera_init_lu130.jsonl";
+
+    /// One recorded control transfer. Field names match the capture tool's
+    /// output so a fresh recording can be dropped in unedited.
+    #[derive(serde::Deserialize)]
+    struct InitStep {
+        dir: String,
+        #[serde(rename = "bRequest", deserialize_with = "hex_u8")]
+        b_request: u8,
+        #[serde(rename = "wValue", deserialize_with = "hex_u16")]
+        w_value: u16,
+        #[serde(rename = "wIndex", deserialize_with = "hex_u16")]
+        w_index: u16,
+        #[serde(rename = "wLength")]
+        w_length: u16,
+        #[serde(default)]
+        data: String,
+    }
+
+    fn hex_u8<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u8, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(d)?;
+        u8::from_str_radix(text.trim_start_matches("0x"), 16).map_err(serde::de::Error::custom)
+    }
+
+    fn hex_u16<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u16, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(d)?;
+        u16::from_str_radix(text.trim_start_matches("0x"), 16).map_err(serde::de::Error::custom)
+    }
+
+    /// Hex text to bytes, ignoring anything malformed — a recorded payload is
+    /// either well-formed or the line is not worth failing the whole bring-up.
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        (0..text.len() / 2)
+            .filter_map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok())
+            .collect()
+    }
     /// One URB's worth of image data; the device streams in 512 KiB chunks.
     const BULK_CHUNK: usize = 0x80000;
     /// Headroom over the exposure for readout and transfer.
@@ -1187,6 +1267,14 @@ mod live_imaging {
                     format!("opening the Lumenera camera failed (WinUSB bound?): {error}"),
                 )
             })?;
+            // Re-select the configuration before claiming. The recorded bring-up
+            // issues SET_CONFIGURATION(1) and only then finds the pipeline's
+            // control register reporting ready; without it the register sits in
+            // a state where the configuration image is ignored. The device is
+            // already configured by enumeration, so this is a deliberate
+            // re-assert rather than setup.
+            let _ = device.set_configuration(1);
+
             let interface = device.claim_interface(0).map_err(|error| {
                 Error::new(
                     ErrorCode::Transport,
@@ -1213,7 +1301,152 @@ mod live_imaging {
             for index in IDX_CAPABILITY_READS {
                 let _ = session.read_property(index);
             }
+            session.configure_pipeline()?;
             Ok(session)
+        }
+
+        /// Stream the sensor-pipeline configuration image and wait for the
+        /// device to report it accepted. Runs once per session, before any
+        /// capture; until it has, the image endpoint delivers nothing however
+        /// correct the acquisition sequence is.
+        ///
+        /// Run unconditionally. The recorded sequence reads `0x0008` first but
+        /// does not branch on it, and the value is not a reliable "already
+        /// configured" flag: a device that has been configured and then reset
+        /// by a driver change reads zero here while delivering no frames.
+        fn configure_pipeline(&self) -> Result<()> {
+            let before = self
+                .read_property(IDX_CONFIG_STATUS)
+                .map(u32::from_le_bytes)
+                .unwrap_or(u32::MAX);
+
+            // `0x80` is the ready-to-configure state, and the only one in which
+            // an arm is accepted: a device already carrying an image reports
+            // `0xA0` and ignores the sequence outright. Skipping the download
+            // then is not an optimisation — re-arming a configured device is
+            // simply refused, so the register load below is what remains to do.
+            if before != CONFIG_READY {
+                self.replay_init_sequence()?;
+                return Ok(());
+            }
+
+            let image =
+                crate::bundled_firmware::blob_by_name(FPGA_IMAGE_FILE).ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::Unsupported,
+                        format!("Lumenera pipeline image {FPGA_IMAGE_FILE} is not compiled in"),
+                    )
+                })?;
+
+            self.interface
+                .set_alt_setting(ALT_CONFIG)
+                .map_err(|error| {
+                    Error::new(
+                        ErrorCode::Transport,
+                        format!("Lumenera configuration alt-setting select failed: {error}"),
+                    )
+                })?;
+            self.property(IDX_CONFIG_STATUS, &word(CONFIG_ARM))?;
+
+            // One transfer for the whole image, as the recorded sequence does.
+            let completion =
+                futures_lite::future::block_on(self.interface.bulk_out(EP_CONFIG, image.to_vec()));
+            completion.status.map_err(|error| {
+                Error::new(
+                    ErrorCode::Transport,
+                    format!("Lumenera pipeline image write failed: {error}"),
+                )
+            })?;
+            let sent = completion.data.actual_length();
+            if sent != image.len() {
+                return Err(Error::new(
+                    ErrorCode::Transport,
+                    format!(
+                        "Lumenera pipeline image short write: {sent}/{} bytes",
+                        image.len()
+                    ),
+                ));
+            }
+
+            // The device reports progress in the same register: it steps down
+            // to zero when it has taken the image. Bounded, because a device
+            // that never finishes must fail rather than hang the caller.
+            let deadline = Instant::now() + CONFIG_TIMEOUT;
+            loop {
+                let status = u32::from_le_bytes(self.read_property(IDX_CONFIG_STATUS)?);
+                if status == 0 {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(Error::new(
+                        ErrorCode::Transport,
+                        format!(
+                            "Lumenera pipeline configuration did not complete: status \
+                             {status:#010x} still set (was {before:#010x} before arming, \
+                             {sent} bytes written)"
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            self.property(IDX_CONFIG_STATUS, &word(CONFIG_FINISH))?;
+            let _ = self.interface.set_alt_setting(ALT_IDLE);
+            self.replay_init_sequence()?;
+            Ok(())
+        }
+
+        /// Replay the recorded post-configuration transfers.
+        ///
+        /// A freshly configured device still yields no frames until its
+        /// register file is loaded: 510 transfers, mostly 8-bit writes on
+        /// `wIndex 6` addressed by `wValue`. Their layout is understood (a reset
+        /// pulse, an ascending sweep, four per-channel blocks) but the meaning
+        /// of individual registers is not, and cannot be established from a
+        /// single observation of a single camera — so they are replayed as
+        /// recorded rather than renamed into invented semantics.
+        ///
+        /// Reads in the sequence are issued and their results discarded: the
+        /// recorded host read them, and a device that expects the traffic
+        /// should see it.
+        fn replay_init_sequence(&self) -> Result<()> {
+            let script =
+                crate::bundled_firmware::sequence_by_name(INIT_SEQUENCE_FILE).ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::Unsupported,
+                        format!("Lumenera init sequence {INIT_SEQUENCE_FILE} is not compiled in"),
+                    )
+                })?;
+
+            for (lineno, line) in script.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let step: InitStep = serde_json::from_str(line).map_err(|error| {
+                    Error::new(
+                        ErrorCode::Driver,
+                        format!("Lumenera init sequence line {}: {error}", lineno + 1),
+                    )
+                })?;
+                if step.dir == "in" {
+                    let mut buffer = vec![0u8; step.w_length as usize];
+                    let control = Control {
+                        control_type: ControlType::Vendor,
+                        recipient: Recipient::Device,
+                        request: step.b_request,
+                        value: step.w_value,
+                        index: step.w_index,
+                    };
+                    let _ =
+                        self.interface
+                            .control_in_blocking(control, &mut buffer, CONTROL_TIMEOUT);
+                } else {
+                    let data = hex_bytes(&step.data);
+                    self.write(step.b_request, step.w_value, step.w_index, &data)?;
+                }
+            }
+            Ok(())
         }
 
         fn write(&self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<()> {
@@ -1303,8 +1536,8 @@ mod live_imaging {
                                 word & 0xffff,
                                 word >> 16
                             ));
-                        } else if index == IDX_CAPABILITY_BIT_DEPTH {
-                            parts.push(format!("{index:#06x}={word:#010x} ({word} bpp)"));
+                        } else if index == IDX_CAPABILITY_STATE {
+                            parts.push(format!("{index:#06x}={word:#010x} (state)"));
                         } else {
                             parts.push(format!("{index:#06x}={word:#010x}"));
                         }
@@ -1419,8 +1652,20 @@ mod live_imaging {
             let iface = self.interface.clone();
             std::thread::spawn(move || {
                 let mut queue = iface.bulk_in_queue(EP_IMAGE);
+                // Size every read to what is still outstanding, never to a flat
+                // chunk. A frame is not a whole number of chunks, and its final
+                // piece is an exact multiple of the endpoint's packet size — so
+                // it carries no short packet to terminate an over-long request,
+                // and an oversized final read simply never completes. Asking for
+                // exactly the remainder is what the recorded host does.
+                let mut queued = 0usize;
                 for _ in 0..4 {
-                    queue.submit(RequestBuffer::new(BULK_CHUNK));
+                    if queued >= expected {
+                        break;
+                    }
+                    let len = BULK_CHUNK.min(expected - queued);
+                    queue.submit(RequestBuffer::new(len));
+                    queued += len;
                 }
                 let _ = ready_tx.send(());
                 loop {
@@ -1433,7 +1678,16 @@ mod live_imaging {
                     if tx.send(message).is_err() || stop {
                         return;
                     }
-                    queue.submit(RequestBuffer::new(BULK_CHUNK));
+                    if queued < expected {
+                        let len = BULK_CHUNK.min(expected - queued);
+                        queue.submit(RequestBuffer::new(len));
+                        queued += len;
+                    }
+                    // The whole frame is queued and drained: awaiting another
+                    // completion on an empty queue is a panic, not a wait.
+                    if queue.pending() == 0 {
+                        return;
+                    }
                 }
             });
 

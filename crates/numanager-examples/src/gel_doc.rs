@@ -173,6 +173,39 @@ fn capture() -> Result<()> {
             timeout,
         )?;
         println!("capture: {}", summarize(&result));
+
+        // Write the pixels out. A capture that "succeeded" is only believable
+        // once someone can look at the image, and a raw file the caller can
+        // decode is the smallest way to make that possible.
+        // The response carries a frame handle; the pixels live in the runtime's
+        // frame store. Write them out — a capture that "succeeded" is only
+        // believable once someone can look at the image.
+        if let Value::Map(fields) = &result {
+            if let (Some(Value::I64(frame_id)), Some(Value::I64(stream_id))) =
+                (fields.get("frame"), fields.get("stream"))
+            {
+                let handle = FrameHandle {
+                    stream: StreamId(*stream_id as u64),
+                    frame: FrameId(*frame_id as u64),
+                };
+                if let Some(frame) = runtime.frame(handle)? {
+                    let path = std::path::Path::new("gel_doc_frame.raw");
+                    std::fs::write(path, &frame.data).map_err(|error| {
+                        Error::new(
+                            ErrorCode::Driver,
+                            format!("writing {}: {error}", path.display()),
+                        )
+                    })?;
+                    let nonzero = frame.data.iter().filter(|byte| **byte != 0).count();
+                    println!(
+                        "frame: {} bytes -> {} ({:.1}% non-zero)",
+                        frame.data.len(),
+                        path.display(),
+                        100.0 * nonzero as f64 / frame.data.len().max(1) as f64
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

@@ -391,6 +391,92 @@ pub fn remove_signing_cert() -> Result<()> {
     ))
 }
 
+/// One driver package that [`ensure_winusb`] published into the Windows driver
+/// store.
+///
+/// `published_name` is the store's own `oemNN.inf` handle — the name every
+/// removal API wants. `original_name` is what the package was called when it
+/// was submitted, which is how these are told apart from WinUSB packages that
+/// other tools (Zadig, libwdi, a vendor installer) may have installed.
+#[cfg(feature = "uninstall")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPackage {
+    pub published_name: String,
+    pub original_name: String,
+}
+
+/// Every WinUSB package this crate published, newest first.
+///
+/// Deliberately scoped to numanager's own packages. A device can be bound to
+/// WinUSB by any number of tools, and removing a package this crate did not
+/// install would silently break unrelated hardware.
+#[cfg(all(windows, feature = "uninstall"))]
+pub fn installed_packages() -> Result<Vec<InstalledPackage>> {
+    win::enum_installed_packages()
+}
+
+#[cfg(all(not(windows), feature = "uninstall"))]
+pub fn installed_packages() -> Result<Vec<InstalledPackage>> {
+    Err(Error::new(
+        ErrorCode::Unsupported,
+        "WinUSB provisioning is only available on Windows",
+    ))
+}
+
+/// Detach every device node one of our packages bound, **including nodes that
+/// are not currently plugged in**, so each re-enumerates with no stored
+/// binding.
+///
+/// Removing the package alone is not enough: Windows keeps a node's binding in
+/// the `Enum` tree while the device is absent, so a package-only uninstall
+/// leaves exactly the devices a user is most likely to be cleaning up still
+/// pointing at WinUSB. Returns the instance ids detached.
+///
+/// Must run **before** [`remove_installed_packages`] — nodes are matched on the
+/// `oemNN.inf` that bound them, and deleting the package destroys that link.
+#[cfg(all(windows, feature = "uninstall"))]
+pub fn remove_bound_nodes() -> Result<Vec<String>> {
+    let packages = win::enum_installed_packages()?;
+    let nodes = win::nodes_bound_by(&packages)?;
+    let mut removed = Vec::new();
+    for node in nodes {
+        win::remove_node(&node)?;
+        removed.push(node);
+    }
+    Ok(removed)
+}
+
+#[cfg(all(not(windows), feature = "uninstall"))]
+pub fn remove_bound_nodes() -> Result<Vec<String>> {
+    Err(Error::new(
+        ErrorCode::Unsupported,
+        "WinUSB provisioning is only available on Windows",
+    ))
+}
+
+/// Delete every package from [`installed_packages`], unbinding any device still
+/// attached so it falls back to whatever driver PnP picks next.
+///
+/// Returns the packages actually removed; an empty vector means nothing of
+/// numanager's was installed. Requires elevation.
+///
+/// A full uninstall is three steps in order: [`remove_bound_nodes`], then this,
+/// then [`remove_signing_cert`]. Nodes first because they are matched via the
+/// package; the certificate last so a failed package removal never leaves the
+/// store trusting nothing for packages that are still installed.
+#[cfg(all(windows, feature = "uninstall"))]
+pub fn remove_installed_packages() -> Result<Vec<InstalledPackage>> {
+    win::remove_installed_packages()
+}
+
+#[cfg(all(not(windows), feature = "uninstall"))]
+pub fn remove_installed_packages() -> Result<Vec<InstalledPackage>> {
+    Err(Error::new(
+        ErrorCode::Unsupported,
+        "WinUSB provisioning is only available on Windows",
+    ))
+}
+
 #[cfg(windows)]
 mod win {
     use super::{Error, ErrorCode, PortState, Result};
@@ -401,6 +487,16 @@ mod win {
         SPDRP_SERVICE, SP_DEVINFO_DATA,
     };
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+
+    // Only the node-removal path needs device properties and instance ids.
+    #[cfg(feature = "uninstall")]
+    use windows_sys::core::GUID;
+    #[cfg(feature = "uninstall")]
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        SetupDiGetDeviceInstanceIdW, SetupDiGetDevicePropertyW,
+    };
+    #[cfg(feature = "uninstall")]
+    use windows_sys::Win32::Foundation::DEVPROPKEY;
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
@@ -578,6 +674,216 @@ mod win {
     /// INF's `CatalogFile=` directive.
     const INF_FILENAME: &str = "numanager_winusb.inf";
     const CAT_FILENAME: &str = "numanager_winusb.cat";
+
+    /// Read the driver store's package list.
+    ///
+    /// `pnputil`'s field *labels* are localized but its *values* are not, so the
+    /// parse keys on values only: a block mentioning [`INF_FILENAME`] is one of
+    /// ours, and the `oemNN.inf` token in that block is its published name.
+    #[cfg(feature = "uninstall")]
+    pub(super) fn enum_installed_packages() -> Result<Vec<super::InstalledPackage>> {
+        let output = std::process::Command::new("pnputil.exe")
+            .arg("/enum-drivers")
+            .output()
+            .map_err(|error| {
+                Error::new(
+                    ErrorCode::Driver,
+                    format!("running `pnputil /enum-drivers` failed: {error}"),
+                )
+            })?;
+        let text = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+        let mut found = Vec::new();
+        for block in text.split("\n\n") {
+            if !block.contains(INF_FILENAME) {
+                continue;
+            }
+            let published = block.split_whitespace().find(|token| {
+                let lower = token.to_ascii_lowercase();
+                lower.starts_with("oem") && lower.ends_with(".inf")
+            });
+            if let Some(published) = published {
+                found.push(super::InstalledPackage {
+                    published_name: published.to_string(),
+                    original_name: INF_FILENAME.to_string(),
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    /// Delete each of our packages, unbinding any device still using it.
+    ///
+    /// `/uninstall` is what detaches bound devices; without it the package is
+    /// merely removed from the store and the devices keep running the copy they
+    /// already have. Errors abort the sweep rather than continuing, so a
+    /// partial removal is reported rather than silently completed.
+    /// Instance ids of every device node bound by one of our packages,
+    /// **including nodes that are not currently plugged in**.
+    ///
+    /// `DIGCF_PRESENT` is deliberately omitted: a node keeps its stored binding
+    /// while absent, so an uninstall that only touched present devices would
+    /// silently leave the very devices a user is most likely to be cleaning up.
+    /// Nodes are matched on `DEVPKEY_Device_DriverInfPath`, which names the
+    /// `oemNN.inf` that bound them — the only link back to us, and one that
+    /// disappears once the package is deleted, so this must run first.
+    #[cfg(feature = "uninstall")]
+    pub(super) fn nodes_bound_by(packages: &[super::InstalledPackage]) -> Result<Vec<String>> {
+        // DEVPKEY_Device_DriverInfPath — {a8b865dd-2e3d-4094-ad97-e593a70c75d6}, pid 5.
+        const DEVPKEY_DEVICE_DRIVER_INF_PATH: DEVPROPKEY = DEVPROPKEY {
+            fmtid: GUID {
+                data1: 0xa8b8_65dd,
+                data2: 0x2e3d,
+                data3: 0x4094,
+                data4: [0xad, 0x97, 0xe5, 0x93, 0xa7, 0x0c, 0x75, 0xd6],
+            },
+            pid: 5,
+        };
+
+        let wanted: Vec<String> = packages
+            .iter()
+            .map(|package| package.published_name.to_ascii_lowercase())
+            .collect();
+        let mut found = Vec::new();
+
+        // SAFETY: FFI. The device info set is destroyed on every exit path;
+        // buffers are sized from the required-size query before the real read.
+        unsafe {
+            let set = SetupDiGetClassDevsW(
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null_mut(),
+                DIGCF_ALLCLASSES,
+            );
+            if set as isize == -1 {
+                return Err(last_err("SetupDiGetClassDevsW"));
+            }
+            let mut index = 0u32;
+            loop {
+                let mut data = SP_DEVINFO_DATA {
+                    cbSize: core::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                    ..core::mem::zeroed()
+                };
+                if SetupDiEnumDeviceInfo(set, index, &mut data) == 0 {
+                    break;
+                }
+                index += 1;
+
+                let mut kind = 0u32;
+                let mut needed = 0u32;
+                SetupDiGetDevicePropertyW(
+                    set,
+                    &data,
+                    &DEVPKEY_DEVICE_DRIVER_INF_PATH,
+                    &mut kind,
+                    core::ptr::null_mut(),
+                    0,
+                    &mut needed,
+                    0,
+                );
+                if needed == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; needed as usize];
+                if SetupDiGetDevicePropertyW(
+                    set,
+                    &data,
+                    &DEVPKEY_DEVICE_DRIVER_INF_PATH,
+                    &mut kind,
+                    buf.as_mut_ptr(),
+                    needed,
+                    &mut needed,
+                    0,
+                ) == 0
+                {
+                    continue;
+                }
+                let inf = decode_sz(&buf).to_ascii_lowercase();
+                if !wanted.iter().any(|name| *name == inf) {
+                    continue;
+                }
+
+                let mut id_len = 0u32;
+                SetupDiGetDeviceInstanceIdW(set, &data, core::ptr::null_mut(), 0, &mut id_len);
+                if id_len == 0 {
+                    continue;
+                }
+                let mut id = vec![0u16; id_len as usize];
+                if SetupDiGetDeviceInstanceIdW(set, &data, id.as_mut_ptr(), id_len, &mut id_len)
+                    != 0
+                {
+                    let text = String::from_utf16_lossy(&id);
+                    found.push(text.trim_end_matches('\0').to_string());
+                }
+            }
+            SetupDiDestroyDeviceInfoList(set);
+        }
+        Ok(found)
+    }
+
+    /// Detach a device node so it re-enumerates with no stored binding. Works
+    /// on absent nodes: `pnputil` addresses the `Enum` entry, not a live device.
+    #[cfg(feature = "uninstall")]
+    pub(super) fn remove_node(instance_id: &str) -> Result<()> {
+        let output = std::process::Command::new("pnputil.exe")
+            .args(["/remove-device", instance_id])
+            .output()
+            .map_err(|error| {
+                Error::new(
+                    ErrorCode::Driver,
+                    format!("running `pnputil /remove-device {instance_id}` failed: {error}"),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(Error::new(
+                ErrorCode::Driver,
+                format!(
+                    "removing device node {instance_id} failed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout).trim()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "uninstall")]
+    pub(super) fn remove_installed_packages() -> Result<Vec<super::InstalledPackage>> {
+        require_elevated()?;
+        let mut removed = Vec::new();
+        for package in enum_installed_packages()? {
+            let output = std::process::Command::new("pnputil.exe")
+                .args([
+                    "/delete-driver",
+                    &package.published_name,
+                    "/uninstall",
+                    "/force",
+                ])
+                .output()
+                .map_err(|error| {
+                    Error::new(
+                        ErrorCode::Driver,
+                        format!(
+                            "running `pnputil /delete-driver {}` failed: {error}",
+                            package.published_name
+                        ),
+                    )
+                })?;
+            if !output.status.success() {
+                return Err(Error::new(
+                    ErrorCode::Driver,
+                    format!(
+                        "removing {} failed ({}); removed {} package(s) first: {}",
+                        package.published_name,
+                        output.status,
+                        removed.len(),
+                        String::from_utf8_lossy(&output.stdout).trim()
+                    ),
+                ));
+            }
+            removed.push(package);
+        }
+        Ok(removed)
+    }
 
     /// Fail early with a clear message if the process is not elevated — the
     /// install APIs need Administrator rights and would otherwise fail deep in

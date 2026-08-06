@@ -15,13 +15,21 @@
 //! cargo run -p numanager-examples -- usb_access claims
 //! cargo run -p numanager-examples -- usb_access show 5354:009a
 //! cargo run -p numanager-examples -- usb_access bind 5354:009a --approve
+//! cargo run -p numanager-examples -- usb_access uninstall
+//! cargo run -p numanager-examples -- usb_access uninstall --approve
 //! ```
 //!
 //! `bind` **displaces whatever driver currently owns the node** and needs an
 //! elevated process, so it does nothing without `--approve`. It is a
 //! deliberate setup action, not something a driver should do while opening a
-//! device. Nothing here is reversible from numanager: to give the node back to
-//! a vendor driver, reinstall that driver's package.
+//! device.
+//!
+//! `uninstall` is the reverse: it removes every WinUSB package numanager
+//! published and unbinds the devices using them, so each falls back to whatever
+//! driver PnP picks next. It lists what it would remove and does nothing
+//! without `--approve`. It is scoped to numanager's own packages — a device can
+//! be bound to WinUSB by Zadig, libwdi or a vendor installer, and removing
+//! those would break unrelated hardware.
 
 use numanager_core::*;
 use numanager_drivers::usb_discovery::{builtin_usb_driver_names, builtin_usb_vendor_claims};
@@ -32,9 +40,10 @@ pub fn run() -> Result<()> {
         "claims" => claims(),
         "show" => show(&function_arg()?),
         "bind" => bind(&function_arg()?),
+        "uninstall" => uninstall(),
         other => Err(Error::new(
             ErrorCode::InvalidCommand,
-            format!("unknown usb_access mode {other}; expected claims, show, or bind"),
+            format!("unknown usb_access mode {other}; expected claims, show, bind, or uninstall"),
         )),
     }
 }
@@ -119,6 +128,62 @@ fn bind(&(vendor_id, product_id): &(u16, u16)) -> Result<()> {
     Ok(())
 }
 
+/// Remove every WinUSB package numanager published, giving the nodes back to
+/// PnP. Lists first and needs `--approve`, for the same reason `bind` does: it
+/// changes which driver owns hardware.
+#[cfg(feature = "winusb-uninstall")]
+fn uninstall() -> Result<()> {
+    use numanager_drivers::winusb_access::{
+        installed_packages, remove_bound_nodes, remove_installed_packages, remove_signing_cert,
+    };
+
+    let packages = installed_packages()?;
+    if packages.is_empty() {
+        println!("no WinUSB packages installed by numanager");
+        return Ok(());
+    }
+
+    println!("WinUSB packages installed by numanager:");
+    for package in &packages {
+        println!(
+            "  {} (from {})",
+            package.published_name, package.original_name
+        );
+    }
+
+    if !std::env::args().any(|arg| arg == "--approve") {
+        println!(
+            "\nnot approved: re-run elevated with --approve to remove {} package(s).\n\
+             Devices using them fall back to whatever driver PnP picks next.",
+            packages.len()
+        );
+        return Ok(());
+    }
+
+    // Nodes first: they are matched via the package that bound them, and that
+    // link is gone once the package is deleted. Absent devices are included —
+    // otherwise an unplugged device keeps pointing at WinUSB.
+    let nodes = remove_bound_nodes()?;
+    for node in &nodes {
+        println!("detached {node}");
+    }
+
+    let removed = remove_installed_packages()?;
+    for package in &removed {
+        println!("removed {}", package.published_name);
+    }
+
+    // Only once the packages are gone is the signing certificate pointless;
+    // dropping it earlier would leave installed packages trusted by nothing.
+    remove_signing_cert()?;
+    println!(
+        "detached {} device node(s), removed {} package(s) and numanager's signing certificate",
+        nodes.len(),
+        removed.len()
+    );
+    Ok(())
+}
+
 #[cfg(not(any(windows, feature = "winusb")))]
 fn show(_device: &(u16, u16)) -> Result<()> {
     Err(unsupported())
@@ -127,6 +192,16 @@ fn show(_device: &(u16, u16)) -> Result<()> {
 #[cfg(not(any(windows, feature = "winusb")))]
 fn bind(_device: &(u16, u16)) -> Result<()> {
     Err(unsupported())
+}
+
+#[cfg(not(feature = "winusb-uninstall"))]
+fn uninstall() -> Result<()> {
+    Err(Error::new(
+        ErrorCode::Unsupported,
+        "uninstall is not compiled in; rebuild with \
+         --features numanager-examples/winusb-uninstall. It is off by default \
+         because removing the packages changes which driver owns the device",
+    ))
 }
 
 #[cfg(not(any(windows, feature = "winusb")))]

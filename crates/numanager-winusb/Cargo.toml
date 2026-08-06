@@ -11,12 +11,21 @@ publish = false
 # drivers can open it — the job Zadig does by hand. Detection is pure Rust via
 # SetupAPI; the install backend is a trimmed, vendored libwdi (added separately).
 
+[features]
+default = []
+# Removal of the driver packages this crate publishes, and of its signing
+# certificate. Off by default: this is a library, and unbinding a device from
+# WinUSB changes which driver owns hardware system-wide. A host application that
+# wants an uninstall path opts in; nothing links it accidentally.
+uninstall = []
+
 [dependencies]
 numanager-core = { path = "../numanager-core" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Cryptography",

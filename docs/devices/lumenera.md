@@ -6,10 +6,36 @@
 | --- | --- |
 | Driver module | `numanager_drivers::lumenera` |
 | Families | Lumenera Lu130-class USB cameras, including the Bio-Rad Gel Doc EZ OEM unit |
-| Support level | USB descriptor discovery for both stages, hidden EZ-USB firmware initialization when explicitly connected, capability readback, and experimental live acquisition from captured-traffic evidence; the last hardware capture returned 0 bytes, and `gain` fails closed because its register mapping is unevidenced |
-| Evidence | Hardware trace for the Bio-Rad OEM USB IDs and firmware initialization sequence; captured hardware traffic (2026-08-05) for the acquisition sequence, geometry, exposure encoding and frame layout; a documented bench run (2026-08-05) for the read-only capability registers, the reported geometry and bit depth, and the firmware-image wire comparison |
-| Transport | USB userspace via `nusb`; EZ-USB anchor writes are internal initialization only |
-| Validation | Firmware initialization live-confirmed 2026-08-03. The acquisition sequence and frame layout were read from captured vendor traffic on 2026-08-05. The numanager implementation of that sequence was run against hardware on 2026-08-05 and returned no frame: every control write was accepted and endpoint `0x86` delivered 0 bytes. Full bench record in [`lumenera-hardware-validation-2026-08-05.md`](lumenera-hardware-validation-2026-08-05.md), which promotes firmware initialization and the capability readback and leaves capture unvalidated. `hardware_validated` stays false for capture |
+| Support level | USB descriptor discovery for both stages, EZ-USB firmware initialization, sensor-pipeline configuration, register load, and **live single-frame `CameraCapture`** at 1392x1040 `Raw16` with writable `exposure`; `gain` fails closed because its register mapping is unevidenced |
+| Evidence | Hardware trace for the Bio-Rad OEM USB IDs and firmware initialization; captured hardware traffic (2026-08-05, 2026-08-06) for the bring-up chain, acquisition sequence, exposure encoding and frame layout; documented bench runs (2026-08-05, 2026-08-06) |
+| Transport | USB userspace via `nusb`; EZ-USB anchor writes and the pipeline image are internal initialization only |
+| Validation | **Capture is hardware-validated (2026-08-06):** six complete frames of 2 895 360 bytes each on endpoint `0x86`, at 100 ms, 200 ms and 500 ms exposures, decoding to a correctly aligned 1392x1040 image with no shear or tearing. Firmware initialization live-confirmed 2026-08-03. Full bench record in [`lumenera-hardware-validation-2026-08-05.md`](lumenera-hardware-validation-2026-08-05.md) |
+
+## Bring-Up Chain
+
+A cold camera needs four stages before it will produce a frame. Each was
+recorded from captured traffic and each is required — skipping the pipeline
+configuration leaves a camera that accepts every control transfer and delivers
+zero image bytes, which is indistinguishable from a wiring fault without a
+trace.
+
+| Stage | What happens | Notes |
+| --- | --- | --- |
+| 1. Firmware | EZ-USB anchor download (`0xA0`), `CPUCS` held then released; the device renumerates from the loader id to the imaging id | Selected by `bcdDevice`. On a host where a third-party loader already owns the loader node, that driver does this and numanager must not |
+| 2. Pipeline configuration | A 98 KB image streamed to bulk endpoint `0x08` under alternate setting 1, bracketed by arm (`0xFFFFFFFF`) and finish (`0`) writes on `wIndex 0x0008` | `0x0008` reports `0x80` ready, `0x40` busy, `0x00` done, `0xA0` already configured. An arm is accepted **only** from `0x80`; a configured device refuses another and must be power-cycled to return to `0x80` |
+| 3. Register load | 510 recorded transfers, mostly 8-bit writes on `wIndex 0x0006` addressed by `wValue` | Replayed as recorded. Layout is understood (reset pulse, ascending sweep, four per-channel blocks of 30 at stride 38); individual register meanings are not |
+| 4. Acquisition | Configure geometry/exposure, select alternate setting 2, arm, start, drain the frame, stop, restore alternate setting 0 | Per capture |
+
+Stages 2 and 3 run once per session, at open. Stage 2 is skipped when the
+device reports it is already configured.
+
+### Reads must be sized to the remainder
+
+A frame is not a whole number of transfer chunks, and its final piece is an
+exact multiple of the endpoint's packet size — so it carries no short packet to
+terminate an over-long request. A reader that always asks for a full chunk gets
+every chunk but the last and then blocks forever. Each read is therefore sized
+to `min(chunk, remaining)`.
 
 ## Logical Devices
 
@@ -71,11 +97,11 @@ in `data/third_party/lumenera/manifest.toml`.
 
 | Area | Gap |
 | --- | --- |
-| Capability registers | `0x1000` (and `0x100c`) read back `0x04100570` = 1392 x 1040, and `0x1014` reads `0x0c` = 12 bpp, both live-confirmed 2026-08-05 — the camera reports exactly the geometry the driver programs. `0x0004`, `0x019c`, `0x0280`, `0x0284`, `0x1004`, `0x1008`, `0x101c`, `0x1040` are read but unidentified |
-| Bench validation | The implemented sequence ran on 2026-08-05 and produced no frame. The wire trace is byte-identical to the reference acquisition trace, so the acquisition sequence itself is not the gap; the open candidates are image-endpoint pipe state and device state carried over from a prior session. The interface is now returned to the idle alternate setting on open and the image endpoint's halt is cleared before reads are queued, and a failed capture reports the camera's capability registers. None of that is hardware validated |
+| Register semantics | The 510-transfer load is replayed, not understood. Its layout is decoded — a reset pulse on register `0x17`, an ascending sweep over `0x0000`-`0x0286` in contiguous runs, four per-channel blocks of 30 registers at stride 38, then a re-write tail — but no individual register has a recorded meaning. Now testable: with a live image, a single-variable sweep can be observed rather than guessed |
+| Capability registers | `0x1000` (and `0x100c`) read back `0x04100570` = 1392 x 1040 — the camera reports exactly the geometry the driver programs. `0x1014` is a device state code, not bit depth: the same camera read `0x0c` and later `0x05`. `0x0004`, `0x019c`, `0x0280`, `0x0284`, `0x1004`, `0x1008`, `0x101c`, `0x1040` are read but unidentified |
+| Illumination | The camera is one of two USB devices in the enclosure; the lamp belongs to the other and this driver never touches it. Every frame captured so far is therefore a dark frame. A lit image needs the enclosure driven in parallel |
 | Gain | Registers `0x0276`-`0x027b` are written on every acquisition (four equal values, then two others — consistent with per-tap gain/offset on a dual-tap sensor), but no mapping to a canonical unit is recorded. Needs a single-variable sweep |
 | Opaque configuration steps | `wIndex` `0x4008`, `0x4010`, `0x0550`, `0x05a0`, `0x0610`, `0x0670` and the post-stop FPGA write at `0x0544` are replayed verbatim with unrecorded meaning |
 | Binning and ROI | The wire encoding is known (`wIndex 0x4018`/`0x400c`), but only 1x1 at full frame has been observed, so neither is exposed as a property |
-| Exposure range | Two points (90 ms and 10 s) fit `elapsed ≈ exposure + ~85 ms`. Min/max and linearity across the range are unconfirmed |
-| Streaming | Only a single-frame diagnostic acquisition path is present; it is not hardware-validated, and `CameraStream` is not offered |
-| Documentation | Record a hardware-validation note with exact unit identity, firmware package identity, firmware digest, OS/runtime versions, and observed output |
+| Exposure range | Captures at 100 ms, 200 ms and 500 ms all returned full frames, and the vendor trace fits `elapsed ≈ exposure + ~85 ms` at 90 ms and 10 s. Min/max and linearity across the range are still unconfirmed, and the *radiometric* effect of `exposure` is unverified because every frame so far is dark |
+| Streaming | Only single-frame capture is implemented; `CameraStream` is not offered. The transport supports it — the device streams continuously once started — but frame-boundary handling across repeated frames is untested |
