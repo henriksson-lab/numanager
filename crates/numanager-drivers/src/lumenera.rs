@@ -107,7 +107,6 @@ mod protocol {
     pub(super) const IDX_FORMAT_MODE: u16 = 0x4010;
     pub(super) const IDX_FORMAT_08: u16 = 0x4008;
     pub(super) const IDX_EXPOSURE: u16 = 0x0540;
-    pub(super) const IDX_STREAM_LIFECYCLE: u16 = 0x0214;
     pub(super) const IDX_ACQUISITION: u16 = 0x0218;
     pub(super) const IDX_OPAQUE_05A0: u16 = 0x05a0;
     pub(super) const IDX_OPAQUE_0550: u16 = 0x0550;
@@ -149,8 +148,6 @@ mod protocol {
     pub(super) const ACQ_STOP: u32 = 0;
     pub(super) const ACQ_ARM: u32 = 4;
     pub(super) const ACQ_START: u32 = 6;
-    pub(super) const STREAM_LIFECYCLE_IDLE: u32 = 0;
-    pub(super) const STREAM_LIFECYCLE_ACTIVE: u32 = u32::MAX;
 
     /// Per-tap registers written on every acquisition.
     pub(super) const REG_TAP_FIRST: u16 = 0x0276;
@@ -1375,7 +1372,6 @@ mod live_imaging {
             // Teardown runs whether or not the read succeeded, so a failed
             // capture still leaves the camera idle rather than streaming.
             let _ = self.property(IDX_ACQUISITION, &word(ACQ_STOP));
-            let _ = self.property(IDX_STREAM_LIFECYCLE, &word(STREAM_LIFECYCLE_IDLE));
             let _ = self.write(
                 REQ_REGISTER,
                 FPGA_TEARDOWN_ADDR,
@@ -1437,7 +1433,6 @@ mod live_imaging {
                     "Lumenera bulk reader did not queue initial reads before acquisition start",
                 )
             })?;
-            self.property(IDX_STREAM_LIFECYCLE, &word(STREAM_LIFECYCLE_ACTIVE))?;
             self.property(IDX_ACQUISITION, &word(ACQ_START))?;
 
             let deadline =
