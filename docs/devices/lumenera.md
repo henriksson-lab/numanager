@@ -6,10 +6,10 @@
 | --- | --- |
 | Driver module | `numanager_drivers::lumenera` |
 | Families | Lumenera Lu130-class USB cameras, including the Bio-Rad Gel Doc EZ OEM unit |
-| Support level | USB descriptor discovery for both stages, hidden EZ-USB firmware initialization when explicitly connected, and live `CameraCapture` with writable `exposure`; `gain` fails closed because its register mapping is unevidenced |
+| Support level | USB descriptor discovery for both stages, hidden EZ-USB firmware initialization when explicitly connected, capability readback, and experimental live acquisition from captured-traffic evidence; the last hardware capture returned 0 bytes, and `gain` fails closed because its register mapping is unevidenced |
 | Evidence | Hardware trace for the Bio-Rad OEM USB IDs and firmware initialization sequence; captured hardware traffic (2026-08-05) for the acquisition sequence, geometry, exposure encoding and frame layout; a documented bench run (2026-08-05) for the read-only capability registers, the reported geometry and bit depth, and the firmware-image wire comparison |
 | Transport | USB userspace via `nusb`; EZ-USB anchor writes are internal initialization only |
-| Validation | Firmware initialization live-confirmed 2026-08-03. The acquisition sequence and frame layout were read from captured traffic on 2026-08-05 and decode to a correct image. The driver implementation of that sequence WAS run against hardware on 2026-08-05 and returned no frame: every control write was accepted and endpoint `0x86` delivered 0 bytes. Full bench record in [`lumenera-hardware-validation-2026-08-05.md`](lumenera-hardware-validation-2026-08-05.md), which promotes firmware initialization and the capability readback and leaves capture unvalidated. `hardware_validated` stays false for capture |
+| Validation | Firmware initialization live-confirmed 2026-08-03. The acquisition sequence and frame layout were read from captured vendor traffic on 2026-08-05. The numanager implementation of that sequence was run against hardware on 2026-08-05 and returned no frame: every control write was accepted and endpoint `0x86` delivered 0 bytes. Full bench record in [`lumenera-hardware-validation-2026-08-05.md`](lumenera-hardware-validation-2026-08-05.md), which promotes firmware initialization and the capability readback and leaves capture unvalidated. `hardware_validated` stays false for capture |
 
 ## Logical Devices
 
@@ -65,7 +65,7 @@ in `data/third_party/lumenera/manifest.toml`.
 | `cargo run -p numanager-examples -- gel_doc` | Configured loader-stage topology, the full property/gate readout, and `CameraCapture` failing closed without a live session |
 | `cargo run -p numanager-examples --features os-usb -- gel_doc live` | Read-only enumeration of real units and their firmware stage |
 | `cargo run -p numanager-examples --features os-usb -- gel_doc initialize-firmware` | Two-stage firmware download against real hardware |
-| `cargo run -p numanager-examples --features os-usb -- gel_doc capture [exposure_ms]` | Sets `exposure` and takes one frame off a live camera |
+| `cargo run -p numanager-examples --features os-usb -- gel_doc capture [exposure_ms]` | Diagnostic acquisition attempt against a live camera; last hardware run timed out with 0 image bytes |
 
 ## Remaining Work
 
@@ -77,5 +77,5 @@ in `data/third_party/lumenera/manifest.toml`.
 | Opaque configuration steps | `wIndex` `0x4008`, `0x4010`, `0x0550`, `0x05a0`, `0x0610`, `0x0670` and the post-stop FPGA write at `0x0544` are replayed verbatim with unrecorded meaning |
 | Binning and ROI | The wire encoding is known (`wIndex 0x4018`/`0x400c`), but only 1x1 at full frame has been observed, so neither is exposed as a property |
 | Exposure range | Two points (90 ms and 10 s) fit `elapsed ≈ exposure + ~85 ms`. Min/max and linearity across the range are unconfirmed |
-| Streaming | Only single-frame capture is implemented; `CameraStream` is not offered |
+| Streaming | Only a single-frame diagnostic acquisition path is present; it is not hardware-validated, and `CameraStream` is not offered |
 | Documentation | Record a hardware-validation note with exact unit identity, firmware package identity, firmware digest, OS/runtime versions, and observed output |

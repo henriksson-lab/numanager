@@ -15,16 +15,18 @@
 //!
 //! ## What is and isn't implemented
 //!
-//! Implemented and evidenced: USB discovery of both stages, the two-stage
-//! **firmware download** (validated on hardware 2026-08-03), and **frame
-//! capture** with writable exposure, from an acquisition sequence recorded off
-//! captured hardware traffic (2026-08-05).
+//! Implemented and evidenced: USB discovery of both stages and the two-stage
+//! **firmware download** (validated on hardware 2026-08-03). The acquisition
+//! control sequence, exposure encoding and frame layout are recorded from
+//! vendor traffic (2026-08-05), but numanager's live acquisition attempt
+//! accepted every control transfer and still received 0 bytes, so capture is
+//! experimental and not hardware-validated.
 //!
 //! The captured acquisition is: configure geometry/exposure, select alternate
 //! setting 2, arm, start, drain one frame off bulk endpoint `0x86`, stop,
 //! restore alternate setting 0. A frame is 16 bits per pixel over the binned
-//! dimensions — confirmed by the captured bulk byte count being an exact
-//! multiple of `1392 * 1040 * 2`, and by the decoded image.
+//! dimensions — inferred from the vendor trace's bulk byte count being an exact
+//! multiple of `1392 * 1040 * 2`. Numanager has not yet reproduced that frame.
 //!
 //! **Not evidenced:** `gain`. The sequence writes registers `0x0276`-`0x027b`
 //! (four equal values then two others, consistent with per-tap gain/offset on
@@ -71,9 +73,10 @@ const DEFAULT_EXPOSURE_US: u32 = 90_000;
 
 /// What of the imaging protocol is recorded, and what is replayed blind.
 const PROTOCOL_STATUS: &str =
-    "acquisition sequence, geometry, exposure and frame layout recorded from \
-     captured hardware traffic; several configuration steps are replayed \
-     verbatim with unrecorded meaning";
+    "acquisition control sequence, geometry, exposure and frame layout recorded \
+     from captured vendor traffic; numanager's 2026-08-05 hardware run accepted \
+     the control writes but received 0 image bytes; several configuration steps \
+     are replayed verbatim with unrecorded meaning";
 
 /// Why a capture cannot run without a live USB session.
 const CAPTURE_REQUIRES_LIVE: &str =
@@ -102,6 +105,10 @@ mod protocol {
     pub(super) const REQ_REGISTER: u8 = 0x13;
 
     /// `wIndex` selectors on [`REQ_PROPERTY`].
+    ///
+    /// The `0x86` image endpoint maps to the second bulk-IN pin and uses
+    /// `0x0218`. The neighboring `0x0214` lifecycle register belongs to the
+    /// first bulk-IN pin (`0x82`) and must not be replayed on this path.
     pub(super) const IDX_DIMENSIONS: u16 = 0x400c;
     pub(super) const IDX_BINNING: u16 = 0x4018;
     pub(super) const IDX_FORMAT_MODE: u16 = 0x4010;
@@ -160,8 +167,9 @@ mod protocol {
     pub(super) const FPGA_TEARDOWN_ADDR: u16 = 0x0544;
     pub(super) const FPGA_TEARDOWN_DATA: [u8; 5] = [0x22, 0x0f, 0x00, 0xc2, 0x00];
 
-    /// Bulk IN endpoint carrying image data, and the alternate settings the
-    /// sequence selects around streaming.
+    /// Bulk IN endpoint carrying image data in the working vendor trace. Alt 2
+    /// also exposes `0x82`, but that first bulk-IN pin maps to lifecycle
+    /// register `0x0214` and is not the observed image stream.
     pub(super) const EP_IMAGE: u8 = 0x86;
     pub(super) const ALT_STREAMING: u8 = 2;
     pub(super) const ALT_IDLE: u8 = 0;
@@ -782,8 +790,9 @@ impl LumeneraCameraDriver {
                 property("width", "Width", ValueType::PixelCount),
                 property("height", "Height", ValueType::PixelCount),
                 string_property("pixel_format", "Pixel format"),
-                // Advertised with the writable shape other camera drivers use;
-                // writes error until the control wire protocol is decoded. [assumed]
+                // Exposure writes update the value programmed at the next
+                // acquisition; gain remains refused until its register mapping
+                // is evidenced.
                 writable_property("exposure", "Exposure", ValueType::TimeInterval),
                 writable_property("gain", "Gain", ValueType::F64),
                 property("firmware_loaded", "Firmware loaded", ValueType::Bool),
@@ -805,8 +814,9 @@ impl LumeneraCameraDriver {
 
     fn support_level(&self) -> &'static str {
         "USB discovery of both stages, hardware-validated two-stage firmware download, and \
-         live Raw16 capture with writable exposure from captured-traffic evidence; gain is not \
-         exposed because its register mapping is unevidenced"
+         experimental live acquisition from captured-traffic evidence; the last hardware run \
+         received 0 image bytes, so capture is not validated; gain is not exposed because its \
+         register mapping is unevidenced"
     }
 
     fn read_property(&self, key: &str) -> Result<Value> {
