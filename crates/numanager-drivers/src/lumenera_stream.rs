@@ -10,18 +10,10 @@
 //! 2. **`VIDEO_EN` is not a boolean.** Enable is `0xFFFFFFFF`; a real teardown
 //!    writes `0x40` first — asking for zero-length packets so the transfer ends
 //!    cleanly — and only then `0x00`.
-//! 3. **The enable is read back as a health check.** A failed read, or any bit
-//!    set above the low byte, means the camera needs a stream recovery. Recovery
-//!    is issued during *stop*, and start retries exactly once — never an
-//!    in-place fix.
-//!
-//!    **This third one is deliberate hardening, not replication.** The read-back,
-//!    the recovery command and the retry all belong to the vendor's USB 3
-//!    transport; its USB 2 transport writes the enable and assumes success. We
-//!    do the check on both because a silent enable failure is otherwise
-//!    indistinguishable from a camera that simply never sends a frame — which is
-//!    the symptom this driver already had. If it proves to misbehave on USB 2
-//!    hardware, this is the thing to switch off first.
+//! 3. **The enable read-back is transport-specific.** The shipped USB 2 path
+//!    writes the enable and assumes success. USB 3 endpoint paths read it back,
+//!    and the legacy USB 3 endpoint path additionally treats high bits as a
+//!    recovery condition.
 //!
 //! Specified in `reveng-dll/teledyne/lucam-protocol-spec.md` §4.3–4.4. This is an
 //! independent implementation from that specification.
@@ -143,7 +135,10 @@ impl Mode {
     /// one. Hardware-trigger still capture does; nothing else does.
     fn post_enable(self) -> Option<u32> {
         match self {
-            Mode::Still { hardware_trigger: true, .. } => Some(STILL_ARM_HARDWARE),
+            Mode::Still {
+                hardware_trigger: true,
+                ..
+            } => Some(STILL_ARM_HARDWARE),
             _ => None,
         }
     }
@@ -151,9 +146,17 @@ impl Mode {
     fn software_trigger(self) -> Option<u32> {
         match self {
             Mode::Video => None,
-            Mode::Still { spec_version: 0, .. } => Some(STILL_TRIGGER_V0),
-            Mode::Still { hardware_trigger: false, .. } => Some(STILL_TRIGGER_SOFTWARE),
-            Mode::Still { hardware_trigger: true, .. } => Some(STILL_TRIGGER_HARDWARE),
+            Mode::Still {
+                spec_version: 0, ..
+            } => Some(STILL_TRIGGER_V0),
+            Mode::Still {
+                hardware_trigger: false,
+                ..
+            } => Some(STILL_TRIGGER_SOFTWARE),
+            Mode::Still {
+                hardware_trigger: true,
+                ..
+            } => Some(STILL_TRIGGER_HARDWARE),
         }
     }
 }
@@ -166,6 +169,16 @@ pub enum BusSpeed {
     /// USB 3 — clearing halt when nothing is halted misbehaves, so it is only
     /// done when a frame error actually occurred.
     Super,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnableReadback {
+    /// USB 2 vendor-control path: no enable read-back.
+    None,
+    /// U3V-compatible path: read failure is an enable failure, no recovery mask.
+    ReadOnly,
+    /// Legacy USB3 endpoint path: read failure or high bits schedules recovery.
+    LegacyUsb3,
 }
 
 /// What streaming needs from a transport. The driver supplies the USB one.
@@ -183,6 +196,12 @@ pub trait StreamTransport {
     /// Drop queued frames and reset the buffer state.
     fn reset_frames(&mut self);
     fn bus_speed(&self) -> BusSpeed;
+    fn enable_readback(&self) -> EnableReadback {
+        EnableReadback::None
+    }
+    fn stream_recovery_supported(&self) -> bool {
+        false
+    }
 }
 
 /// The streaming state machine.
@@ -315,21 +334,27 @@ impl Stream {
 
         io.write_reg(self.mode.reg(), self.mode.enable())?;
 
-        // The read-back is a health check, not a formality.
-        match io.read_reg(self.mode.reg()) {
-            Err(_) => {
-                self.recovery_outstanding = true;
-                return Err(err(
-                    "Lumenera VIDEO_EN read-back failed after enabling; stream recovery required",
-                ));
+        match io.enable_readback() {
+            EnableReadback::None => {}
+            EnableReadback::ReadOnly => {
+                io.read_reg(self.mode.reg())
+                    .map_err(|_| err("Lumenera enable read-back failed after enabling"))?;
             }
-            Ok(v) if v & VIDEO_EN_FAULT_MASK != 0 => {
-                self.recovery_outstanding = true;
-                return Err(err(format!(
-                    "Lumenera VIDEO_EN read back as {v:#010x} after enabling; stream recovery required"
-                )));
-            }
-            Ok(_) => {}
+            EnableReadback::LegacyUsb3 => match io.read_reg(self.mode.reg()) {
+                Err(_) => {
+                    self.recovery_outstanding = true;
+                    return Err(err(
+                        "Lumenera enable read-back failed after enabling; stream recovery required",
+                    ));
+                }
+                Ok(v) if v & VIDEO_EN_FAULT_MASK != 0 => {
+                    self.recovery_outstanding = true;
+                    return Err(err(format!(
+                        "Lumenera enable read back as {v:#010x} after enabling; stream recovery required"
+                    )));
+                }
+                Ok(_) => {}
+            },
         }
 
         if let Some(v) = self.mode.post_enable() {
@@ -393,9 +418,9 @@ impl Stream {
             let _ = io.clear_halt();
         }
 
-        // Recovery is issued here, not where it was detected. USB 3 behaviour
-        // adopted on all transports; see the module header.
-        if self.recovery_outstanding {
+        // Recovery is issued here, not where it was detected, and only on the
+        // legacy USB3 endpoint path that actually defines command 0x21 for this.
+        if self.recovery_outstanding && io.stream_recovery_supported() {
             io.ext_cmd(EXT_STREAM_RECOVERY)?;
             self.recovery_outstanding = false;
         }
@@ -482,6 +507,12 @@ pub(crate) mod tests_support {
                 BusSpeed::High
             }
         }
+        fn enable_readback(&self) -> EnableReadback {
+            EnableReadback::LegacyUsb3
+        }
+        fn stream_recovery_supported(&self) -> bool {
+            true
+        }
     }
 
     fn started(pool: usize) -> (Stream, Fake) {
@@ -519,7 +550,11 @@ pub(crate) mod tests_support {
     #[test]
     fn enable_is_not_a_boolean() {
         let (_, io) = started(2);
-        assert!(io.log.contains(&"write:0xffffffff".to_string()), "{:?}", io.log);
+        assert!(
+            io.log.contains(&"write:0xffffffff".to_string()),
+            "{:?}",
+            io.log
+        );
         assert!(!io.log.contains(&"write:0x1".to_string()));
     }
 
@@ -531,9 +566,16 @@ pub(crate) mod tests_support {
             let (mut s, mut io) = started(2);
             io.log.clear();
             s.stop(&mut io, kind).unwrap();
-            let zlp = io.log.iter().position(|l| l == "write:0x40")
+            let zlp = io
+                .log
+                .iter()
+                .position(|l| l == "write:0x40")
                 .unwrap_or_else(|| panic!("{kind:?} must request ZLP: {:?}", io.log));
-            let off = io.log.iter().position(|l| l == "write:0x0").expect("disable");
+            let off = io
+                .log
+                .iter()
+                .position(|l| l == "write:0x0")
+                .expect("disable");
             assert!(zlp < off, "{kind:?}: 0x40 must precede 0x00: {:?}", io.log);
         }
     }
@@ -591,6 +633,60 @@ pub(crate) mod tests_support {
         assert!(s.start(&mut io).is_err());
     }
 
+    #[test]
+    fn usb2_path_does_not_read_back_or_recover() {
+        struct Usb2(Fake);
+        impl StreamTransport for Usb2 {
+            fn read_reg(&mut self, index: u16) -> Result<u32> {
+                self.0.read_reg(index)
+            }
+            fn write_reg(&mut self, index: u16, value: u32) -> Result<()> {
+                self.0.write_reg(index, value)
+            }
+            fn ext_cmd(&mut self, sub: u8) -> Result<()> {
+                self.0.ext_cmd(sub)
+            }
+            fn set_alt_setting(&mut self, alt: AltSetting) -> Result<()> {
+                self.0.set_alt_setting(alt)
+            }
+            fn submit(&mut self, slot: usize) -> Result<()> {
+                self.0.submit(slot)
+            }
+            fn kill(&mut self, from: usize, count: usize) -> Result<()> {
+                self.0.kill(from, count)
+            }
+            fn clear_halt(&mut self) -> Result<()> {
+                self.0.clear_halt()
+            }
+            fn reset_frames(&mut self) {
+                self.0.reset_frames()
+            }
+            fn bus_speed(&self) -> BusSpeed {
+                BusSpeed::High
+            }
+        }
+
+        let mut s = Stream::new(2);
+        let mut io = Usb2(Fake {
+            readback: vec![Some(0xFFFF_FFFF)],
+            ..Fake::default()
+        });
+        s.acquire(&mut io).unwrap();
+        s.start(&mut io).unwrap();
+        assert!(
+            !io.0.log.iter().any(|l| l.starts_with("read:")),
+            "{:?}",
+            io.0.log
+        );
+        s.note_frame_error(true);
+        s.stop(&mut io, StopKind::Pause).unwrap();
+        assert!(
+            !io.0.log.iter().any(|l| l.starts_with("ext:")),
+            "{:?}",
+            io.0.log
+        );
+    }
+
     /// Recovery is a stop-then-start, issued during stop, retried exactly once.
     #[test]
     fn recovery_is_issued_during_stop_and_start_retries_once() {
@@ -602,13 +698,19 @@ pub(crate) mod tests_support {
         s.start(&mut io).expect("the single retry should succeed");
 
         assert_eq!(
-            io.log.iter().filter(|l| *l == &format!("ext:{EXT_STREAM_RECOVERY:#x}")).count(),
+            io.log
+                .iter()
+                .filter(|l| *l == &format!("ext:{EXT_STREAM_RECOVERY:#x}"))
+                .count(),
             1,
             "recovery sent exactly once: {:?}",
             io.log
         );
         assert_eq!(
-            io.log.iter().filter(|l| l.as_str() == "write:0xffffffff").count(),
+            io.log
+                .iter()
+                .filter(|l| l.as_str() == "write:0xffffffff")
+                .count(),
             2,
             "enabled twice: once failing, once on the retry"
         );
@@ -625,7 +727,10 @@ pub(crate) mod tests_support {
         s.acquire(&mut io).unwrap();
         assert!(s.start(&mut io).is_err());
         assert_eq!(
-            io.log.iter().filter(|l| l.as_str() == "write:0xffffffff").count(),
+            io.log
+                .iter()
+                .filter(|l| l.as_str() == "write:0xffffffff")
+                .count(),
             2,
             "exactly one retry"
         );
@@ -641,14 +746,22 @@ pub(crate) mod tests_support {
         s.start(&mut io).unwrap();
         io.log.clear();
         s.stop(&mut io, StopKind::Pause).unwrap();
-        assert!(!io.log.contains(&"clear_halt".to_string()), "no error, USB3: {:?}", io.log);
+        assert!(
+            !io.log.contains(&"clear_halt".to_string()),
+            "no error, USB3: {:?}",
+            io.log
+        );
         // ...but USB 2 clears unconditionally, which is the shipped transport.
 
         s.start(&mut io).unwrap();
         s.note_frame_error(false);
         io.log.clear();
         s.stop(&mut io, StopKind::Pause).unwrap();
-        assert!(io.log.contains(&"clear_halt".to_string()), "error, USB3: {:?}", io.log);
+        assert!(
+            io.log.contains(&"clear_halt".to_string()),
+            "error, USB3: {:?}",
+            io.log
+        );
 
         // USB 2 clears unconditionally.
         let (mut s2, mut io2) = started(2);
@@ -666,7 +779,10 @@ pub(crate) mod tests_support {
         s.acquire(&mut io).unwrap(); // second acquire is a no-op
         s.start(&mut io).unwrap();
         s.start(&mut io).unwrap(); // already running
-        assert_eq!(io.log.iter().filter(|l| l.starts_with("submit:")).count(), 3);
+        assert_eq!(
+            io.log.iter().filter(|l| l.starts_with("submit:")).count(),
+            3
+        );
         s.stop(&mut io, StopKind::Pause).unwrap();
         s.stop(&mut io, StopKind::Pause).unwrap(); // already paused
         s.release(&mut io).unwrap();
@@ -680,7 +796,11 @@ pub(crate) mod tests_support {
         let (mut s, mut io) = started(2);
         io.log.clear();
         s.release(&mut io).unwrap();
-        assert!(io.log.contains(&"write:0x40".to_string()), "teardown: {:?}", io.log);
+        assert!(
+            io.log.contains(&"write:0x40".to_string()),
+            "teardown: {:?}",
+            io.log
+        );
         assert_eq!(io.log.last().unwrap(), "alt:Idle");
     }
 }
@@ -698,7 +818,11 @@ mod mode_tests {
         let mut io = Fake::new();
         s.acquire(&mut io).unwrap();
         s.start(&mut io).unwrap();
-        assert!(io.reg_writes.contains(&(REG_TRIGGER_CTRL, STILL_ENABLE)), "{:?}", io.reg_writes);
+        assert!(
+            io.reg_writes.contains(&(REG_TRIGGER_CTRL, STILL_ENABLE)),
+            "{:?}",
+            io.reg_writes
+        );
         assert!(
             !io.reg_writes.iter().any(|(r, _)| *r == REG_VIDEO_EN),
             "still capture must not touch VIDEO_EN: {:?}",
@@ -741,7 +865,11 @@ mod mode_tests {
             s.start(&mut io).unwrap();
             io.reg_writes.clear();
             s.trigger(&mut io).unwrap();
-            assert_eq!(io.reg_writes, vec![(REG_TRIGGER_CTRL, want)], "v{ver} hw={hw}");
+            assert_eq!(
+                io.reg_writes,
+                vec![(REG_TRIGGER_CTRL, want)],
+                "v{ver} hw={hw}"
+            );
         }
     }
 
@@ -802,7 +930,11 @@ mod mode_tests {
         s.acquire(&mut io).unwrap();
         s.start(&mut io).unwrap();
         let enable = io.log.iter().position(|l| l.starts_with("write:")).unwrap();
-        let last_submit = io.log.iter().rposition(|l| l.starts_with("submit:")).unwrap();
+        let last_submit = io
+            .log
+            .iter()
+            .rposition(|l| l.starts_with("submit:"))
+            .unwrap();
         assert!(last_submit < enable, "{:?}", io.log);
     }
 }

@@ -31,8 +31,12 @@ fn err(msg: impl Into<String>) -> Error {
     Error::new(ErrorCode::Driver, msg)
 }
 
-/// Two little-endian `u16`: width then height. **Confirmed on hardware.**
+/// `MAX_SIZE`: two little-endian `u16`: width then height.
+/// **Confirmed on hardware.**
 pub const REG_DIMENSIONS: u16 = 0x1000;
+/// `FO_SIZE`: current frame dimensions / active ROI. Falls back to
+/// [`REG_DIMENSIONS`] when either half is zero.
+pub const REG_FRAME_SIZE: u16 = 0x100C;
 /// `SPECIFICATION` — the camera's **protocol version**, not a capability
 /// bitfield. Read once at bring-up and clamped to the highest version the host
 /// implements; it gates the still-trigger encoding among other things.
@@ -100,14 +104,23 @@ fn interpret_depth(raw: u32) -> Option<u8> {
 
 /// Asks the camera for its geometry.
 pub fn query<T: GeometryTransport>(io: &mut T) -> Result<Geometry> {
-    let dims = io.read_reg(REG_DIMENSIONS)?;
-    let width = dims & 0xFFFF;
-    let height = dims >> 16;
-    if width == 0 || height == 0 {
+    let max_size = io.read_reg(REG_DIMENSIONS)?;
+    let max_width = max_size & 0xFFFF;
+    let max_height = max_size >> 16;
+    if max_width == 0 || max_height == 0 {
         return Err(err(format!(
-            "Lumenera reported an impossible sensor size {width}x{height} (register {REG_DIMENSIONS:#06x} = {dims:#010x})"
+            "Lumenera reported an impossible sensor size {max_width}x{max_height} \
+             (register {REG_DIMENSIONS:#06x} = {max_size:#010x})"
         )));
     }
+    let frame_size = io.read_reg(REG_FRAME_SIZE).unwrap_or(0);
+    let frame_width = frame_size & 0xFFFF;
+    let frame_height = frame_size >> 16;
+    let (width, height) = if frame_width == 0 || frame_height == 0 {
+        (max_width, max_height)
+    } else {
+        (frame_width, frame_height)
+    };
 
     // Diagnostics: a failure here must not stop a camera that reports a good
     // size, so these degrade to zero rather than propagating.
@@ -161,6 +174,7 @@ mod tests {
     fn decodes_the_hardware_confirmed_dimension_word() {
         let mut io = Fake::default()
             .with(REG_DIMENSIONS, 0x0410_0570)
+            .with(REG_FRAME_SIZE, 0x0410_0570)
             .with(REG_TRUE_PIXEL_DEPTH, 12);
         let g = query(&mut io).unwrap();
         assert_eq!((g.width, g.height), (1392, 1040));
@@ -171,7 +185,18 @@ mod tests {
     /// yields different numbers with no per-model data.
     #[test]
     fn a_different_camera_reports_different_geometry() {
-        let mut io = Fake::default().with(REG_DIMENSIONS, (1024u32 << 16) | 1280);
+        let mut io = Fake::default()
+            .with(REG_DIMENSIONS, (1024u32 << 16) | 1280)
+            .with(REG_FRAME_SIZE, (768u32 << 16) | 1024);
+        let g = query(&mut io).unwrap();
+        assert_eq!((g.width, g.height), (1024, 768));
+    }
+
+    #[test]
+    fn frame_size_falls_back_to_max_size_when_zero() {
+        let mut io = Fake::default()
+            .with(REG_DIMENSIONS, (1024u32 << 16) | 1280)
+            .with(REG_FRAME_SIZE, 0);
         let g = query(&mut io).unwrap();
         assert_eq!((g.width, g.height), (1280, 1024));
     }
@@ -222,11 +247,17 @@ mod tests {
         assert_eq!(g.frame_bytes(1, 1), 1392 * 1040 * 2);
         assert_eq!(g.frame_bytes(2, 2), 696 * 520 * 2);
 
-        let eight = Geometry { bit_depth: Some(8), ..g.clone() };
+        let eight = Geometry {
+            bit_depth: Some(8),
+            ..g.clone()
+        };
         assert_eq!(eight.frame_bytes(1, 1), 1392 * 1040);
 
         // Unknown depth falls back to two bytes, not to nothing.
-        let unknown = Geometry { bit_depth: None, ..g };
+        let unknown = Geometry {
+            bit_depth: None,
+            ..g
+        };
         assert_eq!(unknown.frame_bytes(1, 1), 1392 * 1040 * 2);
     }
 }

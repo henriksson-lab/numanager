@@ -91,7 +91,7 @@ in `data/third_party/lumenera/manifest.toml`.
 | `cargo run -p numanager-examples -- gel_doc` | Configured loader-stage topology, the full property/gate readout, and `CameraCapture` failing closed without a live session |
 | `cargo run -p numanager-examples --features os-usb -- gel_doc live` | Read-only enumeration of real units and their firmware stage |
 | `cargo run -p numanager-examples --features os-usb -- gel_doc initialize-firmware` | Two-stage firmware download against real hardware |
-| `cargo run -p numanager-examples --features os-usb -- gel_doc capture [exposure_ms]` | Diagnostic acquisition attempt against a live camera; last hardware run timed out with 0 image bytes |
+| `cargo run -p numanager-examples --features os-usb -- gel_doc capture [exposure_ms]` | Diagnostic acquisition against a live camera; validated complete 1392x1040 `Raw16` frames on 2026-08-06 |
 
 ## Remaining Work
 

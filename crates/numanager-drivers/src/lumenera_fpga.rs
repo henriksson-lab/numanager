@@ -183,9 +183,8 @@ impl BitstreamStore {
                 .payload
                 .get(off..off + complen)
                 .ok_or_else(|| err("Lumenera bitstream store payload is truncated"))?;
-            let data = zstd::decode_all(packed).map_err(|e| {
-                err(format!("cannot decompress a Lumenera bitstream: {e}"))
-            })?;
+            let data = zstd::decode_all(packed)
+                .map_err(|e| err(format!("cannot decompress a Lumenera bitstream: {e}")))?;
             if data.len() != rawlen {
                 return Err(err(format!(
                     "Lumenera bitstream decompressed to {} bytes, expected {rawlen}",
@@ -254,8 +253,8 @@ pub enum Programmed {
     NotApplicable,
 }
 
-/// How long to wait for one bitstream to finish programming.
-const PROGRAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Poll attempts while waiting for one bitstream to finish programming.
+const PROGRAM_POLLS: usize = 10;
 /// Settle time after writing a program code. Present because some hosts are
 /// otherwise faster than the camera.
 const CODE_SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
@@ -268,10 +267,7 @@ const POLL_GAP: std::time::Duration = std::time::Duration::from_millis(2);
 ///
 /// Returns without touching the device if it is already programmed, which is the
 /// common path for a camera that has not been power-cycled.
-pub fn program<T: FpgaTransport>(
-    io: &mut T,
-    bitstreams: &[Bitstream],
-) -> Result<Programmed> {
+pub fn program<T: FpgaTransport>(io: &mut T, bitstreams: &[Bitstream]) -> Result<Programmed> {
     if bitstreams.is_empty() {
         return Ok(Programmed::NotApplicable);
     }
@@ -294,21 +290,21 @@ pub fn program<T: FpgaTransport>(
                 io.delay(CHUNK_GAP);
             }
 
-            let mut waited = std::time::Duration::ZERO;
-            loop {
+            let mut done = false;
+            for _ in 0..PROGRAM_POLLS {
+                io.delay(POLL_GAP);
                 if io.read_reg(REG_FPGA_MODE)? & FPGA_BUSY == 0 {
+                    done = true;
                     break;
                 }
-                if waited >= PROGRAM_TIMEOUT {
-                    return Err(err(format!(
-                        "Lumenera FPGA bitstream {} of {} did not finish programming within {:?}",
-                        n + 1,
-                        bitstreams.len(),
-                        PROGRAM_TIMEOUT
-                    )));
-                }
-                io.delay(POLL_GAP);
-                waited += POLL_GAP;
+            }
+            if !done {
+                return Err(err(format!(
+                    "Lumenera FPGA bitstream {} of {} did not finish programming after \
+                     {PROGRAM_POLLS} polls",
+                    n + 1,
+                    bitstreams.len()
+                )));
             }
         }
 
@@ -396,9 +392,11 @@ mod tests {
     /// wrong bitstream — the caller gets nothing and can say so.
     #[test]
     fn unknown_revision_yields_nothing() {
-        let store =
-            BitstreamStore::parse(pack(&[(0x009a, 0x0000, 0, Some(0xff), 0)], &[vec![1, 2, 3]]))
-                .unwrap();
+        let store = BitstreamStore::parse(pack(
+            &[(0x009a, 0x0000, 0, Some(0xff), 0)],
+            &[vec![1, 2, 3]],
+        ))
+        .unwrap();
         assert!(store.bitstreams_for(0x009a, 0xbeef).unwrap().is_empty());
         assert_eq!(store.known_device_ids(0x009a), vec![0x0000]);
     }
@@ -452,7 +450,8 @@ mod real_store_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../data/third_party/lumenera/lucam-fpga.lufpga"
         ));
-        p.is_file().then(|| BitstreamStore::load(p).expect("real store must parse"))
+        p.is_file()
+            .then(|| BitstreamStore::load(p).expect("real store must parse"))
     }
 
     /// The shipped container, not a synthetic one. Skipped where the
@@ -484,7 +483,12 @@ mod real_store_tests {
     fn every_shipped_bitstream_round_trips() {
         let Some(s) = store() else { return };
         let mut seen = 0usize;
-        for pid in s.entries.iter().map(|(p, ..)| *p).collect::<std::collections::BTreeSet<_>>() {
+        for pid in s
+            .entries
+            .iter()
+            .map(|(p, ..)| *p)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
             for did in s.known_device_ids(pid) {
                 for b in s.bitstreams_for(pid, did).unwrap() {
                     assert!(!b.data.is_empty());
@@ -548,15 +552,24 @@ mod program_tests {
     }
 
     fn bs(code: u32, len: usize) -> Bitstream {
-        Bitstream { code: Some(code), data: vec![0xA5; len] }
+        Bitstream {
+            code: Some(code),
+            data: vec![0xA5; len],
+        }
     }
 
     /// The common path: a camera that is already programmed must not be
     /// reprogrammed, and must not have its interface setting disturbed.
     #[test]
     fn already_programmed_is_a_no_op() {
-        let mut io = Fake { mode: FPGA_PROGRAMMED, ..Default::default() };
-        assert_eq!(program(&mut io, &[bs(0xff, 10)]).unwrap(), Programmed::AlreadyDone);
+        let mut io = Fake {
+            mode: FPGA_PROGRAMMED,
+            ..Default::default()
+        };
+        assert_eq!(
+            program(&mut io, &[bs(0xff, 10)]).unwrap(),
+            Programmed::AlreadyDone
+        );
         assert!(io.log.is_empty(), "must not touch the device: {:?}", io.log);
         assert_eq!(io.chunks, 0);
     }
@@ -572,7 +585,10 @@ mod program_tests {
     /// shape. Order and codes are the thing a hardcoded blob gets wrong.
     #[test]
     fn programs_every_bitstream_in_order_with_its_own_code() {
-        let mut io = Fake { program_on_finish: true, ..Default::default() };
+        let mut io = Fake {
+            program_on_finish: true,
+            ..Default::default()
+        };
         let out = program(&mut io, &[bs(0x01, FPGA_CHUNK), bs(0x02, FPGA_CHUNK * 2)]).unwrap();
         assert_eq!(out, Programmed::Completed { bitstreams: 2 });
         assert_eq!(io.chunks, 3, "1 + 2 full chunks");
@@ -587,7 +603,10 @@ mod program_tests {
     /// A sub-chunk bitstream goes out as one short transfer.
     #[test]
     fn short_bitstream_is_sent_short() {
-        let mut io = Fake { program_on_finish: true, ..Default::default() };
+        let mut io = Fake {
+            program_on_finish: true,
+            ..Default::default()
+        };
         program(&mut io, &[bs(0xff, 3)]).unwrap();
         assert_eq!(io.chunks, 1);
         assert_eq!(io.last_chunk_len, 3, "must not be padded to 512");
@@ -596,24 +615,38 @@ mod program_tests {
     /// Busy must be waited out, not raced.
     #[test]
     fn waits_for_the_busy_bit_to_clear() {
-        let mut io = Fake { program_on_finish: true, busy_for: 5, ..Default::default() };
+        let mut io = Fake {
+            program_on_finish: true,
+            busy_for: 5,
+            ..Default::default()
+        };
         assert!(program(&mut io, &[bs(0xff, 8)]).is_ok());
     }
 
     /// If the camera never reports programmed, that is a failure, not success.
     #[test]
     fn silent_programming_failure_is_reported() {
-        let mut io = Fake { program_on_finish: false, ..Default::default() };
+        let mut io = Fake {
+            program_on_finish: false,
+            ..Default::default()
+        };
         let e = program(&mut io, &[bs(0xff, 8)]).unwrap_err();
         assert!(format!("{e}").contains("not programmed"), "{e}");
-        assert_eq!(io.log.last().unwrap(), "alt:Idle", "idle must still be restored");
+        assert_eq!(
+            io.log.last().unwrap(),
+            "alt:Idle",
+            "idle must still be restored"
+        );
     }
 
     /// A mid-transfer failure must still put the interface back, or streaming
     /// cannot claim it afterwards.
     #[test]
     fn restores_idle_setting_even_when_the_transfer_fails() {
-        let mut io = Fake { fail_chunk_at: Some(2), ..Default::default() };
+        let mut io = Fake {
+            fail_chunk_at: Some(2),
+            ..Default::default()
+        };
         assert!(program(&mut io, &[bs(0xff, FPGA_CHUNK * 4)]).is_err());
         assert_eq!(io.log.last().unwrap(), "alt:Idle");
     }

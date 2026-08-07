@@ -110,9 +110,9 @@ const DEFAULT_EXPOSURE_US: u32 = 90_000;
 /// What of the imaging protocol is recorded, and what is replayed blind.
 const PROTOCOL_STATUS: &str =
     "acquisition control sequence, geometry, exposure and frame layout recorded \
-     from captured vendor traffic; numanager's 2026-08-05 hardware run accepted \
-     the control writes but received 0 image bytes; several configuration steps \
-     are replayed verbatim with unrecorded meaning";
+     from captured vendor traffic; 2026-08-06 hardware runs returned complete \
+     1392x1040 Raw16 frames; several configuration steps are replayed verbatim \
+     with unrecorded meaning";
 
 /// Why a capture cannot run without a live USB session.
 const CAPTURE_REQUIRES_LIVE: &str =
@@ -154,10 +154,8 @@ mod protocol {
     pub(super) const IDX_OPAQUE_0550: u16 = 0x0550;
     pub(super) const IDX_OPAQUE_0610: u16 = 0x0610;
     pub(super) const IDX_OPAQUE_0670: u16 = 0x0670;
-    /// Bulk OUT endpoint carrying the configuration image, and the alternate
-    /// setting that exposes it.
-    pub(super) const EP_CONFIG: u8 = 0x08;
-    pub(super) const ALT_CONFIG: u8 = 1;
+    // Bulk OUT endpoint and alternate setting for FPGA programming are
+    // discovered from interface 0 descriptors.
 
     /// `wIndex` selectors on [`REQ_REGISTER`].
     pub(super) const IDX_REGISTER_DATA: u16 = 0x0006;
@@ -196,12 +194,8 @@ mod protocol {
     // specification identifies `0x0218` as trigger control and `0x04`/`0x00` as
     // the still-mode enable and disable.
     //
-    // **One captured write is unaccounted for.** The recorded sequence wrote
-    // `0x04` and then `0x06` to this register; the specification accounts for
-    // `0x04` and `0x00` only. The `0x06` is therefore no longer sent. If capture
-    // regresses on hardware, that dropped write is the first thing to restore —
-    // it is the single behavioural difference between the old sequence and the
-    // new one that is not explained by the specification.
+    // The recorded `0x04` -> `0x06` pair is now accounted for: `0x04` enables
+    // still capture and `0x06` fires the software trigger on SPECIFICATION >= 1.
 
     /// Per-tap registers written on every acquisition.
     pub(super) const REG_TAP_FIRST: u16 = 0x0276;
@@ -218,7 +212,6 @@ mod protocol {
     /// also exposes `0x82`, but that first bulk-IN pin maps to lifecycle
     /// register `0x0214` and is not the observed image stream.
     pub(super) const EP_IMAGE: u8 = 0x86;
-    pub(super) const ALT_STREAMING: u8 = 2;
     pub(super) const ALT_IDLE: u8 = 0;
 
     /// Constant leading word of the exposure payload.
@@ -840,8 +833,7 @@ impl LumeneraCameraDriver {
 
     fn support_level(&self) -> &'static str {
         "USB discovery of both stages, hardware-validated two-stage firmware download, and \
-         experimental live acquisition from captured-traffic evidence; the last hardware run \
-         received 0 image bytes, so capture is not validated; gain is not exposed because its \
+         hardware-validated live single-frame capture; gain is not exposed because its \
          register mapping is unevidenced"
     }
 
@@ -951,6 +943,7 @@ impl LumeneraCameraDriver {
                     self.session = Some(live_imaging::ImagingSession::open(
                         self.probe.vendor_id,
                         IMAGING_PID,
+                        self.probe.firmware_dir.clone(),
                     )?);
                 }
                 let data = match self
@@ -1197,7 +1190,8 @@ fn capability(id: u64, device: DeviceId, kind: CapabilityKind) -> CapabilityDesc
 mod live_imaging {
     use super::protocol::*;
     use super::*;
-    use nusb::transfer::{Control, ControlType, Recipient, RequestBuffer};
+    use nusb::transfer::{Control, ControlType, Direction, EndpointType, Recipient, RequestBuffer};
+    use nusb::Speed;
     use std::time::{Duration, Instant};
 
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1255,11 +1249,96 @@ mod live_imaging {
         /// once at bring-up and clamped to the highest this driver implements.
         /// It selects the still-trigger encoding.
         spec_version: u32,
+        layout: EndpointLayout,
+        speed: crate::lumenera_stream::BusSpeed,
         firmware_dir: Option<String>,
     }
 
     /// Highest protocol version this driver knows how to speak.
     const MAX_SPEC_VERSION: u32 = 2;
+
+    #[derive(Debug, Clone, Copy)]
+    struct EndpointLayout {
+        fpga_out: u8,
+        fpga_alt: u8,
+        image_in: u8,
+        data_alt: u8,
+        idle_alt: u8,
+    }
+
+    impl EndpointLayout {
+        fn discover(device: &nusb::Device) -> Result<Self> {
+            let config = device.active_configuration().map_err(|error| {
+                Error::new(
+                    ErrorCode::Transport,
+                    format!("reading Lumenera active USB configuration failed: {error}"),
+                )
+            })?;
+            let mut fpga = None;
+            let mut in_eps = Vec::new();
+            for group in config.interfaces() {
+                if group.interface_number() != 0 {
+                    continue;
+                }
+                for alt in group.alt_settings() {
+                    let alt_value = alt.alternate_setting();
+                    for ep in alt.endpoints() {
+                        if ep.transfer_type() != EndpointType::Bulk {
+                            continue;
+                        }
+                        match ep.direction() {
+                            Direction::Out if fpga.is_none() => {
+                                fpga = Some((ep.address(), alt_value));
+                            }
+                            Direction::In => in_eps.push((ep.address(), alt_value)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            let (fpga_out, fpga_alt) = fpga.ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Transport,
+                    "Lumenera interface 0 has no bulk OUT endpoint for FPGA programming",
+                )
+            })?;
+            let (image_in, data_alt) = in_eps
+                .iter()
+                .copied()
+                .find(|(ep, _)| *ep == EP_IMAGE)
+                .or_else(|| in_eps.first().copied())
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::Transport,
+                        "Lumenera interface 0 has no bulk IN endpoint for image data",
+                    )
+                })?;
+            Ok(Self {
+                fpga_out,
+                fpga_alt,
+                image_in,
+                data_alt,
+                idle_alt: ALT_IDLE,
+            })
+        }
+
+        fn alt_value(self, alt: crate::lumenera_fpga::AltSetting) -> u8 {
+            use crate::lumenera_fpga::AltSetting as A;
+            match alt {
+                A::Idle => self.idle_alt,
+                A::Fpga => self.fpga_alt,
+                A::Data => self.data_alt,
+            }
+        }
+    }
+
+    fn bus_speed(speed: Option<Speed>) -> crate::lumenera_stream::BusSpeed {
+        match speed {
+            Some(Speed::Super | Speed::SuperPlus) => crate::lumenera_stream::BusSpeed::Super,
+            _ => crate::lumenera_stream::BusSpeed::High,
+        }
+    }
 
     /// Bind WinUSB to the camera's node if something else owns it.
     ///
@@ -1287,7 +1366,11 @@ mod live_imaging {
 
     impl ImagingSession {
         /// Open the imaging-stage device and claim its interface.
-        pub(super) fn open(vendor_id: u16, product_id: u16) -> Result<Self> {
+        pub(super) fn open(
+            vendor_id: u16,
+            product_id: u16,
+            firmware_dir: Option<String>,
+        ) -> Result<Self> {
             // Granting this process access to the node is the driver's problem,
             // not the caller's. On Windows a userspace claim requires WinUSB
             // bound to the device, and an application asking a camera for a
@@ -1328,6 +1411,7 @@ mod live_imaging {
             // already configured by enumeration, so this is a deliberate
             // re-assert rather than setup.
             let _ = device.set_configuration(1);
+            let layout = EndpointLayout::discover(&device)?;
 
             let interface = device.claim_interface(0).map_err(|error| {
                 // Fell through host access: report what owns the node.
@@ -1344,15 +1428,18 @@ mod live_imaging {
             // through a frame. Returning to the idle setting on open resets the
             // endpoint, so the first capture of a session starts from a known
             // state rather than inheriting one.
-            let _ = interface.set_alt_setting(ALT_IDLE);
+            let _ = interface.set_alt_setting(layout.idle_alt);
 
             let device_id = info.device_version();
+            let speed = bus_speed(info.speed());
             let mut session = Self {
                 interface,
                 product_id,
                 device_id,
                 spec_version: 0,
-                firmware_dir: Some(default_firmware_dir()),
+                layout,
+                speed,
+                firmware_dir: firmware_dir.or_else(|| Some(default_firmware_dir())),
             };
             // Clamped, not trusted: a camera reporting a newer protocol than
             // this driver implements is spoken to in the newest dialect the
@@ -1397,7 +1484,11 @@ mod live_imaging {
         /// guess.
         fn configure_pipeline(&mut self) -> Result<()> {
             use crate::lumenera_fpga::Programmed;
-            match self.program_fpga(self.product_id, self.device_id, self.firmware_dir.clone().as_deref())? {
+            match self.program_fpga(
+                self.product_id,
+                self.device_id,
+                self.firmware_dir.clone().as_deref(),
+            )? {
                 Programmed::AlreadyDone | Programmed::NotApplicable => {}
                 Programmed::Completed { bitstreams } => {
                     if std::env::var_os("NUMANAGER_TIME_CAPTURE").is_some() {
@@ -1738,8 +1829,20 @@ mod live_imaging {
         /// Mode is **still**, matching the captured sequence: it writes `0x04` to
         /// `TRIGGER_CTRL`, which is still capture. Video would be `VIDEO_EN`, and
         /// switching to it is a behavioural change rather than a fix.
+        ///
+        /// **Known gap.** The specification says the camera must already be in
+        /// software- or hardware-trigger still mode before the enable is
+        /// accepted, and does not say how that mode is entered. Nothing in this
+        /// driver sets it: the replayed register load touches none of
+        /// `SNAPSHOT_SETTING` (`0x0670`), `TRIGGER_CTRL` (`0x0218`) or the
+        /// `VIDEO_*_SETTING` pair, so we are relying on software-trigger still
+        /// being the camera's state after FPGA programming. The recorded camera
+        /// evidently was in it, since its `0x04`/`0x06` pair worked.
+        ///
+        /// If the enable is refused on hardware, this is the cause, and the fix
+        /// is to establish how the mode is selected rather than to retry.
         fn stream_frame(&self, plan: &CapturePlan, expected: usize) -> Result<Vec<u8>> {
-            use crate::lumenera_stream::{Stream, StopKind};
+            use crate::lumenera_stream::{StopKind, Stream};
 
             self.write_tap_registers(false)?;
 
@@ -1747,8 +1850,7 @@ mod live_imaging {
             // The protocol version selects the trigger encoding. Software-trigger
             // mode is what the captured camera was in; hardware triggering is a
             // distinct camera state this driver never puts it into.
-            let mut stream =
-                Stream::new_still(Stream::DEFAULT_POOL, self.spec_version, false);
+            let mut stream = Stream::new_still(Stream::DEFAULT_POOL, self.spec_version, false);
 
             stream.acquire(&mut io)?;
             // Submits the whole pool, then enables, then checks the read-back.
@@ -1785,15 +1887,6 @@ mod live_imaging {
     // calls register access. `read_property`/`property` are therefore the
     // register accessors.
 
-    fn alt_value(alt: crate::lumenera_fpga::AltSetting) -> u8 {
-        use crate::lumenera_fpga::AltSetting as A;
-        match alt {
-            A::Idle => ALT_IDLE,
-            A::Fpga => ALT_CONFIG,
-            A::Data => ALT_STREAMING,
-        }
-    }
-
     impl crate::lumenera_fpga::FpgaTransport for ImagingSession {
         fn read_reg(&mut self, index: u16) -> Result<u32> {
             Ok(u32::from_le_bytes(self.read_property(index)?))
@@ -1803,7 +1896,8 @@ mod live_imaging {
         }
         fn send_chunk(&mut self, chunk: &[u8]) -> Result<()> {
             let done = futures_lite::future::block_on(
-                self.interface.bulk_out(EP_CONFIG, chunk.to_vec()),
+                self.interface
+                    .bulk_out(self.layout.fpga_out, chunk.to_vec()),
             );
             done.status.map_err(|error| {
                 Error::new(
@@ -1821,12 +1915,14 @@ mod live_imaging {
             Ok(())
         }
         fn set_alt_setting(&mut self, alt: crate::lumenera_fpga::AltSetting) -> Result<()> {
-            self.interface.set_alt_setting(alt_value(alt)).map_err(|error| {
-                Error::new(
-                    ErrorCode::Transport,
-                    format!("Lumenera alt-setting {alt:?} select failed: {error}"),
-                )
-            })
+            self.interface
+                .set_alt_setting(self.layout.alt_value(alt))
+                .map_err(|error| {
+                    Error::new(
+                        ErrorCode::Transport,
+                        format!("Lumenera alt-setting {alt:?} select failed: {error}"),
+                    )
+                })
         }
         fn delay(&mut self, d: std::time::Duration) {
             std::thread::sleep(d);
@@ -1856,13 +1952,10 @@ mod live_imaging {
     impl<'a> StreamIo<'a> {
         pub(super) fn new(session: &'a ImagingSession, chunk: usize) -> Self {
             Self {
-                queue: session.interface.bulk_in_queue(EP_IMAGE),
+                queue: session.interface.bulk_in_queue(session.layout.image_in),
                 session,
                 chunk,
-                // The one measured unit is USB 2; nothing here reads the actual
-                // bus speed yet, and claiming SuperSpeed would silently disable
-                // the unconditional halt clear.
-                speed: crate::lumenera_stream::BusSpeed::High,
+                speed: session.speed,
             }
         }
 
@@ -1909,7 +2002,7 @@ mod live_imaging {
         fn set_alt_setting(&mut self, alt: crate::lumenera_fpga::AltSetting) -> Result<()> {
             self.session
                 .interface
-                .set_alt_setting(alt_value(alt))
+                .set_alt_setting(self.session.layout.alt_value(alt))
                 .map_err(|error| {
                     Error::new(
                         ErrorCode::Transport,
@@ -1926,7 +2019,10 @@ mod live_imaging {
             Ok(())
         }
         fn clear_halt(&mut self) -> Result<()> {
-            let _ = self.session.interface.clear_halt(EP_IMAGE);
+            let _ = self
+                .session
+                .interface
+                .clear_halt(self.session.layout.image_in);
             Ok(())
         }
         fn reset_frames(&mut self) {}
@@ -1945,8 +2041,6 @@ struct CapturePlan {
     x_bin: u16,
     y_bin: u16,
     exposure_us: u32,
-
-
 }
 
 /// Live firmware download — the EZ-USB anchor-download sequence, validated on
