@@ -95,12 +95,14 @@ pub fn set_slot_labels(properties: &mut BTreeMap<String, Value>, labels: &[Strin
 /// Falls back to `1..=labels_len` when the property declares no range, so a driver that
 /// publishes a bare position property still gets usable choices.
 fn positions(schema: &PropertySchema, labels_len: usize) -> Vec<i64> {
-    let bounds = schema.range.as_ref().and_then(|range| {
-        match (as_i64(&range.min), as_i64(&range.max)) {
-            (Some(min), Some(max)) if max >= min => Some((min, max)),
-            _ => None,
-        }
-    });
+    let bounds =
+        schema
+            .range
+            .as_ref()
+            .and_then(|range| match (as_i64(&range.min), as_i64(&range.max)) {
+                (Some(min), Some(max)) if max >= min => Some((min, max)),
+                _ => None,
+            });
     match bounds {
         Some((min, max)) => (min..=max).collect(),
         None => (1..=labels_len as i64).collect(),
@@ -175,7 +177,12 @@ mod tests {
         let mut schema = wheel_position(1, 4);
         apply_slot_labels(
             &mut schema,
-            &["485/20".into(), "500/100".into(), "600/30".into(), "340/35".into()],
+            &[
+                "485/20".into(),
+                "500/100".into(),
+                "600/30".into(),
+                "340/35".into(),
+            ],
         );
         let pairs: Vec<(i64, &str)> = schema
             .enum_values
@@ -187,19 +194,17 @@ mod tests {
             .collect();
         assert_eq!(
             pairs,
-            vec![
-                (1, "485/20"),
-                (2, "500/100"),
-                (3, "600/30"),
-                (4, "340/35")
-            ]
+            vec![(1, "485/20"), (2, "500/100"), (3, "600/30"), (4, "340/35")]
         );
     }
 
     #[test]
     fn a_wheel_numbered_from_zero_is_labelled_from_zero() {
         let mut schema = wheel_position(0, 2);
-        apply_slot_labels(&mut schema, &["open".into(), "GFP".into(), "mCherry".into()]);
+        apply_slot_labels(
+            &mut schema,
+            &["open".into(), "GFP".into(), "mCherry".into()],
+        );
         assert_eq!(schema.enum_values[0].value, Value::I64(0));
         assert_eq!(schema.enum_values[0].label, "open");
     }
@@ -249,7 +254,9 @@ mod tests {
     fn a_name_that_looks_like_a_measurement_is_still_its_own_text() {
         // "500 nm" parses as a wavelength. As a slot name it has to read back verbatim.
         assert_eq!(
-            value_label(&Value::Wavelength(crate::Wavelength::from_nanometers(500.0))),
+            value_label(&Value::Wavelength(crate::Wavelength::from_nanometers(
+                500.0
+            ))),
             "500 nm"
         );
     }

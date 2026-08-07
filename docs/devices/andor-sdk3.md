@@ -6,10 +6,10 @@
 | --- | --- |
 | Driver module | `numanager_drivers::andor_camera` |
 | Families | Andor/Oxford Instruments SDK3 sCMOS cameras |
-| Support level | USB discovery, digest-verified hidden FX3 firmware initialization, confirmed EP0 status readbacks, runtime package checks, vendor-runtime SDK3 feature control/readback, cooler control, and opt-in `Mono16` capture |
-| Protocol evidence | Reverse engineered |
+| Support level | Andor VID/PID USB discovery, digest-verified hidden FX3 firmware initialization, confirmed EP0 status readbacks, runtime package checks, vendor-runtime SDK3 feature control/readback, cooler control, and opt-in `Mono16` capture |
+| Protocol evidence | Reverse engineered Andor behavior plus public Cypress loader evidence where applicable |
 | Transport | USB userspace evidence: EP0 vendor control including SDK3 status reads, bulk-IN `0x82` frame readout, FX3 firmware loading by Cypress CY-image RAM writes; no bulk-OUT data pipe for normal frame data |
-| Discovery | Config-backed candidates plus passive `os-usb` descriptor scanning for Andor SDK3 PIDs and Cypress FX3 pre-firmware IDs |
+| Discovery | Config-backed candidates plus passive `os-usb` descriptor scanning for Andor SDK3 PIDs. Generic Cypress loader IDs are reported by EZ-USB loader discovery as ambiguous, not as Andor, unless config-gated firmware initialization observes an Andor runtime VID/PID |
 | Validation | Hardware validation note pending |
 
 ## Logical Devices
@@ -61,5 +61,5 @@
 | --- | --- |
 | Native write/acquisition framing | Native USB feature setters and acquisition commands require the EP0/bulk command framing; the implemented control path uses the documented vendor runtime ABI instead |
 | Feature-register map | Native feature-register addresses, types, and scaling are not recorded; standard feature access is available through the verified vendor runtime |
-| Firmware package | With `connect=true`, `firmware_loaded=false`, `firmware_blob_path`, and verified `firmware_blob_sha256`, configured discovery parses the Cypress FX3 `CY` image, writes sections with vendor request `0xA0` in 4096-byte chunks, and jumps to the entry address as a hidden initialization step. This is not exposed as a public or advanced command. |
+| Firmware package | With `connect=true`, `firmware_loaded=false`, `firmware_blob_path`, and verified `firmware_blob_sha256`, configured discovery parses the Cypress FX3 `CY` image, writes sections with vendor request `0xA0` in 4096-byte chunks, and jumps to the entry address as a hidden initialization step. The driver must observe an Andor runtime VID/PID after renumeration or fail. This is not exposed as a public or advanced command. |
 | Hardware validation | Record model, firmware/driver package, USB descriptors, register/status readback, vendor-runtime capture behavior, abort behavior, and final safe state |

@@ -39,6 +39,7 @@ const IMAGES: &[(&str, &str)] = &[
 /// Binary (non-Intel-HEX) images compiled in, by originating package. Kept
 /// separate from [`IMAGES`] because these are raw byte streams pushed to an
 /// endpoint rather than address/record text.
+#[cfg(feature = "os-usb")]
 const BLOBS: &[(&str, &[u8])] = &[(
     "lumenera_fpga_lu130.bin",
     include_bytes!("../../../data/third_party/lumenera/lumenera_fpga_lu130.bin"),
@@ -47,9 +48,11 @@ const BLOBS: &[(&str, &[u8])] = &[(
 /// Recorded control-transfer sequences, replayed verbatim during bring-up where
 /// the individual transfers are not decoded. Same treatment as [`IMAGES`]:
 /// third-party data, compiled in so a device works with no `data/` directory.
+#[cfg(feature = "os-usb")]
 const SEQUENCES: &[(&str, &str)] = &[bundled!("lumenera", "lumenera_init_lu130.jsonl")];
 
 /// The compiled-in recorded sequence with this exact file name.
+#[cfg(feature = "os-usb")]
 pub(crate) fn sequence_by_name(name: &str) -> Option<&'static str> {
     let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
     SEQUENCES
@@ -59,6 +62,7 @@ pub(crate) fn sequence_by_name(name: &str) -> Option<&'static str> {
 }
 
 /// The compiled-in binary image with this exact file name.
+#[cfg(feature = "os-usb")]
 pub(crate) fn blob_by_name(name: &str) -> Option<&'static [u8]> {
     let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
     BLOBS

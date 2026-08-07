@@ -16,6 +16,7 @@ pub mod corvus;
 pub mod egrabber_framegrabber;
 pub mod esp32;
 pub mod evident_ix85;
+pub mod ez_usb;
 pub mod genicam;
 pub mod gige_vision;
 pub mod hamilton_mvp;

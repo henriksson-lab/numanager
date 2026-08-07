@@ -2299,6 +2299,11 @@ fn parse_property_value(value_type: ValueType, text: &str) -> Value {
             .map(FlowRate::from_milliliters_per_minute)
             .map(Value::FlowRate)
             .unwrap_or(Value::FlowRate(FlowRate::from_milliliters_per_minute(0.0))),
+        ValueType::Volume => number
+            .and_then(|value| value.parse().ok())
+            .map(Volume::from_microliters)
+            .map(Value::Volume)
+            .unwrap_or(Value::Volume(Volume::from_microliters(0.0))),
         ValueType::Bytes | ValueType::List | ValueType::Map => Value::String(text.into()),
         ValueType::Null => Value::Null,
     }
@@ -2429,6 +2434,10 @@ fn parse_unit_value(value_type: ValueType, text: &str) -> Option<Value> {
         (ValueType::FlowRate, "uL/min") => Some(Value::FlowRate(
             FlowRate::from_microliters_per_minute(number),
         )),
+        (ValueType::Volume, "L") => Some(Value::Volume(Volume::from_liters(number))),
+        (ValueType::Volume, "mL") => Some(Value::Volume(Volume::from_milliliters(number))),
+        (ValueType::Volume, "uL") => Some(Value::Volume(Volume::from_microliters(number))),
+        (ValueType::Volume, "nL") => Some(Value::Volume(Volume::from_nanoliters(number))),
         _ => None,
     }
 }
@@ -2482,6 +2491,7 @@ fn format_value(value: &Value) -> String {
             format!("{} {}", format_scalar(v.value), unit_label(v.unit_symbol()))
         }
         Value::FlowRate(v) => format!("{} {}", format_scalar(v.value), unit_label(v.unit_symbol())),
+        Value::Volume(v) => format!("{} {}", format_scalar(v.value), unit_label(v.unit_symbol())),
         Value::String(v) => v.clone(),
         Value::Bytes(v) => format!("{} bytes", v.len()),
         Value::List(v) => format!("{} items", v.len()),

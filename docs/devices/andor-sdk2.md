@@ -6,10 +6,10 @@
 | --- | --- |
 | Driver module | `numanager_drivers::andor_camera` |
 | Families | Andor/Oxford Instruments SDK2 CCD/ICCD/EMCCD cameras |
-| Support level | USB discovery, runtime package checks, hidden firmware initialization, EP0 identity/status/FIFO/acquisition helpers, opt-in live bulk-IN `Mono16` capture, and vendor-runtime exposure, full-frame capture, detector readback, and temperature/cooler control; native SDK-free exposure/register-window controls are not exposed because register mappings are absent |
-| Protocol evidence | Reverse engineered |
+| Support level | Andor VID/PID USB discovery, runtime package checks, config-gated hidden firmware initialization from ambiguous EZ-USB loaders, EP0 identity/status/FIFO/acquisition helpers, opt-in live bulk-IN `Mono16` capture, and vendor-runtime exposure, full-frame capture, detector readback, and temperature/cooler control; native SDK-free exposure/register-window controls are not exposed because register mappings are absent |
+| Protocol evidence | Reverse engineered Andor behavior plus public Cypress EZ-USB loader evidence |
 | Transport | USB userspace via `nusb`; EP0 vendor control, bulk-IN `0x82` for image readout, bulk-OUT `0x01` for firmware/FPGA upload only |
-| Discovery | Config-backed candidates plus passive `os-usb` descriptor scanning for Andor VID/PID and Cypress FX2 pre-firmware IDs |
+| Discovery | Config-backed candidates plus passive `os-usb` descriptor scanning for Andor VID/PID. Generic Cypress FX2 loader ID `04b4:8613` is reported by the EZ-USB loader discovery as ambiguous, not as Andor, unless config-gated firmware initialization observes an Andor runtime VID/PID |
 | Validation | Hardware validation note pending |
 
 ## Logical Devices
@@ -59,7 +59,7 @@
 | `property.vendor_runtime_path`, `property.vendor_runtime_sha256` | Required for runtime-backed exposure/capture/detector/cooler control | string | Third-party vendor runtime package identity |
 | `property.load_vendor_runtime` | Required for runtime-backed exposure/capture/detector/cooler control | bool | Enables verified SDK2 runtime calls; default `false` |
 | `property.sensor_cooling`, `property.temperature_control` | No | bool / integer string | Initial cached cooler request state and target |
-| `property.firmware_blob_path`, `property.firmware_blob_sha256` | Required only for pre-firmware FX2 devices | string | Config-only firmware package identity; not exposed as public properties or commands. The packaged SDK2 default candidate is `data/third_party/andor/fx2_AndorCam.hex` with SHA-256 `08430b0259a6cd9f73ece020e42a140c6a7f615e03510e999952d3da0e47ac23`; alternate packaged helper images are recorded in `data/third_party/andor/manifest.toml` |
+| `property.firmware_blob_path`, `property.firmware_blob_sha256` | Required only for config-gated pre-firmware FX2 initialization | string | Config-only firmware package identity; not exposed as public properties or commands. The packaged SDK2 default candidate is `data/third_party/andor/fx2_AndorCam.hex` with SHA-256 `08430b0259a6cd9f73ece020e42a140c6a7f615e03510e999952d3da0e47ac23`; alternate packaged helper images are recorded in `data/third_party/andor/manifest.toml` |
 
 ## Remaining Work
 
@@ -67,5 +67,5 @@
 | --- | --- |
 | Acquisition sub-codes | `0xC6` start/stop/clear sub-values are inferred from the reverse engineered SDK2 crate and should be confirmed on hardware |
 | Detector/register windows | Native SDK-free exposure, ROI/detector control, and capability readback need register-window or head-EEPROM mapping evidence before SDK-free public writable properties are advertised |
-| Firmware upload | Upload is an internal initialization step for pre-firmware FX2 devices after configured SHA-256 verification; stage-2 FPGA upload and model-specific package selection still need evidence |
+| Firmware upload | Cypress FX2 RAM loading is evidenced by the public EZ-USB TRM and recorded in `docs/reverse/ez-usb-renumeration.md`. Upload is an internal initialization step after configured SHA-256 verification; the driver must observe an Andor runtime VID/PID after renumeration or fail. Stage-2 FPGA upload and model-specific package selection still need evidence |
 | Hardware validation | Record model, firmware/driver package, USB descriptors, one capture, completion/status behavior, abort behavior, and final safe state |
