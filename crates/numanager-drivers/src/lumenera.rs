@@ -1777,6 +1777,15 @@ mod live_lumenera {
                 format!("opening the Lumenera loader failed (WinUSB bound?): {error}"),
             )
         })?;
+        // Select the configuration before claiming, exactly as the imaging path
+        // does. On Linux and Windows the device is already configured by
+        // enumeration and this is a re-assert; on macOS it is not optional. A
+        // vendor-specific device (class 0xff) that no kernel driver matches is
+        // left *unconfigured* there, so it has no interfaces at all and the
+        // claim fails with a bare "interface not found" — which reads like a
+        // wiring fault rather than a missing SET_CONFIGURATION.
+        let _ = device.set_configuration(1);
+
         let interface = device.claim_interface(0).map_err(|error| {
             Error::new(
                 ErrorCode::Transport,

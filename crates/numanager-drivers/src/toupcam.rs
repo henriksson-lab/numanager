@@ -588,6 +588,19 @@ impl DriverDiscovery for ToupcamDiscovery {
         if self.live_usb {
             let base = self.next_id.0 + candidates.len() as u64;
             for (index, info) in live_toupcam::list_cameras()?.into_iter().enumerate() {
+                // A shared vendor id is not a camera. `VID_CYPRESS` in
+                // particular belongs to the FX2 microcontroller, which ships in
+                // all sorts of instruments — a Bio-Rad Gel Doc EZ carries two of
+                // them on its internal hub — so a device this driver has no
+                // profile for is simply not ours. Pass over it rather than
+                // claiming it and failing: this runs inside a shared sweep, and
+                // an error here is a camera nobody finds on the *other* drivers.
+                //
+                // `index` still counts every vendor match, because that is what
+                // `LiveToupcam::open` counts when it reopens by index.
+                if info.model().is_none() {
+                    continue;
+                }
                 candidates.push(DriverCandidate::from_driver(
                     info.label.clone(),
                     Box::new(ToupcamDriver::open_usb(

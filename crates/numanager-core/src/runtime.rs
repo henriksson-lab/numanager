@@ -157,12 +157,29 @@ impl DiscoveryRegistry {
         self.discoveries.is_empty()
     }
 
+    /// Every candidate the registered discoveries can find.
+    ///
+    /// One discovery failing says nothing about the others: drivers scan
+    /// independent buses, and a single unreachable or unrecognized device must
+    /// not cost the user every *other* instrument on the machine. So a failure
+    /// is remembered rather than propagated, and only reported when the sweep
+    /// found nothing at all — which keeps a real, total failure (no USB access,
+    /// no permissions) loud, while a bad apple stays local.
     pub fn detect_all(&mut self) -> Result<Vec<DriverCandidate>> {
         let mut candidates = Vec::new();
+        let mut failure = None;
         for discovery in &mut self.discoveries {
-            candidates.extend(discovery.detect()?);
+            match discovery.detect() {
+                Ok(found) => candidates.extend(found),
+                // The first failure is the one reported: later ones are usually
+                // the same cause seen again, and the first is nearest to it.
+                Err(error) => failure = failure.or(Some(error)),
+            }
         }
-        Ok(candidates)
+        match failure {
+            Some(error) if candidates.is_empty() => Err(error),
+            _ => Ok(candidates),
+        }
     }
 }
 
@@ -2272,6 +2289,71 @@ fn reject_hidden_maintenance_request(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Fails, as a driver whose bus is unreachable or whose device is foreign
+    /// to it does.
+    struct Failing;
+    impl DriverDiscovery for Failing {
+        fn detect(&mut self) -> Result<Vec<DriverCandidate>> {
+            Err(Error::new(ErrorCode::Transport, "bus unreachable"))
+        }
+    }
+
+    /// Records that it was reached, which is the whole question.
+    struct Counting(Arc<AtomicUsize>);
+    impl DriverDiscovery for Counting {
+        fn detect(&mut self) -> Result<Vec<DriverCandidate>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn one_failing_discovery_does_not_end_the_sweep() {
+        // Drivers scan independent buses. A USB camera driver that meets a
+        // device it has no profile for must not cost the user the instruments
+        // every *other* driver would have found — which is exactly what an
+        // early return did, silently, to everything registered after it.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut registry = DiscoveryRegistry::new();
+        registry.register(Failing);
+        registry.register(Counting(runs.clone()));
+        registry.register(Counting(runs.clone()));
+
+        let _ = registry.detect_all();
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "every discovery after a failing one must still be asked"
+        );
+    }
+
+    #[test]
+    fn a_sweep_that_finds_nothing_reports_why() {
+        // The other half of the contract: swallowing failures wholesale would
+        // turn "no USB permission" into a silent empty list, which is the
+        // hardest kind of bug to chase.
+        let mut registry = DiscoveryRegistry::new();
+        registry.register(Failing);
+        registry.register(Counting(Arc::new(AtomicUsize::new(0))));
+
+        // `DriverCandidate` is not `Debug` (it owns a live driver), so the
+        // result is matched rather than unwrapped.
+        let Err(error) = registry.detect_all() else {
+            panic!("nothing was found, so the failure is the only news");
+        };
+        assert!(
+            error.to_string().contains("bus unreachable"),
+            "the original cause must survive: {error}"
+        );
+    }
 }
 
 fn descriptor_accepts_legacy_request(

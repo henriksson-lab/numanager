@@ -121,6 +121,35 @@ impl OsHidReportDevice {
             read_timeout_ms: config.read_timeout_ms,
         })
     }
+
+    /// The device's raw HID report descriptor.
+    ///
+    /// The descriptor is the only authority on how big a report actually is:
+    /// static analysis of a vendor driver typically narrows it to one of two
+    /// sizes without settling which, and guessing wrong means every read either
+    /// truncates or over-reads. Exposed here because it is a property of the
+    /// device, and only the host HID stack can answer it.
+    pub fn report_descriptor(&self) -> Result<Vec<u8>> {
+        // 4096 is the maximum a HID report descriptor may be, so one read is
+        // always enough.
+        let mut buffer = vec![0u8; 4096];
+        let len = self
+            .device
+            .get_report_descriptor(&mut buffer)
+            .map_err(map_hid_error)?;
+        buffer.truncate(len);
+        Ok(buffer)
+    }
+
+    /// How long [`HidReportIo::read_report`] waits for an input report.
+    ///
+    /// Adjustable because one device serves two different needs: a command
+    /// waits for its reply, while discarding stale reports must not wait at all
+    /// — with a timeout, draining an empty queue would cost that timeout per
+    /// call.
+    pub fn set_read_timeout_ms(&mut self, timeout_ms: i32) {
+        self.read_timeout_ms = timeout_ms;
+    }
 }
 
 #[cfg(feature = "os-hid")]
@@ -147,6 +176,17 @@ impl HidReportIo for OsHidReportDevice {
             .device
             .read_timeout(report.as_mut_slice(), self.read_timeout_ms)
             .map_err(map_hid_error)?;
+        // hidapi signals "nothing arrived in time" by reading zero bytes. Say so
+        // rather than padding: the buffer is already zeroed, so the alternative
+        // is handing back a report full of zeros that a caller cannot tell from
+        // a device genuinely reporting zeros — which for an instrument means
+        // inventing a status word it never sent.
+        if n == 0 {
+            return Err(Error::new(
+                ErrorCode::Timeout,
+                "no HID input report arrived within the read timeout",
+            ));
+        }
         report.truncate(n);
         if report.len() == len + 1 && report.first() == Some(&self.report_id) {
             report.remove(0);
