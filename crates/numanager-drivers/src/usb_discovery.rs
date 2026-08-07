@@ -83,6 +83,7 @@ macro_rules! builtin_usb_drivers {
 }
 
 builtin_usb_drivers! {
+    "ez-usb-loader" => ez_usb::EzUsbLoaderDiscovery,
     "andor-camera" => andor_camera::AndorCameraDiscovery,
     "lumenera" => lumenera::LumeneraDiscovery,
     "mcl" => mcl::MclDiscovery,

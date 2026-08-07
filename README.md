@@ -23,6 +23,29 @@ differs from the device page, capture the device model, firmware version,
 configuration, command output, and any hardware log or trace that can anchor a
 fix.
 
+
+## We do not want SDKs
+
+Some hardware manufacturers insist on proving a "software development kit" to access their hardware.
+We are happy that [Micro-manager](https://github.com/micro-manager) has been allowed to ship some
+of them but the situation is not ideal:
+
+* Some or most SDKs only work on a limited number of operating systems. Not uncommonly, only for Windows, and sometimes an outdated version waiting to be hacked
+* SDKs must be installed by the users separately. There is no easy way of bundling them, making installation difficult
+* Some SDKs have limited APIs, preventing good performance
+* We cannot easily provide autodetection of hardware using SDKs
+* If you are working in a high-stakes environment, how do you know that the SDK does not hold a backdoor to your computer? Even unintentionally? Security problems have gotten out of hand recently
+* Shipping third-party software is tricky from a copyright/license perspective and we want to maximally avoid it
+
+Having investigated hardware deeper, the state of affairs is nasty. Some hardware vendors (will not be named) use the same USB ID's.
+Running an SDK will then install incompatible firmware into the hardware from another vendor, with unforseen consequences. This
+even goes against the instructions in the manual for the chips they use! 
+ 
+For these many reasons, we do not want SDKs in nu-manager. Having lower level insight, we can circumvent the design flaws present 
+in the hardware out there and present a much better user experience for everyone.
+ 
+
+
 ## USB host access
 
 A userspace USB driver can only claim a device the host has granted it. On
@@ -83,8 +106,8 @@ record enough protocol evidence for an implementation.
 | --- | --- | --- |
 | [ABS legacy USB cameras](docs/devices/abs-camera.md) | Runtime-package evidence, writable exposure, explicit software trigger, opt-in vendor-runtime capture, and repeated-capture stream | - |
 | [Agilent/Keysight Laser Combiner](docs/devices/agilent-laser-combiner.md) | Laser control and readback | - |
-| [Andor SDK2 cameras](docs/devices/andor-sdk2.md) | USB discovery, firmware/runtime package checks, EP0 control helpers, opt-in live Mono16 capture, and vendor-runtime exposure/detector/cooler control | - |
-| [Andor SDK3 cameras](docs/devices/andor-sdk3.md) | USB discovery, hidden FX3 firmware init, EP0 status readback, runtime package checks, vendor-runtime feature control, and Mono16 capture | - |
+| [Andor SDK2 cameras](docs/devices/andor-sdk2.md) | Andor VID/PID USB discovery, firmware/runtime package checks, EP0 control helpers, opt-in live Mono16 capture, and vendor-runtime exposure/detector/cooler control | - |
+| [Andor SDK3 cameras](docs/devices/andor-sdk3.md) | Andor VID/PID USB discovery, hidden FX3 firmware init, EP0 status readback, runtime package checks, vendor-runtime feature control, and Mono16 capture | - |
 | [Arduino controller](docs/devices/arduino.md) | Firmware protocol control plus opt-in real serial read/write | - |
 | [Arduino Counter](docs/devices/arduino-counter.md) | Counter/pulse protocol control plus opt-in real serial readback | - |
 | [ASI MS-2000/Tiger](docs/devices/asi.md) | Serial stage, Tiger TTL/ring-buffer, and CRISP autofocus control/readback | - |
@@ -98,6 +121,7 @@ record enough protocol evidence for an implementation.
 | [CoolLED pE series](docs/devices/coolled.md) | Serial illumination control and readback | - |
 | [ESP32 controller](docs/devices/esp32.md) | Serial GPIO, PWM/shutter, ADC, and XY/Z stage control/readback | - |
 | [Euresys eGrabber frame grabbers](docs/devices/egrabber-framegrabber.md) | Configured GenTL producer checks plus default-off SDK interface/device inventory | - |
+| [Generic Cypress EZ-USB loaders](docs/reverse/ez-usb-renumeration.md) | Passive ambiguous loader discovery for pre-firmware USB nodes; no hardware operation is exposed without driver-specific config and post-firmware identity confirmation | - |
 | [Evident/Olympus IX85](docs/devices/evident-ix85.md) | Serial focus, state-device, shutter, timing endpoints, and body readback/control | - |
 | [GenICam node maps](docs/devices/genicam.md) | Node-map execution model with maintenance filtering and local frame source | - |
 | [GigE Vision cameras](docs/devices/gige-vision.md) | GVCP/GVSP model plus opt-in UDP GVCP mapped-property and raw-register access | - |

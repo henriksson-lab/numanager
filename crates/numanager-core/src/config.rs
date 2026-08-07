@@ -690,7 +690,11 @@ fn value_to_toml(value: &Value) -> String {
         // wheel's slots — so they have to survive a save/load round trip rather than
         // degrade to a placeholder the next load would read back as a string.
         Value::List(items) => {
-            let rendered = items.iter().map(value_to_toml).collect::<Vec<_>>().join(", ");
+            let rendered = items
+                .iter()
+                .map(value_to_toml)
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("[{rendered}]")
         }
         Value::Map(_) | Value::Null => "\"unsupported\"".to_string(),

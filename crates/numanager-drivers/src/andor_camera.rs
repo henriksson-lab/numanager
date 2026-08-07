@@ -15,7 +15,7 @@ pub const CYPRESS_FX3_PID: u16 = 0x00f3;
 /// (udev rules on Linux) must cover these; see
 /// `usb_discovery::builtin_usb_vendor_claims`.
 pub fn usb_vendor_ids() -> Vec<u16> {
-    vec![ANDOR_VID, CYPRESS_VID]
+    vec![ANDOR_VID]
 }
 
 pub const SDK2_BULK_IN_ENDPOINT: u8 = 0x82;
@@ -500,16 +500,14 @@ fn active_usb_probes() -> Result<Vec<AndorCameraConfiguredProbe>> {
 
 #[cfg(feature = "os-usb")]
 fn is_andor_usb_candidate(vendor_id: u16, product_id: u16) -> bool {
+    let _ = product_id;
     vendor_id == ANDOR_VID
-        || (vendor_id == CYPRESS_VID && matches!(product_id, CYPRESS_FX2_PID | CYPRESS_FX3_PID))
 }
 
 #[cfg(feature = "os-usb")]
 fn andor_usb_product_name(vendor_id: u16, product_id: u16) -> &'static str {
     match (vendor_id, product_id) {
         (ANDOR_VID, pid) => AndorModel::from_pid(pid).name(),
-        (CYPRESS_VID, CYPRESS_FX2_PID) => "Andor Cypress FX2 pre-firmware device",
-        (CYPRESS_VID, CYPRESS_FX3_PID) => "Andor Cypress FX3 pre-firmware device",
         _ => "Andor USB device",
     }
 }
@@ -590,6 +588,20 @@ impl AndorCameraDriver {
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(1500));
+            if let Some(identity) =
+                live_sdk2::select_loaded_andor_runtime(self.configured.product_id)?
+            {
+                self.configured.vendor_id = identity.vendor_id;
+                self.configured.product_id = identity.product_id;
+                self.configured.product = identity.product.clone();
+                self.configured.serial_number = identity.serial.clone();
+                self.configured.usb_identity = Some(identity);
+            } else {
+                return Err(Error::new(
+                    ErrorCode::Transport,
+                    "Andor firmware probe did not produce an Andor runtime USB device",
+                ));
+            }
             self.configured.firmware_loaded = true;
             if let Some(identity) = self.configured.usb_identity.as_mut() {
                 identity.firmware_loaded = true;
@@ -809,6 +821,30 @@ impl AndorCameraDriver {
             (
                 "active_usb_detected".into(),
                 Value::Bool(self.configured.usb_identity.is_some()),
+            ),
+            (
+                "usb_stage".into(),
+                Value::String(
+                    if self.configured.firmware_loaded {
+                        "runtime"
+                    } else {
+                        "pre_firmware"
+                    }
+                    .into(),
+                ),
+            ),
+            (
+                "usb_identity_confidence".into(),
+                Value::String(
+                    if self.configured.usb_identity.is_some() {
+                        "exact"
+                    } else if self.configured.connect {
+                        "config_assumed"
+                    } else {
+                        "configured"
+                    }
+                    .into(),
+                ),
             ),
             (
                 "evidence_class".into(),
@@ -1113,10 +1149,10 @@ impl AndorCameraDriver {
     fn support_level(&self) -> &'static str {
         match self.sdk_family() {
             AndorSdkFamily::Sdk2 => {
-                "SDK2 USB discovery, firmware/runtime package checks, EP0 command helpers, live bulk-IN Mono16 capture behind os-usb, and vendor-runtime exposure, full-frame capture, detector readback, and cooler control"
+                "SDK2 Andor VID/PID USB discovery, config-gated hidden firmware initialization from ambiguous EZ-USB devices, firmware/runtime package checks, EP0 command helpers, live bulk-IN Mono16 capture behind os-usb, and vendor-runtime exposure, full-frame capture, detector readback, and cooler control"
             }
             AndorSdkFamily::Sdk3 => {
-                "SDK3 USB discovery, hidden FX3 firmware initialization, confirmed EP0 status readbacks, firmware/runtime package checks, vendor-runtime feature control/readback, cooler control, and capture backend"
+                "SDK3 Andor VID/PID USB discovery, config-gated hidden FX3 firmware initialization from ambiguous EZ-USB devices, confirmed EP0 status readbacks, firmware/runtime package checks, vendor-runtime feature control/readback, cooler control, and capture backend"
             }
             AndorSdkFamily::Unknown => {
                 "Andor USB discovery and runtime-package checks; SDK family not classified"
@@ -3478,6 +3514,44 @@ mod live_sdk2 {
 
     fn select_fx2_loader(identity: &Option<AndorUsbIdentity>) -> Result<nusb::DeviceInfo> {
         select_loader(identity, CYPRESS_FX2_PID, "FX2")
+    }
+
+    pub(super) fn select_loaded_andor_runtime(
+        configured_product_id: u16,
+    ) -> Result<Option<AndorUsbIdentity>> {
+        let runtime_product_is_known =
+            !matches!(configured_product_id, CYPRESS_FX2_PID | CYPRESS_FX3_PID);
+        let matches = nusb::list_devices()
+            .map_err(|error| usb_error(format!("Andor USB device listing failed: {error}")))?
+            .filter(|device| device.vendor_id() == ANDOR_VID)
+            .filter(|device| {
+                !runtime_product_is_known || device.product_id() == configured_product_id
+            })
+            .collect::<Vec<_>>();
+        match matches.len() {
+            1 => {
+                let device = matches.into_iter().next().expect("one Andor runtime device");
+                let product_id = device.product_id();
+                let product = device
+                    .product_string()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| AndorModel::from_pid(product_id).name().into());
+                Ok(Some(AndorUsbIdentity {
+                    product,
+                    serial: device.serial_number().map(str::to_string),
+                    vendor_id: device.vendor_id(),
+                    product_id,
+                    bus_number: device.bus_number(),
+                    device_address: device.device_address(),
+                    firmware_loaded: true,
+                }))
+            }
+            0 => Ok(None),
+            _ => Err(Error::new(
+                ErrorCode::InvalidProperty,
+                "Andor firmware probe produced multiple matching runtime devices; configure a product_id or connect one device",
+            )),
+        }
     }
 
     fn select_loader(
