@@ -13,8 +13,13 @@
 //! cargo run -p numanager-examples -- gel_doc                       # configured
 //! cargo run -p numanager-examples --features os-usb -- gel_doc live
 //! cargo run -p numanager-examples --features os-usb -- gel_doc initialize-firmware
-//! cargo run -p numanager-examples --features os-usb -- gel_doc capture [exposure_ms]
+//! cargo run -p numanager-examples --features os-usb -- gel_doc capture [exposure_ms] [out.raw]
 //! ```
+//!
+//! `capture` reports the frame's size and how much of it is non-zero. Give it a
+//! third argument to write the pixels somewhere — without one it writes nothing,
+//! because running an example should not leave megabytes in the working
+//! directory. The result is `Raw16` little-endian at the reported dimensions.
 //!
 //! `initialize-firmware` is the only mode that writes to hardware. On Windows
 //! the loader node must be bound to WinUSB first; a failed interface claim says
@@ -174,12 +179,10 @@ fn capture() -> Result<()> {
         )?;
         println!("capture: {}", summarize(&result));
 
-        // Write the pixels out. A capture that "succeeded" is only believable
-        // once someone can look at the image, and a raw file the caller can
-        // decode is the smallest way to make that possible.
         // The response carries a frame handle; the pixels live in the runtime's
-        // frame store. Write them out — a capture that "succeeded" is only
-        // believable once someone can look at the image.
+        // frame store. Report their shape always, but only write a file when the
+        // caller asked for one — an example should not drop megabytes into the
+        // working directory as a side effect of being run.
         if let Value::Map(fields) = &result {
             if let (Some(Value::I64(frame_id)), Some(Value::I64(stream_id))) =
                 (fields.get("frame"), fields.get("stream"))
@@ -189,20 +192,24 @@ fn capture() -> Result<()> {
                     frame: FrameId(*frame_id as u64),
                 };
                 if let Some(frame) = runtime.frame(handle)? {
-                    let path = std::path::Path::new("gel_doc_frame.raw");
-                    std::fs::write(path, &frame.data).map_err(|error| {
-                        Error::new(
-                            ErrorCode::Driver,
-                            format!("writing {}: {error}", path.display()),
-                        )
-                    })?;
                     let nonzero = frame.data.iter().filter(|byte| **byte != 0).count();
                     println!(
-                        "frame: {} bytes -> {} ({:.1}% non-zero)",
+                        "frame: {} bytes, {:.1}% non-zero",
                         frame.data.len(),
-                        path.display(),
                         100.0 * nonzero as f64 / frame.data.len().max(1) as f64
                     );
+                    match example_arg(2) {
+                        Some(path) => {
+                            std::fs::write(&path, &frame.data).map_err(|error| {
+                                Error::new(ErrorCode::Driver, format!("writing {path}: {error}"))
+                            })?;
+                            println!("wrote {path}");
+                        }
+                        None => println!(
+                            "pass a third argument to write the pixels, \
+                             e.g. `gel_doc capture 100 frame.raw`"
+                        ),
+                    }
                 }
             }
         }

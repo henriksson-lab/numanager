@@ -739,11 +739,63 @@ impl LumeneraCameraDriver {
         token
     }
 
-    /// Push the 8051 firmware if this is a loader-stage device we've been asked
-    /// to bring up. A no-op for an already-imaging device, or during passive
-    /// discovery (`connect == false`).
+    /// Whether this process has been given the device node — on Windows, that
+    /// WinUSB is bound to it. Only a deliberate, approved action puts a node in
+    /// that state, so it doubles as the consent to write to the device.
+    ///
+    /// False for a configured probe with no live node, and false where WinUSB
+    /// provisioning does not apply; both fall back to the `connect` gate.
+    fn host_owns_node(&self) -> bool {
+        #[cfg(any(windows, feature = "winusb"))]
+        {
+            if self.probe.usb.is_none() {
+                return false;
+            }
+            let function =
+                crate::winusb_access::UsbFunction::new(self.probe.vendor_id, self.probe.product_id);
+            crate::winusb_access::access_state(function)
+                .map(|state| state.is_winusb())
+                .unwrap_or(false)
+        }
+        #[cfg(not(any(windows, feature = "winusb")))]
+        false
+    }
+
+    /// Bring the camera to its imaging stage, pushing firmware if it is still a
+    /// loader. Runs from the capture path, where the caller has asked this
+    /// specific camera for a frame — authorisation enough to make it usable
+    /// even if the node is not one we were handed.
+    #[cfg(feature = "os-usb")]
+    fn bring_up(&mut self) -> Result<()> {
+        if self.probe.firmware_loaded {
+            return Ok(());
+        }
+        let was = self.probe.connect;
+        self.probe.connect = true;
+        let outcome = self.initialize_firmware();
+        self.probe.connect = was;
+        outcome?;
+        self.probe.product_id = IMAGING_PID;
+        Ok(())
+    }
+
+    /// Push the 8051 firmware if this is a loader-stage device that is ours to
+    /// bring up. A no-op for an already-imaging device.
+    ///
+    /// "Ours" means the host has bound WinUSB to the node — which only happens
+    /// because someone approved it, so the claim and the consent are the same
+    /// act. A loader-stage device is useless until its firmware is written, and
+    /// the driver that owns the node is the one expected to write it; that is
+    /// what the vendor stack does on device arrival. Where another driver owns
+    /// the node, that driver does the download and this must not interfere.
+    ///
+    /// `connect` remains as an explicit override for configured probes, which
+    /// have no live node to ask about.
     fn initialize_firmware(&mut self) -> Result<()> {
-        if self.probe.firmware_loaded || !self.probe.connect {
+        if self.probe.firmware_loaded {
+            return Ok(());
+        }
+        if !self.probe.connect && !self.host_owns_node() {
             return Ok(());
         }
         let image = firmware_image_text(
@@ -952,12 +1004,15 @@ impl LumeneraCameraDriver {
     ) -> Result<Value> {
         #[cfg(feature = "os-usb")]
         {
-            if self.probe.firmware_loaded && self.probe.connect {
+            if self.probe.usb.is_some() {
+                // Bring the camera to its imaging stage if it is not there yet.
+                // That it arrives as a firmware loader and renumerates is an
+                // implementation detail of this device, not something a caller
+                // asking for a frame should have to sequence.
+                self.bring_up()?;
                 let plan = self.capture_plan();
-                let session = live_imaging::ImagingSession::open(
-                    self.probe.vendor_id,
-                    self.probe.product_id,
-                )?;
+                let session =
+                    live_imaging::ImagingSession::open(self.probe.vendor_id, IMAGING_PID)?;
                 let data = session.acquire(&plan)?;
                 let handle = FrameHandle {
                     stream: StreamId(self.camera.0 .0),
@@ -1240,9 +1295,42 @@ mod live_imaging {
         interface: nusb::Interface,
     }
 
+    /// Bind WinUSB to the camera's node if something else owns it.
+    ///
+    /// Best-effort: a failure here is not reported directly, because the
+    /// interface claim that follows fails with a diagnosis naming the driver
+    /// that actually owns the node — a better error than anything this could
+    /// raise. Needs an elevated process; unelevated, the claim's message says
+    /// so. A no-op where WinUSB provisioning is not a thing.
+    #[cfg(any(windows, feature = "winusb"))]
+    fn ensure_host_access(vendor_id: u16, product_id: u16) {
+        use crate::winusb_access::{access_state, ensure_access, UsbFunction};
+
+        let function = UsbFunction::new(vendor_id, product_id);
+        match access_state(function) {
+            Ok(state) if state.is_winusb() => {}
+            Ok(_) => {
+                let _ = ensure_access(function, &|_| true);
+            }
+            Err(_) => {}
+        }
+    }
+
+    #[cfg(not(any(windows, feature = "winusb")))]
+    fn ensure_host_access(_vendor_id: u16, _product_id: u16) {}
+
     impl ImagingSession {
         /// Open the imaging-stage device and claim its interface.
         pub(super) fn open(vendor_id: u16, product_id: u16) -> Result<Self> {
+            // Granting this process access to the node is the driver's problem,
+            // not the caller's. On Windows a userspace claim requires WinUSB
+            // bound to the device, and an application asking a camera for a
+            // frame should not also have to know that, or run a separate tool
+            // first. Binding displaces whatever currently owns the node, so it
+            // is done here — on an explicit capture against this camera — and
+            // never during passive discovery, which must stay read-only.
+            ensure_host_access(vendor_id, product_id);
+
             let info = nusb::list_devices()
                 .map_err(|error| {
                     Error::new(
@@ -1276,6 +1364,7 @@ mod live_imaging {
             let _ = device.set_configuration(1);
 
             let interface = device.claim_interface(0).map_err(|error| {
+                // Fell through host access: report what owns the node.
                 Error::new(
                     ErrorCode::Transport,
                     format!(
