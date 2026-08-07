@@ -627,6 +627,16 @@ pub struct LumeneraCameraDriver {
     probe: LumeneraProbe,
     next_token: u64,
     events: VecDeque<DriverEvent>,
+    /// The open imaging session, kept between frames.
+    ///
+    /// Opening one is not cheap — it enumerates the bus, re-asserts the
+    /// configuration, re-claims the interface and reads the capability block —
+    /// and none of that describes the *frame* being asked for. Doing it per
+    /// capture put roughly three quarters of a second in front of every frame,
+    /// which reads as a live preview that ignores the exposure it was given.
+    /// Dropped on error so the next capture rebuilds it.
+    #[cfg(feature = "os-usb")]
+    session: Option<live_imaging::ImagingSession>,
 }
 
 impl LumeneraCameraDriver {
@@ -638,6 +648,8 @@ impl LumeneraCameraDriver {
             probe,
             next_token: 1,
             events: VecDeque::new(),
+            #[cfg(feature = "os-usb")]
+            session: None,
         }
     }
 
@@ -919,9 +931,30 @@ impl LumeneraCameraDriver {
                 // asking for a frame should have to sequence.
                 self.bring_up()?;
                 let plan = self.capture_plan();
-                let session =
-                    live_imaging::ImagingSession::open(self.probe.vendor_id, IMAGING_PID)?;
-                let data = session.acquire(&plan)?;
+                if self.session.is_none() {
+                    self.session = Some(live_imaging::ImagingSession::open(
+                        self.probe.vendor_id,
+                        IMAGING_PID,
+                    )?);
+                }
+                let data = match self
+                    .session
+                    .as_ref()
+                    .expect("the session was just opened")
+                    .acquire(&plan)
+                {
+                    Ok(data) => data,
+                    Err(error) => {
+                        // The session ends at the first failure rather than
+                        // being reused: a camera that was unplugged, or an
+                        // interface left mid-frame, is not something the next
+                        // capture should inherit. `acquire` already returns the
+                        // camera to idle on the way out, so the only state worth
+                        // discarding is the claim itself.
+                        self.session = None;
+                        return Err(error);
+                    }
+                };
                 let handle = FrameHandle {
                     stream: StreamId(self.camera.0 .0),
                     frame: FrameId(token.0),
@@ -1584,6 +1617,20 @@ mod live_imaging {
 
         /// Run one acquisition and return the raw 16-bit frame bytes.
         pub(super) fn acquire(&self, plan: &CapturePlan) -> Result<Vec<u8>> {
+            // Where a frame's wall-clock goes, on demand. A capture is a long
+            // chain of control transfers around one bulk read, and which link
+            // dominates is not guessable from the outside — set
+            // `NUMANAGER_TIME_CAPTURE=1` to have each phase say so.
+            let timing = std::env::var_os("NUMANAGER_TIME_CAPTURE").is_some();
+            let started = Instant::now();
+            let mut mark = started;
+            let mut lap = |phase: &str| {
+                if timing {
+                    eprintln!("  {phase}: {:?}", mark.elapsed());
+                    mark = Instant::now();
+                }
+            };
+
             let expected = frame_bytes(
                 plan.width as u32,
                 plan.height as u32,
@@ -1591,6 +1638,7 @@ mod live_imaging {
                 plan.y_bin,
             );
             self.configure(plan)?;
+            lap("configure");
 
             self.interface
                 .set_alt_setting(ALT_STREAMING)
@@ -1607,7 +1655,10 @@ mod live_imaging {
             // frame until the read deadline expires.
             let _ = self.interface.clear_halt(EP_IMAGE);
 
+            lap("alt-setting + clear-halt");
+
             let outcome = self.stream_frame(plan, expected);
+            lap("stream frame (includes the exposure)");
 
             // Teardown runs whether or not the read succeeded, so a failed
             // capture still leaves the camera idle rather than streaming.
@@ -1620,6 +1671,10 @@ mod live_imaging {
             );
             let _ = self.write_tap_registers(true);
             let _ = self.interface.set_alt_setting(ALT_IDLE);
+            lap("teardown");
+            if timing {
+                eprintln!("  total: {:?}", started.elapsed());
+            }
 
             // A failed capture is the one case where the camera's own view of
             // itself is worth the extra transfers, so attach it to the error
