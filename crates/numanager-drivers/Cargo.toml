@@ -7,6 +7,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+zstd = "0.13"
 numanager-core = { path = "../numanager-core" }
 # WinUSB provisioning is part of the driver crate on Windows, not an add-on: a
 # userspace USB driver there cannot open a device that is not bound to WinUSB,

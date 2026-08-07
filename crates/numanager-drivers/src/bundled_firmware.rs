@@ -36,14 +36,11 @@ const IMAGES: &[(&str, &str)] = &[
     bundled!("lumenera", "lumenera_fw_img16.hex"),
 ];
 
-/// Binary (non-Intel-HEX) images compiled in, by originating package. Kept
-/// separate from [`IMAGES`] because these are raw byte streams pushed to an
-/// endpoint rather than address/record text.
-#[cfg(feature = "os-usb")]
-const BLOBS: &[(&str, &[u8])] = &[(
-    "lumenera_fpga_lu130.bin",
-    include_bytes!("../../../data/third_party/lumenera/lumenera_fpga_lu130.bin"),
-)];
+// The captured `lumenera_fpga_lu130.bin` was compiled in here. It was one
+// revision's FPGA bitstream, superseded by the bitstream store in
+// `data/third_party/lumenera/lucam-fpga.lufpga`, which covers every revision of
+// every model with the program codes and ordering the camera needs. That is
+// loaded from disk rather than compiled in: 2.4 MB, and vendor data.
 
 /// Recorded control-transfer sequences, replayed verbatim during bring-up where
 /// the individual transfers are not decoded. Same treatment as [`IMAGES`]:
@@ -61,15 +58,6 @@ pub(crate) fn sequence_by_name(name: &str) -> Option<&'static str> {
         .map(|(_, text)| *text)
 }
 
-/// The compiled-in binary image with this exact file name.
-#[cfg(feature = "os-usb")]
-pub(crate) fn blob_by_name(name: &str) -> Option<&'static [u8]> {
-    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    BLOBS
-        .iter()
-        .find(|(blob, _)| *blob == file)
-        .map(|(_, bytes)| *bytes)
-}
 
 /// The compiled-in image with this exact file name, or `None` when it is not
 /// bundled. `name` may be a bare file name or a path — only the final component

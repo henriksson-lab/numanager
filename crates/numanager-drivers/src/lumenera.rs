@@ -13,6 +13,34 @@
 //! `0x5354` is what *this* Bio-Rad OEM unit reports; stock Lumenera cameras use
 //! the registered USB-IF vendor id `0x1724`, so the driver claims both.
 //!
+//! ## Provenance
+//!
+//! Two different derivations meet in this file, and they carry different
+//! confidence:
+//!
+//! * **Capture-derived.** Discovery, the two-stage firmware download, the
+//!   register-load sequence and the model-specific teardown come from traffic
+//!   recorded off a physical unit. Evidenced but not explained.
+//! * **Specification-derived.** FPGA programming, streaming and geometry come
+//!   from `reveng-dll/teledyne/lucam-protocol-spec.md`, a functional
+//!   specification written from Teledyne's **GPLv2** Linux driver source and
+//!   independently audited against it.
+//!
+//! The specification deliberately records facts — register numbers, orderings,
+//! constants, conditions — and no expression: no code, no control flow, no
+//! comments. These modules were then written from the specification, not from
+//! the source. That is what keeps numanager `MIT OR Apache-2.0`; a translation
+//! of the GPLv2 driver would have to be GPLv2 itself.
+//!
+//! The vendor's proprietary SDK components (`api/`, `examples/`, `doc/`) were
+//! never opened. Their licence forbids it, and the GPLv2 driver made it
+//! unnecessary.
+//!
+//! Practical consequence: where the two derivations disagreed, the
+//! specification won and the difference is noted at the site. The capture could
+//! only ever show *what one camera did once*; the specification says what the
+//! device contract is.
+//!
 //! ## What is and isn't implemented
 //!
 //! Implemented and evidenced: USB discovery of both stages and the two-stage
@@ -122,28 +150,10 @@ mod protocol {
     pub(super) const IDX_FORMAT_MODE: u16 = 0x4010;
     pub(super) const IDX_FORMAT_08: u16 = 0x4008;
     pub(super) const IDX_EXPOSURE: u16 = 0x0540;
-    pub(super) const IDX_ACQUISITION: u16 = 0x0218;
     pub(super) const IDX_OPAQUE_05A0: u16 = 0x05a0;
     pub(super) const IDX_OPAQUE_0550: u16 = 0x0550;
     pub(super) const IDX_OPAQUE_0610: u16 = 0x0610;
     pub(super) const IDX_OPAQUE_0670: u16 = 0x0670;
-
-    /// Sensor-pipeline configuration, streamed to [`EP_CONFIG`] during
-    /// imaging-stage bring-up. `wIndex 0x0008` is its control/status register.
-    ///
-    /// Recorded from captured hardware traffic (2026-08-06): with the device at
-    /// the imaging id and configuration 1 selected, the host reads `0x0008`
-    /// (`0x80`), selects alternate setting 1, writes `0xFFFFFFFF` to `0x0008`,
-    /// streams the image to endpoint `0x08`, polls `0x0008` until it reads
-    /// zero (`0x80` -> `0x40` -> `0x00`), then writes zero to `0x0008`.
-    ///
-    /// Until this runs, every control transfer is accepted and the image
-    /// endpoint delivers nothing.
-    pub(super) const IDX_CONFIG_STATUS: u16 = 0x0008;
-    /// The only status in which an arm is accepted: ready to receive an image.
-    pub(super) const CONFIG_READY: u32 = 0x80;
-    pub(super) const CONFIG_ARM: u32 = 0xFFFF_FFFF;
-    pub(super) const CONFIG_FINISH: u32 = 0;
     /// Bulk OUT endpoint carrying the configuration image, and the alternate
     /// setting that exposes it.
     pub(super) const EP_CONFIG: u8 = 0x08;
@@ -181,11 +191,17 @@ mod protocol {
     /// reading showed to be a coincidence.
     pub(super) const IDX_CAPABILITY_STATE: u16 = 0x1014;
 
-    /// Values written to [`IDX_ACQUISITION`], in the order the sequence uses
-    /// them. Named for their observed position, not a documented meaning.
-    pub(super) const ACQ_STOP: u32 = 0;
-    pub(super) const ACQ_ARM: u32 = 4;
-    pub(super) const ACQ_START: u32 = 6;
+    // The acquisition register and its values now live in `lumenera_stream` as
+    // `REG_TRIGGER_CTRL` / `STILL_ENABLE` / `STILL_DISABLE`, because the vendor
+    // specification identifies `0x0218` as trigger control and `0x04`/`0x00` as
+    // the still-mode enable and disable.
+    //
+    // **One captured write is unaccounted for.** The recorded sequence wrote
+    // `0x04` and then `0x06` to this register; the specification accounts for
+    // `0x04` and `0x00` only. The `0x06` is therefore no longer sent. If capture
+    // regresses on hardware, that dropped write is the first thing to restore —
+    // it is the single behavioural difference between the old sequence and the
+    // new one that is not explained by the specification.
 
     /// Per-tap registers written on every acquisition.
     pub(super) const REG_TAP_FIRST: u16 = 0x0276;
@@ -1185,11 +1201,6 @@ mod live_imaging {
     use std::time::{Duration, Instant};
 
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
-    /// Budget for the pipeline image write and the status poll after it. The
-    /// vendor's own write took ~0.7 s for 98 KB.
-    const CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
-    /// Compiled-in sensor-pipeline configuration image.
-    const FPGA_IMAGE_FILE: &str = "lumenera_fpga_lu130.bin";
     /// Compiled-in post-configuration transfer sequence.
     const INIT_SEQUENCE_FILE: &str = "lumenera_init_lu130.jsonl";
 
@@ -1234,7 +1245,21 @@ mod live_imaging {
 
     pub(super) struct ImagingSession {
         interface: nusb::Interface,
+        product_id: u16,
+        /// `bcdDevice` of the **imaging-stage** descriptor. Selects the FPGA
+        /// bitstream set; the loader stage uses the same field to select the
+        /// 8051 firmware image, so it must be re-read after renumeration rather
+        /// than carried over.
+        device_id: u16,
+        /// `SPECIFICATION` (`0x0010`): the camera's **protocol version**, read
+        /// once at bring-up and clamped to the highest this driver implements.
+        /// It selects the still-trigger encoding.
+        spec_version: u32,
+        firmware_dir: Option<String>,
     }
+
+    /// Highest protocol version this driver knows how to speak.
+    const MAX_SPEC_VERSION: u32 = 2;
 
     /// Bind WinUSB to the camera's node if something else owns it.
     ///
@@ -1321,7 +1346,22 @@ mod live_imaging {
             // state rather than inheriting one.
             let _ = interface.set_alt_setting(ALT_IDLE);
 
-            let session = Self { interface };
+            let device_id = info.device_version();
+            let mut session = Self {
+                interface,
+                product_id,
+                device_id,
+                spec_version: 0,
+                firmware_dir: Some(default_firmware_dir()),
+            };
+            // Clamped, not trusted: a camera reporting a newer protocol than
+            // this driver implements is spoken to in the newest dialect the
+            // driver actually knows.
+            session.spec_version = session
+                .read_property(crate::lumenera_geometry::REG_SPECIFICATION)
+                .map(u32::from_le_bytes)
+                .unwrap_or(0)
+                .min(MAX_SPEC_VERSION);
             // The camera answers this capability block on open, before any
             // configuration. Whether it *requires* the read is unrecorded, so
             // it is issued in the recorded order and the result discarded:
@@ -1344,86 +1384,53 @@ mod live_imaging {
         /// does not branch on it, and the value is not a reliable "already
         /// configured" flag: a device that has been configured and then reset
         /// by a driver change reads zero here while delivering no frames.
-        fn configure_pipeline(&self) -> Result<()> {
-            let before = self
-                .read_property(IDX_CONFIG_STATUS)
-                .map(u32::from_le_bytes)
-                .unwrap_or(u32::MAX);
-
-            // `0x80` is the ready-to-configure state, and the only one in which
-            // an arm is accepted: a device already carrying an image reports
-            // `0xA0` and ignores the sequence outright. Skipping the download
-            // then is not an optimisation — re-arming a configured device is
-            // simply refused, so the register load below is what remains to do.
-            if before != CONFIG_READY {
-                self.replay_init_sequence()?;
-                return Ok(());
-            }
-
-            let image =
-                crate::bundled_firmware::blob_by_name(FPGA_IMAGE_FILE).ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::Unsupported,
-                        format!("Lumenera pipeline image {FPGA_IMAGE_FILE} is not compiled in"),
-                    )
-                })?;
-
-            self.interface
-                .set_alt_setting(ALT_CONFIG)
-                .map_err(|error| {
-                    Error::new(
-                        ErrorCode::Transport,
-                        format!("Lumenera configuration alt-setting select failed: {error}"),
-                    )
-                })?;
-            self.property(IDX_CONFIG_STATUS, &word(CONFIG_ARM))?;
-
-            // One transfer for the whole image, as the recorded sequence does.
-            let completion =
-                futures_lite::future::block_on(self.interface.bulk_out(EP_CONFIG, image.to_vec()));
-            completion.status.map_err(|error| {
-                Error::new(
-                    ErrorCode::Transport,
-                    format!("Lumenera pipeline image write failed: {error}"),
-                )
-            })?;
-            let sent = completion.data.actual_length();
-            if sent != image.len() {
-                return Err(Error::new(
-                    ErrorCode::Transport,
-                    format!(
-                        "Lumenera pipeline image short write: {sent}/{} bytes",
-                        image.len()
-                    ),
-                ));
-            }
-
-            // The device reports progress in the same register: it steps down
-            // to zero when it has taken the image. Bounded, because a device
-            // that never finishes must fail rather than hang the caller.
-            let deadline = Instant::now() + CONFIG_TIMEOUT;
-            loop {
-                let status = u32::from_le_bytes(self.read_property(IDX_CONFIG_STATUS)?);
-                if status == 0 {
-                    break;
+        /// Program the FPGA, then replay the recorded register load.
+        ///
+        /// This replaces a single captured 98 KB blob pushed in one bulk
+        /// transfer. That blob was the Lu130's `did 0x0000` bitstream, and using
+        /// it unconditionally is wrong on any other revision — `did 0x0018`
+        /// needs *two* bitstreams programmed in sequence with different program
+        /// codes, and would have been left half-configured.
+        ///
+        /// The register load afterwards is still replayed as captured: its
+        /// individual meanings are not established, and naming them would be a
+        /// guess.
+        fn configure_pipeline(&mut self) -> Result<()> {
+            use crate::lumenera_fpga::Programmed;
+            match self.program_fpga(self.product_id, self.device_id, self.firmware_dir.clone().as_deref())? {
+                Programmed::AlreadyDone | Programmed::NotApplicable => {}
+                Programmed::Completed { bitstreams } => {
+                    if std::env::var_os("NUMANAGER_TIME_CAPTURE").is_some() {
+                        eprintln!("  programmed {bitstreams} FPGA bitstream(s)");
+                    }
                 }
-                if Instant::now() >= deadline {
-                    return Err(Error::new(
-                        ErrorCode::Transport,
-                        format!(
-                            "Lumenera pipeline configuration did not complete: status \
-                             {status:#010x} still set (was {before:#010x} before arming, \
-                             {sent} bytes written)"
-                        ),
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(5));
             }
-
-            self.property(IDX_CONFIG_STATUS, &word(CONFIG_FINISH))?;
-            let _ = self.interface.set_alt_setting(ALT_IDLE);
-            self.replay_init_sequence()?;
-            Ok(())
+            // Ask the camera what it is. Sensor geometry is not tabled per
+            // model by design — the vendor driver queries it too — so this is
+            // what makes the driver work on more than the one unit it was
+            // captured from. A camera that disagrees with the compiled-in
+            // constants is reported rather than silently overridden, because
+            // nothing downstream has been taught to handle a changing frame
+            // size yet.
+            match self.geometry() {
+                Ok(g) => {
+                    if g.width != SENSOR_WIDTH || g.height != SENSOR_HEIGHT {
+                        eprintln!(
+                            "warning: Lumenera reports {}x{} but this driver is built \
+                             around {SENSOR_WIDTH}x{SENSOR_HEIGHT}; capture geometry may \
+                             be wrong",
+                            g.width, g.height
+                        );
+                    }
+                }
+                // Diagnostic only: a camera that will not answer still captures.
+                Err(error) => {
+                    if std::env::var_os("NUMANAGER_TIME_CAPTURE").is_some() {
+                        eprintln!("  geometry query failed: {error}");
+                    }
+                }
+            }
+            self.replay_init_sequence()
         }
 
         /// Replay the recorded post-configuration transfers.
@@ -1554,6 +1561,51 @@ mod live_imaging {
         /// Best-effort by construction: this runs on a path that has already
         /// failed, so a read error becomes part of the report rather than
         /// replacing the original error.
+        /// Bitstream store, loaded from `firmware_dir` on first use.
+        fn bitstream_store(dir: Option<&str>) -> Result<crate::lumenera_fpga::BitstreamStore> {
+            let name = "lucam-fpga.lufpga";
+            let path = std::path::Path::new(dir.unwrap_or("data/third_party/lumenera")).join(name);
+            crate::lumenera_fpga::BitstreamStore::load(&path)
+        }
+
+        /// Program the FPGA for this camera, per `lucam-protocol-spec.md` §5.2.
+        ///
+        /// `device_id` selects the bitstream set. **Where a camera reports it is
+        /// not yet established** — it is the second key of the vendor's FPGA
+        /// table and is not obviously `bcdDevice`, so it is passed in rather
+        /// than guessed. A camera whose id the store does not cover programs
+        /// nothing and says which ids it does cover, instead of being handed a
+        /// bitstream meant for different silicon.
+        pub(super) fn program_fpga(
+            &mut self,
+            product_id: u16,
+            device_id: u16,
+            firmware_dir: Option<&str>,
+        ) -> Result<crate::lumenera_fpga::Programmed> {
+            let store = Self::bitstream_store(firmware_dir)?;
+            let sets = store.bitstreams_for(product_id, device_id)?;
+            if sets.is_empty() {
+                let known = store.known_device_ids(product_id);
+                if known.is_empty() {
+                    // Models with no FPGA at all are a real case, not an error.
+                    return Ok(crate::lumenera_fpga::Programmed::NotApplicable);
+                }
+                return Err(Error::new(
+                    ErrorCode::Unsupported,
+                    format!(
+                        "Lumenera {product_id:#06x} device id {device_id:#06x} has no bitstream; \
+                         this store covers {known:#06x?}"
+                    ),
+                ));
+            }
+            crate::lumenera_fpga::program(self, &sets)
+        }
+
+        /// Sensor geometry, asked of the camera rather than compiled in.
+        pub(super) fn geometry(&mut self) -> Result<crate::lumenera_geometry::Geometry> {
+            crate::lumenera_geometry::query(self)
+        }
+
         fn capability_report(&self) -> String {
             let mut parts = Vec::new();
             for index in IDX_CAPABILITY_READS {
@@ -1640,29 +1692,16 @@ mod live_imaging {
             self.configure(plan)?;
             lap("configure");
 
-            self.interface
-                .set_alt_setting(ALT_STREAMING)
-                .map_err(|error| {
-                    Error::new(
-                        ErrorCode::Transport,
-                        format!("Lumenera streaming alt-setting select failed: {error}"),
-                    )
-                })?;
-
-            // Clear any halt left on the image endpoint before reads are
-            // queued: a stalled pipe accepts submissions and never completes
-            // them, which is indistinguishable from a camera that produced no
-            // frame until the read deadline expires.
-            let _ = self.interface.clear_halt(EP_IMAGE);
-
-            lap("alt-setting + clear-halt");
-
+            // Alternate setting, halt clearing and the camera enable/disable are
+            // owned by the streaming state machine now: it selects Data on
+            // acquire, restores Idle on release, and clears the halt during stop
+            // where the specification puts it. Doing any of it here as well
+            // would fight it.
             let outcome = self.stream_frame(plan, expected);
             lap("stream frame (includes the exposure)");
 
-            // Teardown runs whether or not the read succeeded, so a failed
-            // capture still leaves the camera idle rather than streaming.
-            let _ = self.property(IDX_ACQUISITION, &word(ACQ_STOP));
+            // Model-specific teardown the state machine knows nothing about,
+            // replayed as captured. Runs whether or not the read succeeded.
             let _ = self.write(
                 REQ_REGISTER,
                 FPGA_TEARDOWN_ADDR,
@@ -1670,7 +1709,6 @@ mod live_imaging {
                 &FPGA_TEARDOWN_DATA,
             );
             let _ = self.write_tap_registers(true);
-            let _ = self.interface.set_alt_setting(ALT_IDLE);
             lap("teardown");
             if timing {
                 eprintln!("  total: {:?}", started.elapsed());
@@ -1690,113 +1728,210 @@ mod live_imaging {
         }
 
         /// Arm, start, and drain exactly one frame off the bulk endpoint.
+        /// Drive one frame through the streaming state machine.
+        ///
+        /// The ordering that matters — every transfer submitted *before* the
+        /// camera is enabled — is enforced by `lumenera_stream`, not here. The
+        /// previous implementation coordinated it with a reader thread and a
+        /// ready channel; queue submission is non-blocking, so neither is needed.
+        ///
+        /// Mode is **still**, matching the captured sequence: it writes `0x04` to
+        /// `TRIGGER_CTRL`, which is still capture. Video would be `VIDEO_EN`, and
+        /// switching to it is a behavioural change rather than a fix.
         fn stream_frame(&self, plan: &CapturePlan, expected: usize) -> Result<Vec<u8>> {
-            let timing = std::env::var_os("NUMANAGER_TIME_CAPTURE").is_some();
-            let mut mark = Instant::now();
-            let mut lap = |phase: &str| {
-                if timing {
-                    eprintln!("    {phase}: {:?}", mark.elapsed());
-                    mark = Instant::now();
-                }
-            };
-            self.property(IDX_ACQUISITION, &word(ACQ_ARM))?;
+            use crate::lumenera_stream::{Stream, StopKind};
+
             self.write_tap_registers(false)?;
-            lap("arm + tap registers");
 
-            // Read on a dedicated thread. The completion future has to be
-            // awaited to completion — racing it against a timer drops it and
-            // loses the transfer — so the timeout lives on the channel instead.
-            // Reads are queued before the start write because the device begins
-            // streaming immediately and a late reader loses the frame head.
-            let (tx, rx) = std::sync::mpsc::sync_channel::<std::result::Result<Vec<u8>, String>>(8);
-            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
-            let iface = self.interface.clone();
-            std::thread::spawn(move || {
-                let mut queue = iface.bulk_in_queue(EP_IMAGE);
-                // Size every read to what is still outstanding, never to a flat
-                // chunk. A frame is not a whole number of chunks, and its final
-                // piece is an exact multiple of the endpoint's packet size — so
-                // it carries no short packet to terminate an over-long request,
-                // and an oversized final read simply never completes. Asking for
-                // exactly the remainder is what the recorded host does.
-                let mut queued = 0usize;
-                for _ in 0..4 {
-                    if queued >= expected {
-                        break;
-                    }
-                    let len = BULK_CHUNK.min(expected - queued);
-                    queue.submit(RequestBuffer::new(len));
-                    queued += len;
-                }
-                let _ = ready_tx.send(());
-                loop {
-                    let completion = futures_lite::future::block_on(queue.next_complete());
-                    let message = completion
-                        .status
-                        .map(|_| completion.data.clone())
-                        .map_err(|error| error.to_string());
-                    let stop = message.is_err();
-                    if tx.send(message).is_err() || stop {
-                        return;
-                    }
-                    if queued < expected {
-                        let len = BULK_CHUNK.min(expected - queued);
-                        queue.submit(RequestBuffer::new(len));
-                        queued += len;
-                    }
-                    // The whole frame is queued and drained: awaiting another
-                    // completion on an empty queue is a panic, not a wait.
-                    if queue.pending() == 0 {
-                        return;
-                    }
-                }
-            });
+            let mut io = StreamIo::new(self, BULK_CHUNK.min(expected.max(1)));
+            // The protocol version selects the trigger encoding. Software-trigger
+            // mode is what the captured camera was in; hardware triggering is a
+            // distinct camera state this driver never puts it into.
+            let mut stream =
+                Stream::new_still(Stream::DEFAULT_POOL, self.spec_version, false);
 
-            ready_rx.recv_timeout(CONTROL_TIMEOUT).map_err(|_| {
-                Error::new(
-                    ErrorCode::Transport,
-                    "Lumenera bulk reader did not queue initial reads before acquisition start",
-                )
-            })?;
-            lap("reader queued");
-            self.property(IDX_ACQUISITION, &word(ACQ_START))?;
-            lap("acquisition start");
+            stream.acquire(&mut io)?;
+            // Submits the whole pool, then enables, then checks the read-back.
+            stream.start(&mut io)?;
+            // Enabling only arms the camera. Without this it never exposes, and
+            // the read below would wait out its whole deadline for a frame that
+            // was never taken.
+            stream.trigger(&mut io)?;
 
             let deadline =
                 Instant::now() + Duration::from_micros(plan.exposure_us as u64) + READ_OVERHEAD;
+            let outcome = io.drain(expected, deadline);
+            if outcome.is_err() {
+                // A read failure is the class that needs a rebuild, not a retry.
+                stream.note_frame_error(true);
+            }
+
+            let stopped = stream.stop(&mut io, StopKind::Teardown);
+            let released = stream.release(&mut io);
+            let frame = outcome?;
+            stopped?;
+            released?;
+            Ok(frame)
+        }
+    }
+
+    // ---- transport adapters -------------------------------------------------
+    //
+    // The sequences live in `lumenera_fpga` / `lumenera_stream` / `lumenera_geometry`
+    // so they can be tested without a camera; these bind them to real USB.
+    //
+    // Note the request-code naming: this module calls `0x12` REQ_PROPERTY, but
+    // it is the vendor's *register* file — the same wire value the specification
+    // calls register access. `read_property`/`property` are therefore the
+    // register accessors.
+
+    fn alt_value(alt: crate::lumenera_fpga::AltSetting) -> u8 {
+        use crate::lumenera_fpga::AltSetting as A;
+        match alt {
+            A::Idle => ALT_IDLE,
+            A::Fpga => ALT_CONFIG,
+            A::Data => ALT_STREAMING,
+        }
+    }
+
+    impl crate::lumenera_fpga::FpgaTransport for ImagingSession {
+        fn read_reg(&mut self, index: u16) -> Result<u32> {
+            Ok(u32::from_le_bytes(self.read_property(index)?))
+        }
+        fn write_reg(&mut self, index: u16, value: u32) -> Result<()> {
+            self.property(index, &word(value))
+        }
+        fn send_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+            let done = futures_lite::future::block_on(
+                self.interface.bulk_out(EP_CONFIG, chunk.to_vec()),
+            );
+            done.status.map_err(|error| {
+                Error::new(
+                    ErrorCode::Transport,
+                    format!("Lumenera FPGA bitstream chunk write failed: {error}"),
+                )
+            })?;
+            let sent = done.data.actual_length();
+            if sent != chunk.len() {
+                return Err(Error::new(
+                    ErrorCode::Transport,
+                    format!("Lumenera FPGA chunk short write: {sent}/{}", chunk.len()),
+                ));
+            }
+            Ok(())
+        }
+        fn set_alt_setting(&mut self, alt: crate::lumenera_fpga::AltSetting) -> Result<()> {
+            self.interface.set_alt_setting(alt_value(alt)).map_err(|error| {
+                Error::new(
+                    ErrorCode::Transport,
+                    format!("Lumenera alt-setting {alt:?} select failed: {error}"),
+                )
+            })
+        }
+        fn delay(&mut self, d: std::time::Duration) {
+            std::thread::sleep(d);
+        }
+    }
+
+    impl crate::lumenera_geometry::GeometryTransport for ImagingSession {
+        fn read_reg(&mut self, index: u16) -> Result<u32> {
+            Ok(u32::from_le_bytes(self.read_property(index)?))
+        }
+    }
+
+    /// Streaming transport bound to one bulk-IN queue.
+    ///
+    /// `submit`/`kill` are the sequence's view of the transfer pool. nusb's queue
+    /// has no addressable slots, so `kill` cancels everything outstanding; the
+    /// ring position the sequence tracks is bookkeeping we honour but cannot
+    /// replicate literally. Behaviourally what matters — all transfers in flight
+    /// before the enable, all cancelled on stop — does hold.
+    pub(super) struct StreamIo<'a> {
+        session: &'a ImagingSession,
+        queue: nusb::transfer::Queue<RequestBuffer>,
+        chunk: usize,
+        speed: crate::lumenera_stream::BusSpeed,
+    }
+
+    impl<'a> StreamIo<'a> {
+        pub(super) fn new(session: &'a ImagingSession, chunk: usize) -> Self {
+            Self {
+                queue: session.interface.bulk_in_queue(EP_IMAGE),
+                session,
+                chunk,
+                // The one measured unit is USB 2; nothing here reads the actual
+                // bus speed yet, and claiming SuperSpeed would silently disable
+                // the unconditional halt clear.
+                speed: crate::lumenera_stream::BusSpeed::High,
+            }
+        }
+
+        /// Pull one frame out of the queue, resubmitting as buffers complete.
+        pub(super) fn drain(&mut self, expected: usize, deadline: Instant) -> Result<Vec<u8>> {
             let mut frame = Vec::with_capacity(expected);
             while frame.len() < expected {
-                let now = Instant::now();
-                let remaining = deadline.checked_duration_since(now).unwrap_or_default();
-                match rx.recv_timeout(remaining) {
-                    Ok(Ok(data)) => {
-                        if frame.is_empty() {
-                            // Everything up to here is setup; this is the camera
-                            // deciding to hand over pixels.
-                            lap("start -> first pixels (exposure + sensor)");
-                        }
-                        let take = (expected - frame.len()).min(data.len());
-                        frame.extend_from_slice(&data[..take]);
-                    }
-                    Ok(Err(error)) => {
-                        return Err(Error::new(
-                            ErrorCode::Transport,
-                            format!("Lumenera bulk read failed: {error}"),
-                        ))
-                    }
-                    Err(_) => {
-                        return Err(Error::new(
-                            ErrorCode::Transport,
-                            format!(
-                                "Lumenera frame read timed out ({} of {expected} bytes)",
-                                frame.len()
-                            ),
-                        ))
-                    }
+                if Instant::now() >= deadline {
+                    return Err(Error::new(
+                        ErrorCode::Timeout,
+                        format!(
+                            "Lumenera frame read timed out ({} of {expected} bytes)",
+                            frame.len()
+                        ),
+                    ));
+                }
+                let done = futures_lite::future::block_on(self.queue.next_complete());
+                done.status.map_err(|error| {
+                    Error::new(
+                        ErrorCode::Transport,
+                        format!("Lumenera bulk read failed: {error}"),
+                    )
+                })?;
+                let take = (expected - frame.len()).min(done.data.len());
+                frame.extend_from_slice(&done.data[..take]);
+                if frame.len() < expected {
+                    self.queue.submit(RequestBuffer::new(self.chunk));
                 }
             }
-            lap("remaining pixels over the bus");
             Ok(frame)
+        }
+    }
+
+    impl crate::lumenera_stream::StreamTransport for StreamIo<'_> {
+        fn read_reg(&mut self, index: u16) -> Result<u32> {
+            Ok(u32::from_le_bytes(self.session.read_property(index)?))
+        }
+        fn write_reg(&mut self, index: u16, value: u32) -> Result<()> {
+            self.session.property(index, &word(value))
+        }
+        fn ext_cmd(&mut self, sub: u8) -> Result<()> {
+            self.session.write(REQ_REGISTER, 0, sub as u16, &[])
+        }
+        fn set_alt_setting(&mut self, alt: crate::lumenera_fpga::AltSetting) -> Result<()> {
+            self.session
+                .interface
+                .set_alt_setting(alt_value(alt))
+                .map_err(|error| {
+                    Error::new(
+                        ErrorCode::Transport,
+                        format!("Lumenera alt-setting {alt:?} select failed: {error}"),
+                    )
+                })
+        }
+        fn submit(&mut self, _slot: usize) -> Result<()> {
+            self.queue.submit(RequestBuffer::new(self.chunk));
+            Ok(())
+        }
+        fn kill(&mut self, _from: usize, _count: usize) -> Result<()> {
+            self.queue.cancel_all();
+            Ok(())
+        }
+        fn clear_halt(&mut self) -> Result<()> {
+            let _ = self.session.interface.clear_halt(EP_IMAGE);
+            Ok(())
+        }
+        fn reset_frames(&mut self) {}
+        fn bus_speed(&self) -> crate::lumenera_stream::BusSpeed {
+            self.speed
         }
     }
 }
@@ -1810,6 +1945,8 @@ struct CapturePlan {
     x_bin: u16,
     y_bin: u16,
     exposure_us: u32,
+
+
 }
 
 /// Live firmware download — the EZ-USB anchor-download sequence, validated on

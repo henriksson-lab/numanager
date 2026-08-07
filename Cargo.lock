@@ -3306,6 +3306,7 @@ dependencies = [
  "serde_json",
  "serialport",
  "sha2",
+ "zstd",
 ]
 
 [[package]]
