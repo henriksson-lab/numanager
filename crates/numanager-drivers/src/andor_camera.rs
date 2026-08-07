@@ -3441,12 +3441,15 @@ mod live_sdk2 {
             })
     }
 
+    /// Budget for one anchor-download control transfer.
+    const FIRMWARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     pub(super) fn upload_fx2_firmware(
         identity: &Option<AndorUsbIdentity>,
         path: &str,
     ) -> Result<()> {
         let text = firmware_package_text(path)?;
-        let segments = parse_ihex(&text)?;
+        let records = crate::ez_usb::parse_ihex(&text)?;
         let device = select_fx2_loader(identity)?;
         let (vendor_id, product_id) = (device.vendor_id(), device.product_id());
         let device = device.open().map_err(|error| {
@@ -3458,14 +3461,22 @@ mod live_sdk2 {
                 crate::usb_discovery::usb_claim_hint(vendor_id, product_id, 0)
             ))
         })?;
-        raw_vendor_out(&interface, 0xa0, 0xe600, 0, &[0x01])?;
-        for (base, data) in segments {
-            for (offset, chunk) in data.chunks(1024).enumerate() {
-                let address = base.wrapping_add((offset * 1024) as u16);
-                raw_vendor_out(&interface, 0xa0, address, 0, chunk)?;
-            }
+        // Shared EZ-USB anchor download: hold the 8051, write every record,
+        // release. One transfer per Intel-HEX record rather than coalesced
+        // 1 KiB blocks — that is what the FX2 programming model specifies and
+        // what has been verified record-for-record against captured traffic on
+        // another FX2 camera in this repository. This path has never been run
+        // on Andor hardware, so it uses the code that has been.
+        crate::ez_usb::hold_8051(&interface, true, FIRMWARE_TIMEOUT)?;
+        for record in &records {
+            crate::ez_usb::anchor_write(
+                &interface,
+                record.address,
+                &record.data,
+                FIRMWARE_TIMEOUT,
+            )?;
         }
-        raw_vendor_out(&interface, 0xa0, 0xe600, 0, &[0x00])
+        crate::ez_usb::hold_8051(&interface, false, FIRMWARE_TIMEOUT)
     }
 
     pub(super) fn upload_fx3_firmware(
@@ -3616,53 +3627,6 @@ mod live_sdk2 {
                 "Andor FX2 firmware control_out req=0x{request:02x} val=0x{value:04x} idx=0x{index:04x} failed: {error}"
             ))
         })
-    }
-
-    fn parse_ihex(text: &str) -> Result<Vec<(u16, Vec<u8>)>> {
-        let mut upper = 0_u32;
-        let mut segments = Vec::new();
-        for (lineno, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let bytes = parse_ihex_line(line).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::InvalidProperty,
-                    format!("bad Andor SDK2 Intel HEX firmware line {}", lineno + 1),
-                )
-            })?;
-            let len = bytes[0] as usize;
-            let addr = u16::from_be_bytes([bytes[1], bytes[2]]) as u32;
-            let rtype = bytes[3];
-            let data = &bytes[4..4 + len];
-            match rtype {
-                0x00 => segments.push((((upper << 16 | addr) & 0xffff) as u16, data.to_vec())),
-                0x01 => break,
-                0x04 if data.len() >= 2 => upper = u16::from_be_bytes([data[0], data[1]]) as u32,
-                _ => {}
-            }
-        }
-        if segments.is_empty() {
-            return Err(Error::new(
-                ErrorCode::InvalidProperty,
-                "Andor SDK2 firmware package contains no Intel HEX data records",
-            ));
-        }
-        Ok(segments)
-    }
-
-    fn parse_ihex_line(line: &str) -> Option<Vec<u8>> {
-        let line = line.strip_prefix(':')?;
-        if line.len() % 2 != 0 || line.len() < 10 {
-            return None;
-        }
-        let mut bytes = Vec::with_capacity(line.len() / 2);
-        for index in (0..line.len()).step_by(2) {
-            bytes.push(u8::from_str_radix(&line[index..index + 2], 16).ok()?);
-        }
-        let sum = bytes.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
-        (sum == 0).then_some(bytes)
     }
 
     struct Fx3Image {

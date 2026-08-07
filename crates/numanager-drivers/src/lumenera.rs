@@ -64,13 +64,6 @@ pub const LOADER_PID: u16 = 0x809A;
 /// Renumerated imaging stage (Lu130).
 pub const IMAGING_PID: u16 = 0x009A;
 
-/// EZ-USB anchor-download vendor request. (Only the live download path uses it.)
-#[cfg(feature = "os-usb")]
-const REQ_ANCHOR: u8 = 0xA0;
-/// EZ-USB `CPUCS` register: write 1 to hold the 8051 in reset, 0 to release.
-#[cfg(feature = "os-usb")]
-const CPUCS: u16 = 0xE600;
-
 // Sensor geometry is the Sony ICX205 nominal from the Gel Doc EZ guide; the
 // exact active ROI must still be read from live descriptors once the imaging
 // protocol is decoded.
@@ -313,91 +306,6 @@ fn firmware_image_text(selector: u16, firmware_dir: Option<&str>) -> Result<Stri
                 format!("Lumenera firmware image {name} is neither bundled nor in firmware_dir"),
             )
         })
-}
-
-/// One Intel-HEX data record: load `data` at `addr`.
-#[cfg(feature = "os-usb")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HexRecord {
-    addr: u16,
-    data: Vec<u8>,
-}
-
-/// Parse Intel-HEX text into its data records (type 00), stopping at EOF
-/// (type 01). All Lumenera images stay within a 16-bit address space, so no
-/// extended-address records are expected. Used by the live download path and
-/// the tests.
-#[cfg(feature = "os-usb")]
-fn parse_ihex(text: &str) -> Result<Vec<HexRecord>> {
-    let mut out = Vec::new();
-    for (lineno, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let body = line.strip_prefix(':').ok_or_else(|| {
-            Error::new(
-                ErrorCode::InvalidProperty,
-                format!(
-                    "Lumenera firmware line {}: missing ':' start code",
-                    lineno + 1
-                ),
-            )
-        })?;
-        if body.len() < 10 || body.len() % 2 != 0 {
-            return Err(Error::new(
-                ErrorCode::InvalidProperty,
-                format!("Lumenera firmware line {}: malformed record", lineno + 1),
-            ));
-        }
-        let bytes = (0..body.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&body[i..i + 2], 16))
-            .collect::<std::result::Result<Vec<u8>, _>>()
-            .map_err(|e| {
-                Error::new(
-                    ErrorCode::InvalidProperty,
-                    format!("Lumenera firmware line {}: bad hex: {e}", lineno + 1),
-                )
-            })?;
-        let len = bytes[0] as usize;
-        if bytes.len() != len + 5 {
-            return Err(Error::new(
-                ErrorCode::InvalidProperty,
-                format!(
-                    "Lumenera firmware line {}: length byte disagrees with record",
-                    lineno + 1
-                ),
-            ));
-        }
-        // Checksum is the two's complement of the sum of every byte but the last.
-        let sum = bytes[..bytes.len() - 1]
-            .iter()
-            .fold(0u8, |a, b| a.wrapping_add(*b));
-        if sum.wrapping_neg() != bytes[bytes.len() - 1] {
-            return Err(Error::new(
-                ErrorCode::InvalidProperty,
-                format!("Lumenera firmware line {}: checksum mismatch", lineno + 1),
-            ));
-        }
-        match bytes[3] {
-            0x00 => out.push(HexRecord {
-                addr: u16::from_be_bytes([bytes[1], bytes[2]]),
-                data: bytes[4..4 + len].to_vec(),
-            }),
-            0x01 => break,
-            other => {
-                return Err(Error::new(
-                    ErrorCode::InvalidProperty,
-                    format!(
-                        "Lumenera firmware line {}: unsupported record type {other:#04x}",
-                        lineno + 1
-                    ),
-                ))
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// A discovered Gel Doc EZ device in one of its two stages.
@@ -1838,7 +1746,6 @@ struct CapturePlan {
 #[cfg(feature = "os-usb")]
 mod live_lumenera {
     use super::*;
-    use nusb::transfer::{Control, ControlType, Recipient};
     use std::time::Duration;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -1846,7 +1753,7 @@ mod live_lumenera {
     /// Download `image` (Intel-HEX text, already resolved from the bundled copy
     /// or from `firmware_dir` by [`super::firmware_image_text`]) to the loader.
     pub(super) fn push_firmware(vendor_id: u16, product_id: u16, image: &str) -> Result<()> {
-        let records = parse_ihex(image)?;
+        let records = crate::ez_usb::parse_ihex(image)?;
 
         let info = nusb::list_devices()
             .map_err(|error| {
@@ -1880,39 +1787,16 @@ mod live_lumenera {
             )
         })?;
 
-        let write = |value: u16, data: &[u8]| -> Result<()> {
-            let control = Control {
-                control_type: ControlType::Vendor,
-                recipient: Recipient::Device,
-                request: REQ_ANCHOR,
-                value,
-                index: 0,
-            };
-            let sent = interface
-                .control_out_blocking(control, data, TIMEOUT)
-                .map_err(|error| {
-                    Error::new(
-                        ErrorCode::Transport,
-                        format!("Lumenera anchor download to {value:#06x} failed: {error}"),
-                    )
-                })?;
-            if sent != data.len() {
-                return Err(Error::new(
-                    ErrorCode::Transport,
-                    format!(
-                        "Lumenera anchor download to {value:#06x} short: {sent}/{}",
-                        data.len()
-                    ),
-                ));
-            }
-            Ok(())
-        };
+        // One transfer per Intel-HEX record, not coalesced blocks: this is the
+        // download a working stack performs, confirmed record-for-record
+        // against captured traffic, and the record boundaries are part of what
+        // was verified.
 
-        write(CPUCS, &[0x01])?; // hold 8051 in reset
+        crate::ez_usb::hold_8051(&interface, true, TIMEOUT)?;
         for record in &records {
-            write(record.addr, &record.data)?;
+            crate::ez_usb::anchor_write(&interface, record.address, &record.data, TIMEOUT)?;
         }
-        write(CPUCS, &[0x00])?; // release -> renumerate to the imaging PID
+        crate::ez_usb::hold_8051(&interface, false, TIMEOUT)?;
         Ok(())
     }
 }

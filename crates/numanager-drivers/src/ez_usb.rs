@@ -6,6 +6,140 @@ pub const CYPRESS_VID: u16 = 0x04b4;
 pub const CYPRESS_FX2_PID: u16 = 0x8613;
 pub const CYPRESS_FX3_PID: u16 = 0x00f3;
 
+/// EZ-USB anchor-download vendor request, and the `CPUCS` register that holds
+/// (`1`) or releases (`0`) the 8051. Both are properties of the Cypress part,
+/// not of any vendor's device, so every FX2/FX3 driver here writes the same
+/// two values in the same order.
+pub const REQ_ANCHOR: u8 = 0xA0;
+pub const CPUCS: u16 = 0xE600;
+
+/// One Intel-HEX data record: where the bytes go, and the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HexRecord {
+    pub address: u16,
+    pub data: Vec<u8>,
+}
+
+/// Parse Intel-HEX text into its data records (type `00`), in file order,
+/// stopping at the end-of-file record (type `01`).
+///
+/// Records are returned individually rather than coalesced into segments: a
+/// driver that must reproduce a recorded download byte-for-byte needs the
+/// original record boundaries, and one that would rather write larger blocks
+/// can always merge them itself. Extended-address records are rejected instead
+/// of being silently ignored, since a firmware image that uses them would be
+/// loaded to the wrong place.
+pub fn parse_ihex(text: &str) -> Result<Vec<HexRecord>> {
+    let mut out = Vec::new();
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let line_number = lineno + 1;
+        let body = line.strip_prefix(':').ok_or_else(|| {
+            Error::new(
+                ErrorCode::InvalidProperty,
+                format!("Intel-HEX line {line_number}: missing ':' start code"),
+            )
+        })?;
+        if body.len() < 10 || body.len() % 2 != 0 {
+            return Err(Error::new(
+                ErrorCode::InvalidProperty,
+                format!("Intel-HEX line {line_number}: malformed record"),
+            ));
+        }
+        let bytes = (0..body.len() / 2)
+            .map(|i| u8::from_str_radix(&body[i * 2..i * 2 + 2], 16))
+            .collect::<std::result::Result<Vec<u8>, _>>()
+            .map_err(|error| {
+                Error::new(
+                    ErrorCode::InvalidProperty,
+                    format!("Intel-HEX line {line_number}: bad hex: {error}"),
+                )
+            })?;
+        let len = bytes[0] as usize;
+        if bytes.len() != len + 5 {
+            return Err(Error::new(
+                ErrorCode::InvalidProperty,
+                format!("Intel-HEX line {line_number}: length byte disagrees with record"),
+            ));
+        }
+        // Two's complement of the sum of every byte but the checksum itself.
+        let sum = bytes[..bytes.len() - 1]
+            .iter()
+            .fold(0u8, |acc, byte| acc.wrapping_add(*byte));
+        if sum.wrapping_neg() != bytes[bytes.len() - 1] {
+            return Err(Error::new(
+                ErrorCode::InvalidProperty,
+                format!("Intel-HEX line {line_number}: checksum mismatch"),
+            ));
+        }
+        match bytes[3] {
+            0x00 => out.push(HexRecord {
+                address: u16::from_be_bytes([bytes[1], bytes[2]]),
+                data: bytes[4..4 + len].to_vec(),
+            }),
+            0x01 => break,
+            other => {
+                return Err(Error::new(
+                    ErrorCode::InvalidProperty,
+                    format!("Intel-HEX line {line_number}: unsupported record type {other:#04x}"),
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One anchor-download write: `bRequest 0xA0`, `wValue` = target address.
+#[cfg(feature = "os-usb")]
+pub fn anchor_write(
+    interface: &nusb::Interface,
+    address: u16,
+    data: &[u8],
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use nusb::transfer::{Control, ControlType, Recipient};
+
+    let control = Control {
+        control_type: ControlType::Vendor,
+        recipient: Recipient::Device,
+        request: REQ_ANCHOR,
+        value: address,
+        index: 0,
+    };
+    let sent = interface
+        .control_out_blocking(control, data, timeout)
+        .map_err(|error| {
+            Error::new(
+                ErrorCode::Transport,
+                format!("EZ-USB anchor write to {address:#06x} failed: {error}"),
+            )
+        })?;
+    if sent != data.len() {
+        return Err(Error::new(
+            ErrorCode::Transport,
+            format!(
+                "EZ-USB anchor write to {address:#06x} short: {sent}/{}",
+                data.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Hold the 8051 in reset (`true`) or release it (`false`). Releasing is what
+/// makes the part renumerate under its firmware's identity.
+#[cfg(feature = "os-usb")]
+pub fn hold_8051(
+    interface: &nusb::Interface,
+    held: bool,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    anchor_write(interface, CPUCS, &[u8::from(held)], timeout)
+}
+
 /// USB vendor ids this passive loader discovery claims.
 pub fn usb_vendor_ids() -> Vec<u16> {
     vec![CYPRESS_VID]
