@@ -1691,8 +1691,17 @@ mod live_imaging {
 
         /// Arm, start, and drain exactly one frame off the bulk endpoint.
         fn stream_frame(&self, plan: &CapturePlan, expected: usize) -> Result<Vec<u8>> {
+            let timing = std::env::var_os("NUMANAGER_TIME_CAPTURE").is_some();
+            let mut mark = Instant::now();
+            let mut lap = |phase: &str| {
+                if timing {
+                    eprintln!("    {phase}: {:?}", mark.elapsed());
+                    mark = Instant::now();
+                }
+            };
             self.property(IDX_ACQUISITION, &word(ACQ_ARM))?;
             self.write_tap_registers(false)?;
+            lap("arm + tap registers");
 
             // Read on a dedicated thread. The completion future has to be
             // awaited to completion — racing it against a timer drops it and
@@ -1749,7 +1758,9 @@ mod live_imaging {
                     "Lumenera bulk reader did not queue initial reads before acquisition start",
                 )
             })?;
+            lap("reader queued");
             self.property(IDX_ACQUISITION, &word(ACQ_START))?;
+            lap("acquisition start");
 
             let deadline =
                 Instant::now() + Duration::from_micros(plan.exposure_us as u64) + READ_OVERHEAD;
@@ -1759,6 +1770,11 @@ mod live_imaging {
                 let remaining = deadline.checked_duration_since(now).unwrap_or_default();
                 match rx.recv_timeout(remaining) {
                     Ok(Ok(data)) => {
+                        if frame.is_empty() {
+                            // Everything up to here is setup; this is the camera
+                            // deciding to hand over pixels.
+                            lap("start -> first pixels (exposure + sensor)");
+                        }
                         let take = (expected - frame.len()).min(data.len());
                         frame.extend_from_slice(&data[..take]);
                     }
@@ -1779,6 +1795,7 @@ mod live_imaging {
                     }
                 }
             }
+            lap("remaining pixels over the bus");
             Ok(frame)
         }
     }
