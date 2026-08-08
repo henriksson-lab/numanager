@@ -207,12 +207,25 @@ fn bundled_blobs_are_covered_by_a_manifest() {
 }
 
 /// Appended to a size/digest mismatch when the bytes explain themselves.
+///
+/// The two ways these files go wrong without anyone touching them are an
+/// unfetched LFS object and end-of-line rewriting, and both produce a bare
+/// number mismatch that reads like data corruption. Naming them costs one
+/// `if` and saves the next person the bisect.
 fn lfs_hint(bytes: &[u8]) -> String {
     if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1") {
-        " — this file is a Git LFS pointer, not its contents; run `git lfs pull` \
-         (CI needs actions/checkout with `lfs: true`)"
-            .to_string()
-    } else {
-        String::new()
+        return " — this file is a Git LFS pointer, not its contents; run `git lfs pull` \
+                (CI needs actions/checkout with `lfs: true`)"
+            .to_string();
     }
+    let crlf = bytes.windows(2).filter(|w| w == b"\r\n").count();
+    if crlf > 0 {
+        return format!(
+            " — the file contains {crlf} CRLF line endings, so it was almost certainly \
+             rewritten on checkout: git's autocrlf is the default on Windows runners. \
+             data/third_party is marked `-text` in .gitattributes to prevent exactly \
+             this; check that the rule still covers this path"
+        );
+    }
+    String::new()
 }

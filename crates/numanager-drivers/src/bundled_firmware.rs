@@ -62,7 +62,12 @@ pub(crate) const BITSTREAM_STORE: &[u8] =
 
 /// Name of the store within `data/third_party/lumenera/`, and the file a
 /// configured `firmware_dir` is expected to hold.
+///
+/// Only read on the `os-usb` bring-up path; without that feature nothing
+/// resolves a firmware directory, so the lint is suppressed there rather than
+/// everywhere.
 #[cfg(feature = "lumenera")]
+#[cfg_attr(not(feature = "os-usb"), allow(dead_code))]
 pub(crate) const BITSTREAM_STORE_FILE: &str = "lucam-fpga.lufpga";
 
 /// Compile-time proof that no bundled blob is a Git LFS pointer.

@@ -39,6 +39,11 @@ pub(crate) const fn is_pointer(raw: &[u8]) -> bool {
 }
 
 /// The `size` field of a pointer: how large the real file is.
+///
+/// Runtime-only, and the runtime caller is the FPGA bring-up path behind
+/// `os-usb`; [`is_pointer`] is the one that is always live, because the
+/// compile-time assertions use it.
+#[cfg_attr(not(feature = "os-usb"), allow(dead_code))]
 pub(crate) fn pointer_size(raw: &[u8]) -> Option<u64> {
     std::str::from_utf8(raw)
         .ok()?
@@ -53,6 +58,10 @@ pub(crate) fn pointer_size(raw: &[u8]) -> Option<u64> {
 ///
 /// `origin` names the copy at fault ("the bitstream store at /path"), so a
 /// configured path and the bundled blob do not produce the same message.
+///
+/// Reached only when something parses a file at runtime — see
+/// [`pointer_size`] on why that is `os-usb`-shaped.
+#[cfg_attr(not(feature = "os-usb"), allow(dead_code))]
 pub(crate) fn pointer_error(raw: &[u8], origin: &str) -> Error {
     let stands_for = match pointer_size(raw) {
         Some(n) => format!("{n} bytes"),

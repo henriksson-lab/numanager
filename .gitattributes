@@ -1,1 +1,30 @@
-data/third_party/**/*.lufpga filter=lfs diff=lfs merge=lfs -text
+# Third-party device data is bytes, not text.
+#
+# These files are baked into the binary verbatim by `include_bytes!` /
+# `include_str!` (see crates/numanager-drivers/src/bundled_firmware.rs), and
+# their exact size and SHA-256 are recorded in data/third_party/*/manifest.toml.
+# Anything that rewrites them per-platform makes the embedded copy differ from
+# the recorded one — firmware that is not the firmware that was captured.
+#
+# `-text` disables git's end-of-line conversion. Without it, `core.autocrlf`
+# (the default on GitHub's Windows runners) turns LF into CRLF on checkout for
+# every file git guesses is text, adding one byte per line: fx2_vendax.hex was
+# checked out at 10713 bytes instead of 10422, and Windows builds embedded that.
+# Intel-HEX images, the captured JSONL transfer logs and the Okolab dictionary
+# are all "text" by that guess, so all of them were affected.
+data/third_party/** -text
+
+# Captured device data that lives beside its driver rather than under data/.
+# Same reasoning: `include_str!`-ed, and parsed line by line — a trailing CR
+# would ride along on the last field of every row.
+crates/numanager-drivers/src/toupcam_init_seq.jsonl -text
+crates/numanager-drivers/src/toupcam_models.tsv -text
+
+# NOTE: lucam-fpga.lufpga was tracked in Git LFS here. It is an ordinary blob
+# now (2.4 MB — unremarkable for git; GitHub warns at 50 MB, and this crate is
+# not published to crates.io, so that registry's 10 MB package limit does not
+# apply either). LFS was actively harmful for it: cargo checks out git
+# dependencies with libgit2, which never runs LFS filters, so every consumer
+# taking this crate as a git dependency got a ~130-byte pointer file instead of
+# the bitstream store, with no way to configure its way out. Do not re-add an
+# LFS filter for anything that `bundled_firmware` compiles in.
