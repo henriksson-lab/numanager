@@ -26,6 +26,9 @@
 //! (`lucam.c`, `lucam_fpga_setup`, USB 2 path). This file is therefore
 //! annotated `GPL-2.0-only`.
 
+// A pointer where the store was expected is not corruption but an unfetched LFS
+// object — `crate::lfs` owns that detection and its wording.
+use crate::lfs;
 use numanager_core::{Error, ErrorCode, Result};
 
 fn err(msg: impl Into<String>) -> Error {
@@ -90,10 +93,23 @@ fn rd_u16(b: &[u8], at: usize) -> Result<u16> {
 impl BitstreamStore {
     /// Parses a container. Only the index is read here; blobs stay packed.
     pub fn parse(raw: Vec<u8>) -> Result<Self> {
+        Self::parse_from(raw, "the Lumenera bitstream store")
+    }
+
+    /// [`parse`](Self::parse), naming where the bytes came from so an error can
+    /// say which copy is wrong — the bundled one or a configured path.
+    pub fn parse_from(raw: Vec<u8>, origin: &str) -> Result<Self> {
+        // Checked before the magic: a pointer *is* a bad magic, but reporting it
+        // as one sends the reader after a corrupt download instead of a missing
+        // LFS fetch.
+        if lfs::is_pointer(&raw) {
+            return Err(lfs::pointer_error(&raw, origin));
+        }
         if raw.len() < 12 || &raw[..8] != MAGIC {
-            return Err(err(
-                "not a Lumenera bitstream store (bad magic); rebuild it with `lucam_fpga --pack`",
-            ));
+            return Err(err(format!(
+                "{origin} is not a Lumenera bitstream store (bad magic); rebuild it \
+                 with `lucam_fpga --pack`"
+            )));
         }
         let n_entries = rd_u32(&raw, 8)? as usize;
         let mut at = 12;
@@ -153,7 +169,7 @@ impl BitstreamStore {
                 path.display()
             ))
         })?;
-        Self::parse(raw)
+        Self::parse_from(raw, &format!("the bitstream store at {}", path.display()))
     }
 
     /// Bitstreams for a camera, in programming order.
@@ -217,29 +233,36 @@ impl BitstreamStore {
     }
 }
 
+/// Checks the property [`BitstreamStore::bitstreams_for`] actually relies on:
+/// each *run* of equal keys is a complete programming set, ordered from 0.
+///
+/// A key may open more than one run. The real vendor table does exactly that —
+/// pids `0x8b`, `0x8d`, `0x92`, `0x97` and `0x9e` each appear in two or three
+/// separate runs — and the lookup is built for it: it selects the first run
+/// that matches and `break`s at the key change, so later runs are unreachable
+/// for that key and cannot contribute bitstreams.
+///
+/// An earlier revision rejected a repeated key as "non-contiguous entries".
+/// That was a stricter invariant than the lookup needs, and it was not one the
+/// vendor's table satisfies: it rejected the shipped store outright, so *every*
+/// Lumenera camera failed FPGA bring-up before a single transfer was made.
 fn validate_entry_grouping(entries: &[(u16, u16, u8, u32, u32)]) -> Result<()> {
-    let mut closed = Vec::new();
-    let mut current = None;
+    let mut current: Option<(u16, u16)> = None;
+    let mut expected_order = 0u8;
     for (pid, did, order, ..) in entries {
         let key = (*pid, *did);
-        if current == Some(key) {
-            continue;
+        if current != Some(key) {
+            current = Some(key);
+            expected_order = 0;
         }
-        if closed.contains(&key) {
+        if *order != expected_order {
             return Err(err(format!(
-                "Lumenera bitstream store has non-contiguous entries for pid={:#06x} did={:#06x}",
+                "Lumenera bitstream store has pid={:#06x} did={:#06x} at order {order}, \
+                 expected {expected_order} — a programming set must run 0, 1, 2, …",
                 key.0, key.1
             )));
         }
-        if let Some(previous) = current.replace(key) {
-            closed.push(previous);
-        }
-        if *order != 0 {
-            return Err(err(format!(
-                "Lumenera bitstream store starts pid={:#06x} did={:#06x} at order {}, expected 0",
-                key.0, key.1, order
-            )));
-        }
+        expected_order = expected_order.saturating_add(1);
     }
     Ok(())
 }
@@ -362,4 +385,155 @@ pub fn program<T: FpgaTransport>(io: &mut T, bitstreams: &[Bitstream]) -> Result
     Ok(Programmed::Completed {
         bitstreams: bitstreams.len(),
     })
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    const POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1\n\
+        oid sha256:5a27aaefc56f08f1f36c4e59ea8fe76130bac43a638ef987b12dbf1f1c6b3135\n\
+        size 2400605\n";
+
+    /// `Result::unwrap_err` wants `BitstreamStore: Debug`, and a 2.4 MB store
+    /// has no business having one just to satisfy a test.
+    fn parse_err(raw: &[u8], origin: &str) -> Error {
+        match BitstreamStore::parse_from(raw.to_vec(), origin) {
+            Ok(_) => panic!("{origin}: expected a parse error, got a store"),
+            Err(e) => e,
+        }
+    }
+
+    /// The bundled store is the one the binary actually programs from, so a
+    /// build that got past `bundled_firmware`'s assertions must still parse.
+    #[test]
+    fn the_bundled_store_parses() {
+        let store = BitstreamStore::parse(crate::bundled_firmware::BITSTREAM_STORE.to_vec())
+            .expect("the compiled-in bitstream store must parse");
+        // The Lu130 at device id 0x0018 needs two bitstreams in sequence — a
+        // property of the real store, not of any container that happens to
+        // carry the magic.
+        assert!(!store.entries.is_empty());
+    }
+
+    /// A configured `firmware_dir` can hold a pointer even when the bundled
+    /// copy is fine: the operator's checkout is not this build's checkout.
+    #[test]
+    fn a_pointer_is_diagnosed_rather_than_called_bad_magic() {
+        let e = parse_err(POINTER, "the store at /x");
+        assert!(e.message.contains("Git LFS pointer"), "{}", e.message);
+        assert!(e.message.contains("git lfs pull"), "{}", e.message);
+        // The old wording sent readers after a corrupt pack. It must not appear.
+        assert!(!e.message.contains("bad magic"), "{}", e.message);
+    }
+
+    /// Genuinely wrong bytes still report as bad magic — the LFS branch must
+    /// not swallow every parse failure.
+    #[test]
+    fn non_pointer_garbage_still_reports_bad_magic() {
+        let e = parse_err(b"not a store at all", "the store");
+        assert!(e.message.contains("bad magic"), "{}", e.message);
+    }
+
+    /// The origin is named, so an error distinguishes the bundled copy from a
+    /// configured path.
+    #[test]
+    fn errors_name_which_copy_is_wrong() {
+        let e = parse_err(POINTER, "the store at /tmp/fw");
+        assert!(e.message.contains("/tmp/fw"), "{}", e.message);
+    }
+
+    /// The vendor table opens several runs for the same key. Rejecting that
+    /// rejected the shipped store, so it is asserted on the real bytes.
+    #[test]
+    fn the_bundled_store_has_keys_in_more_than_one_run() {
+        let store = BitstreamStore::parse(crate::bundled_firmware::BITSTREAM_STORE.to_vec())
+            .expect("the compiled-in bitstream store must parse");
+        let mut runs = Vec::new();
+        let mut current = None;
+        for (pid, did, ..) in &store.entries {
+            if current != Some((*pid, *did)) {
+                current = Some((*pid, *did));
+                runs.push((*pid, *did));
+            }
+        }
+        let mut repeated: Vec<_> = runs
+            .iter()
+            .filter(|k| runs.iter().filter(|o| o == k).count() > 1)
+            .collect();
+        repeated.dedup();
+        assert!(
+            !repeated.is_empty(),
+            "expected the vendor table to reopen keys; if it no longer does, the \
+             relaxed grouping rule in validate_entry_grouping is untested"
+        );
+    }
+
+    /// End-to-end on the camera this repository is actually driving: the Gel
+    /// Doc EZ's imaging-stage pid. Parsing proves the index; this proves the
+    /// blob offsets and the zstd payload, which is what bring-up sends.
+    #[test]
+    fn the_bundled_store_yields_bitstreams_for_the_gel_doc_ez() {
+        let store = BitstreamStore::parse(crate::bundled_firmware::BITSTREAM_STORE.to_vec())
+            .expect("the compiled-in bitstream store must parse");
+        let imaging_pid = crate::lumenera::IMAGING_PID;
+
+        let dids = store.known_device_ids(imaging_pid);
+        assert!(
+            !dids.is_empty(),
+            "the store covers no device id for pid {imaging_pid:#06x}"
+        );
+
+        for did in dids {
+            let sets = store
+                .bitstreams_for(imaging_pid, did)
+                .unwrap_or_else(|e| panic!("pid={imaging_pid:#06x} did={did:#06x}: {e}"));
+            assert!(
+                !sets.is_empty(),
+                "pid={imaging_pid:#06x} did={did:#06x} resolved to no bitstreams"
+            );
+            for (n, bitstream) in sets.iter().enumerate() {
+                assert!(
+                    !bitstream.data.is_empty(),
+                    "pid={imaging_pid:#06x} did={did:#06x} bitstream {n} decompressed to nothing"
+                );
+            }
+        }
+    }
+
+    /// Relaxing the run rule must not relax the ordering rule: a set that does
+    /// not start at 0 is still a broken set.
+    #[test]
+    fn a_run_that_does_not_start_at_zero_is_rejected() {
+        // pid, did, order, code, blob
+        let entries = [(0x92u16, 0u16, 1u8, 0u32, 0u32)];
+        let e = validate_entry_grouping(&entries).unwrap_err();
+        assert!(e.message.contains("expected 0"), "{}", e.message);
+    }
+
+    /// A gap inside one run is a missing bitstream, and the camera would be
+    /// programmed with an incomplete set.
+    #[test]
+    fn a_gap_inside_a_run_is_rejected() {
+        let entries = [
+            (0x92u16, 0u16, 0u8, 0u32, 0u32),
+            (0x92, 0, 2, 0, 1), // order 1 missing
+        ];
+        let e = validate_entry_grouping(&entries).unwrap_err();
+        assert!(e.message.contains("expected 1"), "{}", e.message);
+    }
+
+    /// The shape the old rule forbade: the same key opening a second complete
+    /// run later in the table.
+    #[test]
+    fn a_key_may_open_a_later_run() {
+        let entries = [
+            (0x92u16, 0u16, 0u8, 0u32, 0u32),
+            (0x92, 0, 1, 0, 1),
+            (0x97, 0, 0, 0, 2),
+            (0x92, 0, 0, 0, 3), // reopened — legal
+            (0x92, 0, 1, 0, 4),
+        ];
+        assert!(validate_entry_grouping(&entries).is_ok());
+    }
 }

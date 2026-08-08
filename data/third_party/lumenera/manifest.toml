@@ -43,6 +43,15 @@ license_note = "third-party data; not covered by repo MIT/Apache-2.0"
 note = "Streamed to bulk endpoint 0x08 during imaging-stage bring-up; without it the sensor pipeline never produces frames. Byte-identical to the payload observed on the wire (capture 2026-08-06)."
 
 [[file]]
+name = "lucam-fpga.lufpga"
+platform = "packed FPGA bitstream store, all models"
+sha256 = "5a27aaefc56f08f1f36c4e59ea8fe76130bac43a638ef987b12dbf1f1c6b3135"
+size_bytes = 2400605
+selector = "keyed by (product id, device id)"
+license_note = "third-party data; not covered by repo MIT/Apache-2.0"
+note = "Built by `lucam_fpga --pack`; 108 (pid, did) references over 38 distinct blobs. Git LFS tracks this file, so a checkout that did not run the smudge filter leaves a ~130-byte pointer here — cargo git dependencies always do. The digest below is what distinguishes the two; see tests/third_party_data.rs."
+
+[[file]]
 name = "lumenera_init_lu130.jsonl"
 platform = "lu130 post-configuration register load"
 sha256 = "b3f889a967403ec44ff59135c837411983d708b0f85033953add583ec4f28b50"

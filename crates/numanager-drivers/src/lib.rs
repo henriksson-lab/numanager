@@ -20,6 +20,7 @@ pub mod ez_usb;
 pub mod genicam;
 pub mod gige_vision;
 pub mod hamilton_mvp;
+mod lfs;
 pub mod lumencor;
 #[cfg(feature = "lumenera")]
 pub mod lumenera;

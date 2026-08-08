@@ -31,6 +31,13 @@ serde_json = "1"
 serialport = { version = "4", optional = true }
 sha2 = "0.10"
 
+# Integration tests under `tests/` do not inherit the entries above — they link
+# the crate, not its dependency graph. `tests/third_party_data.rs` verifies the
+# recorded SHA-256 of every bundled blob, so it needs these in its own right.
+[dev-dependencies]
+hex = "0.4"
+sha2 = "0.10"
+
 # Always present on Windows regardless of features: see the note above.
 [target.'cfg(windows)'.dependencies]
 numanager-winusb = { path = "../numanager-winusb" }

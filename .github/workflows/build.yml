@@ -36,6 +36,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        # `lfs: true` is required, not a nicety: data/third_party's bitstream
+        # store is LFS-tracked and `bundled_firmware` compiles it in. Without
+        # the smudge, the checkout holds a ~130-byte pointer, and a build here
+        # would embed that pointer — which is exactly what the compile-time
+        # assertions in bundled_firmware.rs now refuse to do. Note this covers
+        # *this* repository only; it does nothing for consumers that take this
+        # crate as a cargo git dependency, because cargo checks those out with
+        # libgit2, which never runs LFS filters.
+        with:
+          lfs: true
+
+      # Proves the LFS objects actually arrived, with a message that names the
+      # cause. Without it the next failure is a compile-time assertion whose
+      # text is right but whose timing makes it look like a code error.
+      - name: Verify third-party data is real (not LFS pointers)
+        shell: bash
+        run: |
+          if grep -rl --include='*' 'https://git-lfs.github.com/spec/v1' data/third_party/ 2>/dev/null | grep -q .; then
+            echo "::error::data/third_party contains Git LFS pointers, not file contents."
+            echo "The checkout did not fetch LFS objects. Ensure actions/checkout has 'lfs: true'."
+            grep -rl 'https://git-lfs.github.com/spec/v1' data/third_party/
+            exit 1
+          fi
+          echo "All third-party blobs are real files."
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -60,3 +84,11 @@ jobs:
 
       - name: Build (GUI example)
         run: cargo build --workspace --features numanager-examples/gui
+
+      # The builds above compile test code but never run it, so nothing checked
+      # that the bundled third-party blobs are the files they claim to be —
+      # sizes and digests against data/third_party/*/manifest.toml, and the
+      # packed bitstream store actually resolving to programmable bitstreams.
+      # Those are what catch a wrong file that still compiles.
+      - name: Test
+        run: cargo test --workspace

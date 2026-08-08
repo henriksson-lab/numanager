@@ -2156,27 +2156,39 @@ mod live_imaging {
         /// Best-effort by construction: this runs on a path that has already
         /// failed, so a read error becomes part of the report rather than
         /// replacing the original error.
-        /// Bitstream store, loaded from `firmware_dir` on first use.
+        /// The bitstream store: a configured `firmware_dir` if it holds one,
+        /// otherwise the copy compiled into this binary.
+        ///
+        /// Same precedence as [`crate::bundled_firmware`]: a configured path
+        /// overrides, and is never a prerequisite. Earlier revisions instead
+        /// fell back to `default_firmware_dir()`, which is derived from
+        /// `CARGO_MANIFEST_DIR` — a path on whatever machine did the build. It
+        /// existed for a developer running from the source tree and for nobody
+        /// else, so shipped binaries and cargo git-dependency consumers had no
+        /// store at all and discovered it during FPGA bring-up.
         fn bitstream_store(dir: Option<&str>) -> Result<crate::lumenera_fpga::BitstreamStore> {
-            let name = "lucam-fpga.lufpga";
-            if let Some(dir) = dir {
-                let path = std::path::Path::new(dir).join(name);
-                match crate::lumenera_fpga::BitstreamStore::load(&path) {
-                    Ok(store) => return Ok(store),
-                    Err(configured_error) => {
-                        let fallback = std::path::Path::new(&default_firmware_dir()).join(name);
-                        if fallback != path {
-                            if let Ok(store) = crate::lumenera_fpga::BitstreamStore::load(&fallback)
-                            {
-                                return Ok(store);
-                            }
-                        }
-                        return Err(configured_error);
-                    }
-                }
+            let bundled = || {
+                crate::lumenera_fpga::BitstreamStore::parse_from(
+                    crate::bundled_firmware::BITSTREAM_STORE.to_vec(),
+                    "the bundled Lumenera bitstream store",
+                )
+            };
+            let Some(dir) = dir else {
+                return bundled();
+            };
+            let path =
+                std::path::Path::new(dir).join(crate::bundled_firmware::BITSTREAM_STORE_FILE);
+            // A configured directory that simply does not carry a store is the
+            // ordinary case (it is set by default), so fall through quietly.
+            // A store that is present but unreadable is reported, because the
+            // operator asked for that file specifically.
+            if !path.exists() {
+                return bundled();
             }
-            let path = std::path::Path::new(&default_firmware_dir()).join(name);
-            crate::lumenera_fpga::BitstreamStore::load(&path)
+            match crate::lumenera_fpga::BitstreamStore::load(&path) {
+                Ok(store) => Ok(store),
+                Err(configured_error) => bundled().map_err(|_| configured_error),
+            }
         }
 
         /// Program the FPGA for this camera, following the GPL SDK's
