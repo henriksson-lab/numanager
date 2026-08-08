@@ -1604,18 +1604,65 @@ mod live_imaging {
                             )
                         })?
                 } else if let Some(serial) = &identity.serial {
-                    candidates
-                        .into_iter()
-                        .find(|device| device.serial_number() == Some(serial.as_str()))
+                    // The serial in hand was read from the **loader** stage, and a
+                    // camera does not have to keep it across renumeration. The
+                    // Lu130 does not: it answers with the EZ-USB placeholder
+                    // `000000000` before firmware and its real serial (`19020090`
+                    // on the bench unit) after. Requiring an exact match therefore
+                    // found nothing on a perfectly healthy camera, and the error
+                    // named a serial that no device would ever report — pointing
+                    // the reader at the camera instead of at the assumption.
+                    //
+                    // Take an exact match when there is one, since a unit whose
+                    // loader serial is real is the case this was written for.
+                    // Otherwise identify the renumerated node by where it sits:
+                    // it comes back on the bus it left.
+                    let present = || -> String {
+                        candidates
+                            .iter()
+                            .map(|device| {
+                                format!(
+                                    "{} at bus {} addr {}",
+                                    device.serial_number().unwrap_or("<no serial>"),
+                                    device.bus_number(),
+                                    device.device_address()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    let sole_on_bus = || {
+                        let mut on_bus = candidates
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, device)| device.bus_number() == identity.bus_number);
+                        let (index, _) = on_bus.next()?;
+                        on_bus.next().is_none().then_some(index)
+                    };
+                    let chosen = candidates
+                        .iter()
+                        .position(|device| device.serial_number() == Some(serial.as_str()))
+                        .or_else(sole_on_bus)
+                        .or_else(|| (candidates.len() == 1).then_some(0))
                         .ok_or_else(|| {
                             Error::new(
                                 ErrorCode::Transport,
                                 format!(
                                     "Lumenera imaging device {vendor_id:04x}:{product_id:04x} \
-                                     with serial {serial} is not present after firmware initialization"
+                                     could not be identified after firmware initialization. \
+                                     The loader reported serial {serial}, which a camera need \
+                                     not keep across renumeration, and the bus it was on \
+                                     (bus {}) does not carry exactly one imaging device. \
+                                     Imaging devices present: [{}]",
+                                    identity.bus_number,
+                                    present()
                                 ),
                             )
-                        })?
+                        })?;
+                    candidates
+                        .into_iter()
+                        .nth(chosen)
+                        .expect("index came from this same list")
                 } else {
                     let mut iter = candidates.into_iter();
                     let first = iter.next().ok_or_else(|| {
@@ -1779,7 +1826,28 @@ mod live_imaging {
                 self.device_id,
                 self.firmware_dir.clone().as_deref(),
             )? {
-                Programmed::AlreadyDone | Programmed::NotApplicable => {}
+                // Every outcome is reported, not just the one that did work.
+                // "Nothing printed" covered both *skipped because already
+                // programmed* and *skipped because the store covers no
+                // bitstream for this camera* — two very different states that
+                // present identically downstream, as a STALL on the first
+                // register write of a capture.
+                Programmed::AlreadyDone => {
+                    if std::env::var_os("NUMANAGER_TIME_CAPTURE").is_some() {
+                        eprintln!(
+                            "  FPGA reports already programmed (bit 5 set) — skipped. \
+                             Power-cycle the camera to force a fresh program."
+                        );
+                    }
+                }
+                Programmed::NotApplicable => {
+                    if std::env::var_os("NUMANAGER_TIME_CAPTURE").is_some() {
+                        eprintln!(
+                            "  no FPGA bitstream for pid={:#06x} did={:#06x} — programming skipped",
+                            self.product_id, self.device_id
+                        );
+                    }
+                }
                 Programmed::Completed { bitstreams } => {
                     if std::env::var_os("NUMANAGER_TIME_CAPTURE").is_some() {
                         eprintln!("  programmed {bitstreams} FPGA bitstream(s)");
