@@ -31,9 +31,14 @@ const IMAGES: &[(&str, &str)] = &[
     bundled!("andor", "fx2_temp_prog.hex"),
     bundled!("andor", "fx2_usbcam.hex"),
     bundled!("andor", "fx2_vendax.hex"),
+    #[cfg(feature = "lumenera")]
     bundled!("lumenera", "lumenera_fw_img00.hex"),
+    #[cfg(feature = "lumenera")]
     bundled!("lumenera", "lumenera_fw_img01.hex"),
-    bundled!("lumenera", "lumenera_fw_img16.hex"),
+    #[cfg(feature = "lumenera")]
+    bundled!("lumenera", "lumenera_fw_img10.hex"),
+    #[cfg(feature = "lumenera")]
+    bundled!("lumenera", "lumenera_fw_img18.hex"),
 ];
 
 // The captured `lumenera_fpga_lu130.bin` was compiled in here. It was one
@@ -45,11 +50,11 @@ const IMAGES: &[(&str, &str)] = &[
 /// Recorded control-transfer sequences, replayed verbatim during bring-up where
 /// the individual transfers are not decoded. Same treatment as [`IMAGES`]:
 /// third-party data, compiled in so a device works with no `data/` directory.
-#[cfg(feature = "os-usb")]
+#[cfg(all(feature = "os-usb", feature = "lumenera"))]
 const SEQUENCES: &[(&str, &str)] = &[bundled!("lumenera", "lumenera_init_lu130.jsonl")];
 
 /// The compiled-in recorded sequence with this exact file name.
-#[cfg(feature = "os-usb")]
+#[cfg(all(feature = "os-usb", feature = "lumenera"))]
 pub(crate) fn sequence_by_name(name: &str) -> Option<&'static str> {
     let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
     SEQUENCES
@@ -57,7 +62,6 @@ pub(crate) fn sequence_by_name(name: &str) -> Option<&'static str> {
         .find(|(seq, _)| *seq == file)
         .map(|(_, text)| *text)
 }
-
 
 /// The compiled-in image with this exact file name, or `None` when it is not
 /// bundled. `name` may be a bare file name or a path — only the final component

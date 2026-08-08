@@ -45,12 +45,12 @@ pub struct UsbVendorClaim {
 /// discovery registration and the vendor-id claims from that single list — so
 /// the access rules a host installs cannot drift from the drivers that probe.
 macro_rules! builtin_usb_drivers {
-    ($($driver:literal => $module:ident :: $discovery:ident),* $(,)?) => {
+    ($($(#[$meta:meta])* $driver:literal => $module:ident :: $discovery:ident),* $(,)?) => {
         /// Register every builtin USB VID/PID discovery.
         pub fn register_builtin_usb_vid_pid_discovery(registry: &mut DiscoveryRegistry) {
             #[cfg(feature = "os-usb")]
             {
-                $( registry.register_factory(crate::$module::$discovery::os_usb); )*
+                $( $(#[$meta])* registry.register_factory(crate::$module::$discovery::os_usb); )*
             }
 
             #[cfg(not(feature = "os-usb"))]
@@ -66,6 +66,7 @@ macro_rules! builtin_usb_drivers {
         pub fn builtin_usb_vendor_claims() -> Vec<UsbVendorClaim> {
             let mut claims = Vec::new();
             $(
+                $(#[$meta])*
                 for vendor_id in crate::$module::usb_vendor_ids() {
                     claims.push(UsbVendorClaim { driver: $driver, vendor_id });
                 }
@@ -77,7 +78,12 @@ macro_rules! builtin_usb_drivers {
 
         /// The drivers behind [`builtin_usb_vendor_claims`], in declaration order.
         pub fn builtin_usb_driver_names() -> Vec<&'static str> {
-            vec![$($driver),*]
+            let mut names = Vec::new();
+            $(
+                $(#[$meta])*
+                names.push($driver);
+            )*
+            names
         }
     };
 }
@@ -85,6 +91,7 @@ macro_rules! builtin_usb_drivers {
 builtin_usb_drivers! {
     "ez-usb-loader" => ez_usb::EzUsbLoaderDiscovery,
     "andor-camera" => andor_camera::AndorCameraDiscovery,
+    #[cfg(feature = "lumenera")]
     "lumenera" => lumenera::LumeneraDiscovery,
     "mcl" => mcl::MclDiscovery,
     "toupcam" => toupcam::ToupcamDiscovery,

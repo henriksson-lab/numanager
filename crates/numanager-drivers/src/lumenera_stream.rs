@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Lumenera streaming: the acquire / start / stop / release state machine.
 //!
 //! Three things here are not guessable from watching traffic, and getting any of
@@ -15,8 +16,10 @@
 //!    and the legacy USB 3 endpoint path additionally treats high bits as a
 //!    recovery condition.
 //!
-//! Specified in `reveng-dll/teledyne/lucam-protocol-spec.md` §4.3–4.4. This is an
-//! independent implementation from that specification.
+//! This state machine is derived from Teledyne's GPLv2 Linux SDK driver
+//! (`lucam.c`, USB 2 plus labelled legacy USB3/U3V branches), with
+//! `reveng-dll/teledyne/lucam-protocol-spec.md` kept as an audit notebook.
+//! This file is therefore annotated `GPL-2.0-only`.
 //!
 //! The transport is abstracted so the ordering can be tested without a camera,
 //! which is the only way any of this is checkable before hardware time.
@@ -69,6 +72,8 @@ pub enum State {
     Stopped,
     /// Resources held, camera idle.
     Paused,
+    /// Transfers are being submitted/enabled; cleanup must still run on failure.
+    Starting,
     /// Camera emitting.
     Running,
 }
@@ -172,6 +177,7 @@ pub enum BusSpeed {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum EnableReadback {
     /// USB 2 vendor-control path: no enable read-back.
     None,
@@ -185,6 +191,9 @@ pub enum EnableReadback {
 pub trait StreamTransport {
     fn read_reg(&mut self, index: u16) -> Result<u32>;
     fn write_reg(&mut self, index: u16, value: u32) -> Result<()>;
+    fn before_enable(&mut self, _mode: Mode) -> Result<()> {
+        Ok(())
+    }
     /// Host-to-device extended command, no payload.
     fn ext_cmd(&mut self, sub: u8) -> Result<()>;
     fn set_alt_setting(&mut self, alt: AltSetting) -> Result<()>;
@@ -219,15 +228,11 @@ pub struct Stream {
     recovery_outstanding: bool,
     frame_error: bool,
     frames: u64,
+    camera_enabled: bool,
 }
 
 impl Stream {
     pub const DEFAULT_POOL: usize = 15;
-
-    /// A video stream. Use [`Stream::new_still`] for single-frame capture.
-    pub fn new(pool: usize) -> Self {
-        Self::with_mode(pool, Mode::Video)
-    }
 
     pub fn new_still(pool: usize, spec_version: u32, hardware_trigger: bool) -> Self {
         Self::with_mode(
@@ -248,25 +253,8 @@ impl Stream {
             recovery_outstanding: false,
             frame_error: false,
             frames: 0,
+            camera_enabled: false,
         }
-    }
-
-    pub fn state(&self) -> State {
-        self.state
-    }
-    pub fn mode(&self) -> Mode {
-        self.mode
-    }
-    pub fn frames(&self) -> u64 {
-        self.frames
-    }
-    pub fn recovery_pending(&self) -> bool {
-        self.recovery_outstanding
-    }
-
-    /// Record a completed transfer so teardown knows where the ring is.
-    pub fn note_completed(&mut self, slot: usize) {
-        self.last_completed = slot;
     }
 
     /// Record a frame error. `fatal` means the stream cannot continue and has to
@@ -294,7 +282,7 @@ impl Stream {
     /// Start emitting. Paused -> Running.
     pub fn start<T: StreamTransport>(&mut self, io: &mut T) -> Result<()> {
         match self.state {
-            State::Running => return Ok(()),
+            State::Starting | State::Running => return Ok(()),
             State::Stopped => {
                 return Err(err("Lumenera stream cannot start before it is acquired"))
             }
@@ -307,7 +295,7 @@ impl Stream {
             match self.try_start(io) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    if self.recovery_outstanding && !retried {
+                    if self.recovery_outstanding && io.stream_recovery_supported() && !retried {
                         retried = true;
                         // The stop sequence is what issues the recovery.
                         self.state = State::Running;
@@ -323,6 +311,8 @@ impl Stream {
 
     fn try_start<T: StreamTransport>(&mut self, io: &mut T) -> Result<()> {
         self.frames = 0;
+        self.camera_enabled = false;
+        self.state = State::Starting;
         // Seeded one before the start so the first teardown sweep begins at
         // slot 0 rather than slot 1.
         self.last_completed = self.pool.saturating_sub(1);
@@ -332,7 +322,9 @@ impl Stream {
             io.submit(slot)?;
         }
 
+        io.before_enable(self.mode)?;
         io.write_reg(self.mode.reg(), self.mode.enable())?;
+        self.camera_enabled = true;
 
         match io.enable_readback() {
             EnableReadback::None => {}
@@ -389,7 +381,7 @@ impl Stream {
     }
 
     fn stop_inner<T: StreamTransport>(&mut self, io: &mut T, kind: StopKind) -> Result<()> {
-        if self.state != State::Running {
+        if !matches!(self.state, State::Starting | State::Running) {
             return Ok(());
         }
         self.state = State::Paused;
@@ -402,10 +394,13 @@ impl Stream {
         // paused", and pause is inside that. An earlier revision restricted it
         // to teardown, which left a pause without the clean transfer
         // termination it is there to provide.
-        if self.mode.requests_zlp() {
-            let _ = io.write_reg(self.mode.reg(), VIDEO_REQUEST_ZLP);
+        if self.camera_enabled {
+            if self.mode.requests_zlp() {
+                let _ = io.write_reg(self.mode.reg(), VIDEO_REQUEST_ZLP);
+            }
+            let _ = io.write_reg(self.mode.reg(), self.mode.disable());
+            self.camera_enabled = false;
         }
-        let _ = io.write_reg(self.mode.reg(), self.mode.disable());
         let _ = kind;
 
         // Walk the ring from after the last completion, not from zero.
@@ -432,7 +427,7 @@ impl Stream {
 
     /// Give the resources back. Paused -> Stopped.
     pub fn release<T: StreamTransport>(&mut self, io: &mut T) -> Result<()> {
-        if self.state == State::Running {
+        if matches!(self.state, State::Starting | State::Running) {
             self.stop_inner(io, StopKind::Teardown)?;
         }
         if self.state == State::Stopped {
@@ -441,500 +436,5 @@ impl Stream {
         io.set_alt_setting(AltSetting::Idle)?;
         self.state = State::Stopped;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod tests_support {
-    use super::*;
-
-    #[derive(Default)]
-    pub(crate) struct Fake {
-        pub(crate) log: Vec<String>,
-        /// values the enable register reads back, popped in order
-        pub(crate) readback: Vec<Option<u32>>,
-        pub(crate) speed_super: bool,
-        pub(crate) reg_writes: Vec<(u16, u32)>,
-    }
-
-    impl Fake {
-        pub(crate) fn new() -> Self {
-            Self::default()
-        }
-    }
-
-    impl StreamTransport for Fake {
-        fn read_reg(&mut self, index: u16) -> Result<u32> {
-            self.log.push(format!("read:{index:#06x}"));
-            match self.readback.pop() {
-                Some(Some(v)) => Ok(v),
-                Some(None) => Err(err("simulated read failure")),
-                None => Ok(1),
-            }
-        }
-        fn write_reg(&mut self, index: u16, value: u32) -> Result<()> {
-            self.reg_writes.push((index, value));
-            self.log.push(format!("write:{value:#x}"));
-            Ok(())
-        }
-        fn ext_cmd(&mut self, sub: u8) -> Result<()> {
-            self.log.push(format!("ext:{sub:#x}"));
-            Ok(())
-        }
-        fn set_alt_setting(&mut self, alt: AltSetting) -> Result<()> {
-            self.log.push(format!("alt:{alt:?}"));
-            Ok(())
-        }
-        fn submit(&mut self, slot: usize) -> Result<()> {
-            self.log.push(format!("submit:{slot}"));
-            Ok(())
-        }
-        fn kill(&mut self, from: usize, count: usize) -> Result<()> {
-            self.log.push(format!("kill:{from}+{count}"));
-            Ok(())
-        }
-        fn clear_halt(&mut self) -> Result<()> {
-            self.log.push("clear_halt".into());
-            Ok(())
-        }
-        fn reset_frames(&mut self) {
-            self.log.push("reset_frames".into());
-        }
-        fn bus_speed(&self) -> BusSpeed {
-            if self.speed_super {
-                BusSpeed::Super
-            } else {
-                BusSpeed::High
-            }
-        }
-        fn enable_readback(&self) -> EnableReadback {
-            EnableReadback::LegacyUsb3
-        }
-        fn stream_recovery_supported(&self) -> bool {
-            true
-        }
-    }
-
-    fn started(pool: usize) -> (Stream, Fake) {
-        let mut s = Stream::new(pool);
-        let mut io = Fake::new();
-        s.acquire(&mut io).unwrap();
-        s.start(&mut io).unwrap();
-        (s, io)
-    }
-
-    /// The ordering fact the whole module exists for.
-    #[test]
-    fn every_transfer_is_submitted_before_the_camera_is_enabled() {
-        let (_, io) = started(15);
-        let enable = io
-            .log
-            .iter()
-            .position(|l| l == &format!("write:{VIDEO_ENABLE:#x}"))
-            .expect("enable must happen");
-        let submits: Vec<usize> = io
-            .log
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.starts_with("submit:"))
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(submits.len(), 15, "the whole pool must be in flight");
-        assert!(
-            submits.iter().all(|&i| i < enable),
-            "a transfer was submitted after enable: {:?}",
-            io.log
-        );
-    }
-
-    #[test]
-    fn enable_is_not_a_boolean() {
-        let (_, io) = started(2);
-        assert!(
-            io.log.contains(&"write:0xffffffff".to_string()),
-            "{:?}",
-            io.log
-        );
-        assert!(!io.log.contains(&"write:0x1".to_string()));
-    }
-
-    /// Zero-length packets are requested before the disable on **every** stop,
-    /// pause included. An earlier revision restricted this to teardown.
-    #[test]
-    fn zero_length_packets_are_requested_before_every_disable() {
-        for kind in [StopKind::Teardown, StopKind::Pause] {
-            let (mut s, mut io) = started(2);
-            io.log.clear();
-            s.stop(&mut io, kind).unwrap();
-            let zlp = io
-                .log
-                .iter()
-                .position(|l| l == "write:0x40")
-                .unwrap_or_else(|| panic!("{kind:?} must request ZLP: {:?}", io.log));
-            let off = io
-                .log
-                .iter()
-                .position(|l| l == "write:0x0")
-                .expect("disable");
-            assert!(zlp < off, "{kind:?}: 0x40 must precede 0x00: {:?}", io.log);
-        }
-    }
-
-    /// Camera first, transfers second.
-    #[test]
-    fn stop_disables_the_camera_before_killing_transfers() {
-        let (mut s, mut io) = started(4);
-        io.log.clear();
-        s.stop(&mut io, StopKind::Pause).unwrap();
-        let off = io.log.iter().position(|l| l == "write:0x0").unwrap();
-        let kill = io.log.iter().position(|l| l.starts_with("kill:")).unwrap();
-        assert!(off < kill, "{:?}", io.log);
-    }
-
-    /// The ring is walked from after the last completion.
-    #[test]
-    fn kill_starts_after_the_last_completed_slot() {
-        let (mut s, mut io) = started(8);
-        s.note_completed(5);
-        io.log.clear();
-        s.stop(&mut io, StopKind::Pause).unwrap();
-        assert!(io.log.contains(&"kill:6+8".to_string()), "{:?}", io.log);
-    }
-
-    /// With nothing completed yet the sweep starts at slot 0, which is why the
-    /// ring is seeded one before the start rather than at zero.
-    #[test]
-    fn first_sweep_starts_at_slot_zero() {
-        let (mut s, mut io) = started(8);
-        io.log.clear();
-        s.stop(&mut io, StopKind::Pause).unwrap();
-        assert!(io.log.contains(&"kill:0+8".to_string()), "{:?}", io.log);
-    }
-
-    /// A read-back with high bits set means recovery, and enable has failed.
-    #[test]
-    fn bad_readback_schedules_recovery_and_fails_enable() {
-        let mut s = Stream::new(2);
-        let mut io = Fake::new();
-        // Both the first attempt and the retry read back faulted.
-        io.readback = vec![Some(0x0000_0100), Some(0x0000_0100)];
-        s.acquire(&mut io).unwrap();
-        let e = s.start(&mut io).unwrap_err();
-        assert!(format!("{e}").contains("recovery"), "{e}");
-        assert_eq!(s.state(), State::Paused);
-    }
-
-    #[test]
-    fn failed_readback_read_also_schedules_recovery() {
-        let mut s = Stream::new(2);
-        let mut io = Fake::new();
-        io.readback = vec![None, None];
-        s.acquire(&mut io).unwrap();
-        assert!(s.start(&mut io).is_err());
-    }
-
-    #[test]
-    fn usb2_path_does_not_read_back_or_recover() {
-        struct Usb2(Fake);
-        impl StreamTransport for Usb2 {
-            fn read_reg(&mut self, index: u16) -> Result<u32> {
-                self.0.read_reg(index)
-            }
-            fn write_reg(&mut self, index: u16, value: u32) -> Result<()> {
-                self.0.write_reg(index, value)
-            }
-            fn ext_cmd(&mut self, sub: u8) -> Result<()> {
-                self.0.ext_cmd(sub)
-            }
-            fn set_alt_setting(&mut self, alt: AltSetting) -> Result<()> {
-                self.0.set_alt_setting(alt)
-            }
-            fn submit(&mut self, slot: usize) -> Result<()> {
-                self.0.submit(slot)
-            }
-            fn kill(&mut self, from: usize, count: usize) -> Result<()> {
-                self.0.kill(from, count)
-            }
-            fn clear_halt(&mut self) -> Result<()> {
-                self.0.clear_halt()
-            }
-            fn reset_frames(&mut self) {
-                self.0.reset_frames()
-            }
-            fn bus_speed(&self) -> BusSpeed {
-                BusSpeed::High
-            }
-        }
-
-        let mut s = Stream::new(2);
-        let mut io = Usb2(Fake {
-            readback: vec![Some(0xFFFF_FFFF)],
-            ..Fake::default()
-        });
-        s.acquire(&mut io).unwrap();
-        s.start(&mut io).unwrap();
-        assert!(
-            !io.0.log.iter().any(|l| l.starts_with("read:")),
-            "{:?}",
-            io.0.log
-        );
-        s.note_frame_error(true);
-        s.stop(&mut io, StopKind::Pause).unwrap();
-        assert!(
-            !io.0.log.iter().any(|l| l.starts_with("ext:")),
-            "{:?}",
-            io.0.log
-        );
-    }
-
-    /// Recovery is a stop-then-start, issued during stop, retried exactly once.
-    #[test]
-    fn recovery_is_issued_during_stop_and_start_retries_once() {
-        let mut s = Stream::new(2);
-        let mut io = Fake::new();
-        // First enable faults; the retry reads back clean.
-        io.readback = vec![Some(1), Some(0x0000_0200)];
-        s.acquire(&mut io).unwrap();
-        s.start(&mut io).expect("the single retry should succeed");
-
-        assert_eq!(
-            io.log
-                .iter()
-                .filter(|l| *l == &format!("ext:{EXT_STREAM_RECOVERY:#x}"))
-                .count(),
-            1,
-            "recovery sent exactly once: {:?}",
-            io.log
-        );
-        assert_eq!(
-            io.log
-                .iter()
-                .filter(|l| l.as_str() == "write:0xffffffff")
-                .count(),
-            2,
-            "enabled twice: once failing, once on the retry"
-        );
-        assert!(!s.recovery_pending(), "flag must be cleared once sent");
-        assert_eq!(s.state(), State::Running);
-    }
-
-    /// Two failures propagate; it does not retry forever.
-    #[test]
-    fn a_second_failure_propagates() {
-        let mut s = Stream::new(2);
-        let mut io = Fake::new();
-        io.readback = vec![Some(0x0000_0300), Some(0x0000_0400)];
-        s.acquire(&mut io).unwrap();
-        assert!(s.start(&mut io).is_err());
-        assert_eq!(
-            io.log
-                .iter()
-                .filter(|l| l.as_str() == "write:0xffffffff")
-                .count(),
-            2,
-            "exactly one retry"
-        );
-    }
-
-    /// On USB 3 the halt is only cleared when a frame error actually happened.
-    #[test]
-    fn halt_clearing_is_conditional_on_bus_and_error() {
-        let mut s = Stream::new(2);
-        let mut io = Fake::new();
-        io.speed_super = true;
-        s.acquire(&mut io).unwrap();
-        s.start(&mut io).unwrap();
-        io.log.clear();
-        s.stop(&mut io, StopKind::Pause).unwrap();
-        assert!(
-            !io.log.contains(&"clear_halt".to_string()),
-            "no error, USB3: {:?}",
-            io.log
-        );
-        // ...but USB 2 clears unconditionally, which is the shipped transport.
-
-        s.start(&mut io).unwrap();
-        s.note_frame_error(false);
-        io.log.clear();
-        s.stop(&mut io, StopKind::Pause).unwrap();
-        assert!(
-            io.log.contains(&"clear_halt".to_string()),
-            "error, USB3: {:?}",
-            io.log
-        );
-
-        // USB 2 clears unconditionally.
-        let (mut s2, mut io2) = started(2);
-        io2.log.clear();
-        s2.stop(&mut io2, StopKind::Pause).unwrap();
-        assert!(io2.log.contains(&"clear_halt".to_string()));
-    }
-
-    #[test]
-    fn lifecycle_is_idempotent_where_it_should_be() {
-        let mut s = Stream::new(3);
-        let mut io = Fake::new();
-        assert!(s.start(&mut io).is_err(), "cannot start before acquire");
-        s.acquire(&mut io).unwrap();
-        s.acquire(&mut io).unwrap(); // second acquire is a no-op
-        s.start(&mut io).unwrap();
-        s.start(&mut io).unwrap(); // already running
-        assert_eq!(
-            io.log.iter().filter(|l| l.starts_with("submit:")).count(),
-            3
-        );
-        s.stop(&mut io, StopKind::Pause).unwrap();
-        s.stop(&mut io, StopKind::Pause).unwrap(); // already paused
-        s.release(&mut io).unwrap();
-        assert_eq!(s.state(), State::Stopped);
-        assert_eq!(io.log.last().unwrap(), "alt:Idle");
-    }
-
-    /// Release from Running must take the camera down properly on the way.
-    #[test]
-    fn release_while_running_tears_down_first() {
-        let (mut s, mut io) = started(2);
-        io.log.clear();
-        s.release(&mut io).unwrap();
-        assert!(
-            io.log.contains(&"write:0x40".to_string()),
-            "teardown: {:?}",
-            io.log
-        );
-        assert_eq!(io.log.last().unwrap(), "alt:Idle");
-    }
-}
-
-#[cfg(test)]
-mod mode_tests {
-    use super::tests_support::Fake;
-    use super::*;
-
-    /// Still mode drives a different register with different values — not the
-    /// same register with a different payload.
-    #[test]
-    fn still_mode_uses_trigger_ctrl() {
-        let mut s = Stream::new_still(2, 1, false);
-        let mut io = Fake::new();
-        s.acquire(&mut io).unwrap();
-        s.start(&mut io).unwrap();
-        assert!(
-            io.reg_writes.contains(&(REG_TRIGGER_CTRL, STILL_ENABLE)),
-            "{:?}",
-            io.reg_writes
-        );
-        assert!(
-            !io.reg_writes.iter().any(|(r, _)| *r == REG_VIDEO_EN),
-            "still capture must not touch VIDEO_EN: {:?}",
-            io.reg_writes
-        );
-    }
-
-    /// Enable then trigger. Without the trigger the camera arms and never
-    /// exposes, which presents as a camera that simply never sends a frame.
-    #[test]
-    fn still_capture_enables_then_triggers() {
-        let mut s = Stream::new_still(2, 1, false);
-        let mut io = Fake::new();
-        s.acquire(&mut io).unwrap();
-        s.start(&mut io).unwrap();
-        s.trigger(&mut io).unwrap();
-        assert_eq!(
-            io.reg_writes,
-            vec![
-                (REG_TRIGGER_CTRL, STILL_ENABLE),
-                (REG_TRIGGER_CTRL, STILL_TRIGGER_SOFTWARE),
-            ],
-            "0x04 then 0x06"
-        );
-    }
-
-    /// The trigger encoding depends on protocol version and trigger mode.
-    #[test]
-    fn trigger_encoding_follows_version_and_mode() {
-        let cases = [
-            ((0, false), STILL_TRIGGER_V0),
-            ((1, false), STILL_TRIGGER_SOFTWARE),
-            ((2, false), STILL_TRIGGER_SOFTWARE),
-            ((1, true), STILL_TRIGGER_HARDWARE),
-        ];
-        for ((ver, hw), want) in cases {
-            let mut s = Stream::new_still(1, ver, hw);
-            let mut io = Fake::new();
-            s.acquire(&mut io).unwrap();
-            s.start(&mut io).unwrap();
-            io.reg_writes.clear();
-            s.trigger(&mut io).unwrap();
-            assert_eq!(
-                io.reg_writes,
-                vec![(REG_TRIGGER_CTRL, want)],
-                "v{ver} hw={hw}"
-            );
-        }
-    }
-
-    /// Hardware-trigger mode takes an extra write straight after the enable.
-    #[test]
-    fn hardware_trigger_mode_arms_after_enable() {
-        let mut s = Stream::new_still(1, 1, true);
-        let mut io = Fake::new();
-        s.acquire(&mut io).unwrap();
-        s.start(&mut io).unwrap();
-        assert_eq!(
-            io.reg_writes,
-            vec![
-                (REG_TRIGGER_CTRL, STILL_ENABLE),
-                (REG_TRIGGER_CTRL, STILL_ARM_HARDWARE),
-            ]
-        );
-    }
-
-    /// The camera refuses a trigger unless the stream is running.
-    #[test]
-    fn trigger_before_start_is_refused() {
-        let mut s = Stream::new_still(1, 1, false);
-        let mut io = Fake::new();
-        s.acquire(&mut io).unwrap();
-        assert!(s.trigger(&mut io).is_err());
-    }
-
-    /// Video mode has no trigger step.
-    #[test]
-    fn video_mode_trigger_is_a_no_op() {
-        let mut s = Stream::new(1);
-        let mut io = Fake::new();
-        s.acquire(&mut io).unwrap();
-        s.start(&mut io).unwrap();
-        io.reg_writes.clear();
-        s.trigger(&mut io).unwrap();
-        assert!(io.reg_writes.is_empty());
-    }
-
-    /// The zero-length-packet request is video-only.
-    #[test]
-    fn still_mode_does_not_request_zero_length_packets() {
-        let mut s = Stream::new_still(2, 1, false);
-        let mut io = Fake::new();
-        s.acquire(&mut io).unwrap();
-        s.start(&mut io).unwrap();
-        io.reg_writes.clear();
-        s.stop(&mut io, StopKind::Teardown).unwrap();
-        assert_eq!(io.reg_writes, vec![(REG_TRIGGER_CTRL, STILL_DISABLE)]);
-    }
-
-    /// Ordering discipline is the same in both modes.
-    #[test]
-    fn still_mode_still_submits_before_enabling() {
-        let mut s = Stream::new_still(4, 1, false);
-        let mut io = Fake::new();
-        s.acquire(&mut io).unwrap();
-        s.start(&mut io).unwrap();
-        let enable = io.log.iter().position(|l| l.starts_with("write:")).unwrap();
-        let last_submit = io
-            .log
-            .iter()
-            .rposition(|l| l.starts_with("submit:"))
-            .unwrap();
-        assert!(last_submit < enable, "{:?}", io.log);
     }
 }

@@ -1,5 +1,7 @@
+#[cfg(feature = "os-usb")]
 use numanager_core::runtime::{DriverCandidate, DriverDiscovery};
 use numanager_core::*;
+#[cfg(feature = "os-usb")]
 use std::collections::{BTreeMap, VecDeque};
 
 pub const CYPRESS_VID: u16 = 0x04b4;
@@ -145,12 +147,13 @@ pub fn usb_vendor_ids() -> Vec<u16> {
     vec![CYPRESS_VID]
 }
 
+#[cfg(feature = "os-usb")]
 pub struct EzUsbLoaderDiscovery {
     next_id: DriverId,
 }
 
+#[cfg(feature = "os-usb")]
 impl EzUsbLoaderDiscovery {
-    #[cfg(feature = "os-usb")]
     pub fn os_usb(next_id: DriverId) -> Self {
         Self { next_id }
     }
@@ -207,6 +210,7 @@ fn is_ez_usb_loader(vendor_id: u16, product_id: u16) -> bool {
     vendor_id == CYPRESS_VID && matches!(product_id, CYPRESS_FX2_PID | CYPRESS_FX3_PID)
 }
 
+#[cfg(feature = "os-usb")]
 fn ez_usb_loader_name(product_id: u16) -> &'static str {
     match product_id {
         CYPRESS_FX2_PID => "Generic Cypress EZ-USB FX2 pre-firmware device",
@@ -215,6 +219,7 @@ fn ez_usb_loader_name(product_id: u16) -> &'static str {
     }
 }
 
+#[cfg(feature = "os-usb")]
 struct EzUsbLoaderDriver {
     id: DriverId,
     device: DeviceId,
@@ -228,6 +233,7 @@ struct EzUsbLoaderDriver {
     pending: VecDeque<DriverEvent>,
 }
 
+#[cfg(feature = "os-usb")]
 impl EzUsbLoaderDriver {
     fn metadata(&self) -> BTreeMap<String, Value> {
         BTreeMap::from([
@@ -305,6 +311,7 @@ impl EzUsbLoaderDriver {
     }
 }
 
+#[cfg(feature = "os-usb")]
 impl Driver for EzUsbLoaderDriver {
     fn id(&self) -> DriverId {
         self.id
@@ -391,6 +398,7 @@ impl Driver for EzUsbLoaderDriver {
     }
 }
 
+#[cfg(feature = "os-usb")]
 fn property(key: &str, display_name: &str, value_type: ValueType) -> PropertySchema {
     PropertySchema {
         key: key.into(),
@@ -408,6 +416,7 @@ fn property(key: &str, display_name: &str, value_type: ValueType) -> PropertySch
     }
 }
 
+#[cfg(feature = "os-usb")]
 fn string_property(key: &str, display_name: &str) -> PropertySchema {
     property(key, display_name, ValueType::String)
 }

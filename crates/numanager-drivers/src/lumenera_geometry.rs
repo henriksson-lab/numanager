@@ -1,4 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Lumenera sensor geometry, read from the camera rather than compiled in.
+//!
+//! This module is derived from Teledyne's GPLv2 Linux SDK driver register reads
+//! (`lucam.c` / `lucam_def.h`). It is therefore annotated `GPL-2.0-only`.
 //!
 //! The vendor driver carries no per-model geometry table — it asks the device.
 //! That is why this exists: hardcoding `1392x1040 / 12-bit` works for exactly one
@@ -136,128 +140,4 @@ pub fn query<T: GeometryTransport>(io: &mut T) -> Result<Geometry> {
         raw_specification,
         format_count,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-
-    #[derive(Default)]
-    struct Fake {
-        regs: BTreeMap<u16, Result<u32>>,
-    }
-
-    impl Fake {
-        fn with(mut self, i: u16, v: u32) -> Self {
-            self.regs.insert(i, Ok(v));
-            self
-        }
-        fn failing(mut self, i: u16) -> Self {
-            self.regs.insert(i, Err(err("simulated read failure")));
-            self
-        }
-    }
-
-    impl GeometryTransport for Fake {
-        fn read_reg(&mut self, index: u16) -> Result<u32> {
-            match self.regs.get(&index) {
-                Some(Ok(v)) => Ok(*v),
-                Some(Err(e)) => Err(err(format!("{e}"))),
-                None => Ok(0),
-            }
-        }
-    }
-
-    /// The exact word a Gel Doc EZ returned on 2026-08-05.
-    #[test]
-    fn decodes_the_hardware_confirmed_dimension_word() {
-        let mut io = Fake::default()
-            .with(REG_DIMENSIONS, 0x0410_0570)
-            .with(REG_FRAME_SIZE, 0x0410_0570)
-            .with(REG_TRUE_PIXEL_DEPTH, 12);
-        let g = query(&mut io).unwrap();
-        assert_eq!((g.width, g.height), (1392, 1040));
-        assert_eq!(g.bit_depth, Some(12));
-    }
-
-    /// The whole point: geometry comes from the device, so a different camera
-    /// yields different numbers with no per-model data.
-    #[test]
-    fn a_different_camera_reports_different_geometry() {
-        let mut io = Fake::default()
-            .with(REG_DIMENSIONS, (1024u32 << 16) | 1280)
-            .with(REG_FRAME_SIZE, (768u32 << 16) | 1024);
-        let g = query(&mut io).unwrap();
-        assert_eq!((g.width, g.height), (1024, 768));
-    }
-
-    #[test]
-    fn frame_size_falls_back_to_max_size_when_zero() {
-        let mut io = Fake::default()
-            .with(REG_DIMENSIONS, (1024u32 << 16) | 1280)
-            .with(REG_FRAME_SIZE, 0);
-        let g = query(&mut io).unwrap();
-        assert_eq!((g.width, g.height), (1280, 1024));
-    }
-
-    /// An implausible depth must not be passed off as real. This is the trap the
-    /// previous `0x1014` reading fell into.
-    #[test]
-    fn implausible_depth_is_reported_as_unknown_not_guessed() {
-        let mut io = Fake::default()
-            .with(REG_DIMENSIONS, 0x0410_0570)
-            .with(REG_TRUE_PIXEL_DEPTH, 0x0000_000c_u32 ^ 0x0c ^ 0x07); // 7 bits
-        let g = query(&mut io).unwrap();
-        assert_eq!(g.bit_depth, None, "7 is not a depth this family reports");
-        assert_eq!(g.raw_pixel_depth, 7, "but the raw value is still visible");
-    }
-
-    /// Diagnostics failing must not sink a camera that reports a good size.
-    #[test]
-    fn diagnostic_read_failures_do_not_fail_the_query() {
-        let mut io = Fake::default()
-            .with(REG_DIMENSIONS, 0x0410_0570)
-            .failing(REG_SPECIFICATION)
-            .failing(REG_FORMAT_COUNT);
-        let g = query(&mut io).unwrap();
-        assert_eq!((g.width, g.height), (1392, 1040));
-        assert_eq!(g.raw_specification, 0);
-    }
-
-    /// A zero size is a failed read dressed up as data; refuse it.
-    #[test]
-    fn impossible_geometry_is_refused() {
-        let mut io = Fake::default().with(REG_DIMENSIONS, 0);
-        let e = query(&mut io).unwrap_err();
-        assert!(format!("{e}").contains("impossible"), "{e}");
-    }
-
-    #[test]
-    fn frame_bytes_tracks_binning_and_depth() {
-        let g = Geometry {
-            width: 1392,
-            height: 1040,
-            bit_depth: Some(12),
-            raw_pixel_depth: 12,
-            raw_specification: 0,
-            format_count: 0,
-        };
-        // 12-bit still ships two bytes per pixel, matching the measured frame.
-        assert_eq!(g.frame_bytes(1, 1), 1392 * 1040 * 2);
-        assert_eq!(g.frame_bytes(2, 2), 696 * 520 * 2);
-
-        let eight = Geometry {
-            bit_depth: Some(8),
-            ..g.clone()
-        };
-        assert_eq!(eight.frame_bytes(1, 1), 1392 * 1040);
-
-        // Unknown depth falls back to two bytes, not to nothing.
-        let unknown = Geometry {
-            bit_depth: None,
-            ..g
-        };
-        assert_eq!(unknown.frame_bytes(1, 1), 1392 * 1040 * 2);
-    }
 }

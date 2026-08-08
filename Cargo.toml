@@ -11,5 +11,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
+# Default for files without a more specific SPDX header. Some source files are
+# GPL-marked and carry their own terms.
 license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/numanager"

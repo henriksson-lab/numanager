@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Bio-Rad Gel Doc EZ camera — Lumenera **Lu130** (Sony ICX205, 12-bit mono).
 //!
 //! This is a two-stage EZ-USB device. Cold, it enumerates as an anchor-download
@@ -21,25 +22,25 @@
 //! * **Capture-derived.** Discovery, the two-stage firmware download, the
 //!   register-load sequence and the model-specific teardown come from traffic
 //!   recorded off a physical unit. Evidenced but not explained.
-//! * **Specification-derived.** FPGA programming, streaming and geometry come
-//!   from `reveng-dll/teledyne/lucam-protocol-spec.md`, a functional
-//!   specification written from Teledyne's **GPLv2** Linux driver source and
-//!   independently audited against it.
+//! * **GPL SDK-derived.** FPGA programming, streaming and geometry are derived
+//!   directly from Teledyne's GPLv2 Linux SDK driver
+//!   `lucam-sdk-2.4.11.241/drivers/lucam/lucam.c` and
+//!   `lucam-sdk-2.4.11.241/drivers/lucam/lucam_def.h`, with
+//!   `reveng-dll/teledyne/lucam-protocol-spec.md` retained as an audit notebook.
 //!
-//! The specification deliberately records facts — register numbers, orderings,
-//! constants, conditions — and no expression: no code, no control flow, no
-//! comments. These modules were then written from the specification, not from
-//! the source. That is what keeps numanager `MIT OR Apache-2.0`; a translation
-//! of the GPLv2 driver would have to be GPLv2 itself.
+//! This module is therefore annotated `GPL-2.0-only`. The crate default remains
+//! `MIT OR Apache-2.0` only for source files that do not say otherwise; keep
+//! SDK-transcribed behaviour and fixes in the GPL-marked Lumenera modules.
 //!
 //! The vendor's proprietary SDK components (`api/`, `examples/`, `doc/`) were
 //! never opened. Their licence forbids it, and the GPLv2 driver made it
 //! unnecessary.
 //!
-//! Practical consequence: where the two derivations disagreed, the
-//! specification won and the difference is noted at the site. The capture could
-//! only ever show *what one camera did once*; the specification says what the
-//! device contract is.
+//! Practical consequence: where captured traffic, the protocol notebook, and the
+//! GPL SDK disagree, the SDK-derived behaviour wins unless hardware evidence
+//! later proves this specific camera needs a documented divergence. The capture
+//! could only ever show *what one camera did once*; the SDK shows the vendor
+//! driver's intended contract.
 //!
 //! ## What is and isn't implemented
 //!
@@ -47,7 +48,7 @@
 //! **firmware download** (validated on hardware 2026-08-03).
 //!
 //! Bring-up has three further stages, all recorded from captured traffic and
-//! all implemented, none yet shown to produce a frame:
+//! all implemented:
 //!
 //! 1. **Sensor-pipeline configuration** — a 98 KB image streamed to bulk
 //!    endpoint `0x08` under alternate setting 1, bracketed by arm/finish writes
@@ -61,15 +62,14 @@
 //! 3. **Acquisition** — the sequence below.
 //!
 //! A run against hardware on 2026-08-05, before stages 1 and 2 existed, accepted
-//! every control transfer and received 0 image bytes. Capture is therefore
-//! **experimental and not hardware-validated**: the stages are evidenced
-//! individually, the chain has not yet been shown to yield a frame.
+//! every control transfer and received 0 image bytes. After adding those stages,
+//! 2026-08-06 bench runs returned complete 1392x1040 Raw16 frames at 100 ms,
+//! 200 ms and 500 ms exposures.
 //!
 //! The captured acquisition is: configure geometry/exposure, select alternate
 //! setting 2, arm, start, drain one frame off bulk endpoint `0x86`, stop,
 //! restore alternate setting 0. A frame is 16 bits per pixel over the binned
-//! dimensions — inferred from the vendor trace's bulk byte count being an exact
-//! multiple of `1392 * 1040 * 2`. Numanager has not yet reproduced that frame.
+//! dimensions — confirmed by the vendor trace and reproduced on hardware.
 //!
 //! **Not evidenced:** `gain`. The sequence writes registers `0x0276`-`0x027b`
 //! (four equal values then two others, consistent with per-tap gain/offset on
@@ -135,52 +135,158 @@ const GAIN_UNEVIDENCED: &str =
 /// detail: never exported and never used from examples.
 #[cfg(feature = "os-usb")]
 mod protocol {
-    /// Property/configuration request.
+    /// LuCam register/property request (`REQUEST_LUCAM` in the GPL SDK).
     pub(super) const REQ_PROPERTY: u8 = 0x12;
-    /// Register/FPGA access request.
-    pub(super) const REQ_REGISTER: u8 = 0x13;
+    /// Extended-command request (`REQUEST_EXT_CMD` in the GPL SDK).
+    pub(super) const REQ_EXT_CMD: u8 = 0x13;
 
     /// `wIndex` selectors on [`REQ_PROPERTY`].
     ///
     /// The `0x86` image endpoint maps to the second bulk-IN pin and uses
     /// `0x0218`. The neighboring `0x0214` lifecycle register belongs to the
     /// first bulk-IN pin (`0x82`) and must not be replayed on this path.
-    pub(super) const IDX_DIMENSIONS: u16 = 0x400c;
-    pub(super) const IDX_BINNING: u16 = 0x4018;
-    pub(super) const IDX_FORMAT_MODE: u16 = 0x4010;
-    pub(super) const IDX_FORMAT_08: u16 = 0x4008;
+    pub(super) const REG_STILL_POSITION: u16 = 0x4008;
+    pub(super) const REG_STILL_SIZE: u16 = 0x400c;
+    pub(super) const REG_STILL_COLOR_ID: u16 = 0x4010;
+    pub(super) const REG_STILL_SUBSAMPLING: u16 = 0x4018;
+    pub(super) const REG_STILL_VALIDATE: u16 = 0x4060;
+    pub(super) const REG_STILL_TAP_CONFIGURATION: u16 = 0x4068;
+    pub(super) const REG_FORMAT_COUNT: u16 = 0x019c;
+    pub(super) const REG_MAX_SIZE: u16 = 0x1000;
+    pub(super) const REG_UNIT_SIZE: u16 = 0x1004;
+    pub(super) const REG_FO_POSITION: u16 = 0x1008;
+    pub(super) const REG_FO_SIZE: u16 = 0x100c;
+    pub(super) const REG_FO_COLOR_ID: u16 = 0x1010;
+    pub(super) const REG_COLOR_INQ: u16 = 0x1014;
+    pub(super) const REG_FO_SUBSAMPLING: u16 = 0x1018;
+    pub(super) const REG_FO_SUBSAMPLING_INQ: u16 = 0x101c;
+    pub(super) const REG_FO_SUPPORTED_BINNING: u16 = 0x1020;
+    pub(super) const REG_FO_SUPPORTED_SUBSAMPLING: u16 = 0x1024;
+    pub(super) const REG_FO_TAP_CONFIGURATION: u16 = 0x1068;
+    pub(super) const REG_MESSAGE_SUPPORT: u16 = 0x4ff8;
+    pub(super) const REG_FO_EXPOSURE: u16 = 0x04a0;
+    pub(super) const REG_FO_GAIN: u16 = 0x04f0;
+    pub(super) const REG_FO_GAIN_RED: u16 = 0x0500;
+    pub(super) const REG_FO_GAIN_GREEN1: u16 = 0x0510;
+    pub(super) const REG_FO_GAIN_GREEN2: u16 = 0x0520;
+    pub(super) const REG_FO_GAIN_BLUE: u16 = 0x0530;
+    pub(super) const REG_FO_GAINHDR: u16 = 0x0910;
+    pub(super) const REG_STILL_GAIN: u16 = 0x0550;
+    pub(super) const REG_STILL_GAIN_RED: u16 = 0x0560;
+    pub(super) const REG_STILL_GAIN_GREEN1: u16 = 0x0570;
+    pub(super) const REG_STILL_GAIN_GREEN2: u16 = 0x0580;
+    pub(super) const REG_STILL_GAIN_BLUE: u16 = 0x0590;
+    pub(super) const REG_STILL_STROBE_DELAY: u16 = 0x05a0;
+    pub(super) const REG_STILL_EXPOSURE_DELAY: u16 = 0x0610;
+    pub(super) const REG_STILL_STROBE_DURATION: u16 = 0x0710;
+    pub(super) const REG_STILL_GAINHDR: u16 = 0x0920;
+    pub(super) const REG_SNAPSHOT_SETTING: u16 = 0x0670;
     pub(super) const IDX_EXPOSURE: u16 = 0x0540;
-    pub(super) const IDX_OPAQUE_05A0: u16 = 0x05a0;
-    pub(super) const IDX_OPAQUE_0550: u16 = 0x0550;
-    pub(super) const IDX_OPAQUE_0610: u16 = 0x0610;
-    pub(super) const IDX_OPAQUE_0670: u16 = 0x0670;
     // Bulk OUT endpoint and alternate setting for FPGA programming are
     // discovered from interface 0 descriptors.
 
-    /// `wIndex` selectors on [`REQ_REGISTER`].
-    pub(super) const IDX_REGISTER_DATA: u16 = 0x0006;
+    /// `LUCAM_FIRMFPGA_VERSION`.
+    pub(super) const IDX_FIRMFPGA_VERSION: u16 = 0x000c;
+    /// `LUCAM_FLAGS`.
+    pub(super) const IDX_FLAGS: u16 = 0x0280;
+    /// `LUCAM_FLAGS_FORMAT_VALIDATION`.
+    pub(super) const FLAG_FORMAT_VALIDATION: u32 = 0x0000_0002;
+    /// `LUCAM_FLAGS_TRANSFERSIZE_SUPPORTED`.
+    pub(super) const FLAG_TRANSFER_SIZE_SUPPORTED: u32 = 0x0000_4000;
+
+    /// `wIndex` selectors on [`REQ_EXT_CMD`].
+    pub(super) const IDX_EXT_SENSOR_DATA: u16 = 0x0006;
     pub(super) const IDX_FPGA_WRITE: u16 = 0x0000;
     pub(super) const IDX_CMD_0F: u16 = 0x000f;
 
-    /// Capability registers the camera answers on open, before any
-    /// configuration. Four-byte IN transfers on [`REQ_PROPERTY`], in the order
-    /// a working stack issues them.
+    /// Capability and frame-output registers the SDK refreshes after FPGA setup.
+    /// Four-byte IN transfers on [`REQ_PROPERTY`], keeping SDK order for the
+    /// registers this driver currently mirrors.
     ///
-    /// Read-only, and not part of the capture sequence. `0x1000` and `0x1014`
-    /// are live-confirmed (2026-08-05); the rest are read but unidentified, so
-    /// they are named for their wire index only.
-    pub(super) const IDX_CAPABILITY_READS: [u16; 11] = [
-        0x0004, 0x019c, 0x0280, 0x0284, 0x101c, 0x1000, 0x1004, 0x1008, 0x100c, 0x1014, 0x1040,
+    /// Read-only, and not part of the capture sequence. `0x0280` is SDK
+    /// `LUCAM_FLAGS`; `0x1000` and `0x1014` are live-confirmed (2026-08-05);
+    /// the rest are read but unidentified, so they are named for their wire
+    /// index only.
+    pub(super) const IDX_CAPABILITY_READS: [u16; 16] = [
+        0x0004,
+        0x0008,
+        REG_FORMAT_COUNT,
+        0x0280,
+        REG_COLOR_INQ,
+        REG_MAX_SIZE,
+        REG_UNIT_SIZE,
+        REG_FO_COLOR_ID,
+        REG_FO_TAP_CONFIGURATION,
+        REG_FO_POSITION,
+        REG_FO_SIZE,
+        REG_FO_SUBSAMPLING,
+        REG_FO_SUBSAMPLING_INQ,
+        REG_FO_SUPPORTED_BINNING,
+        REG_FO_SUPPORTED_SUBSAMPLING,
+        REG_MESSAGE_SUPPORT,
+    ];
+
+    pub(super) const SDK_PARAM_READS: [u16; 50] = [
+        0x0450,
+        0x0410,
+        0x0400,
+        REG_FO_EXPOSURE,
+        REG_FO_GAIN,
+        REG_FO_GAIN_RED,
+        REG_FO_GAIN_GREEN1,
+        REG_FO_GAIN_GREEN2,
+        REG_FO_GAIN_BLUE,
+        REG_FO_GAINHDR,
+        IDX_EXPOSURE,
+        REG_STILL_GAIN,
+        REG_STILL_GAIN_RED,
+        REG_STILL_GAIN_GREEN1,
+        REG_STILL_GAIN_GREEN2,
+        REG_STILL_GAIN_BLUE,
+        REG_STILL_GAINHDR,
+        REG_STILL_STROBE_DELAY,
+        REG_STILL_EXPOSURE_DELAY,
+        REG_STILL_STROBE_DURATION,
+        0x04b0,
+        0x04c0,
+        0x05c0,
+        0x05d0,
+        0x05e0,
+        0x05f0,
+        0x07e0,
+        0x0660,
+        0x06a0,
+        0x07b0,
+        REG_SNAPSHOT_SETTING,
+        0x0750,
+        0x0600,
+        0x06b0,
+        0x0870,
+        0x0640,
+        0x0680,
+        0x0960,
+        0x0850,
+        0x0d00,
+        0x0d20,
+        0x0970,
+        0x0890,
+        0x0980,
+        0x0760,
+        0x0770,
+        0x0880,
+        0x0720,
+        0x08c0,
+        0x0990,
     ];
 
     /// `0x1000` reads back as two little-endian `u16` giving width and height.
     /// Read live from a Gel Doc EZ on 2026-08-05: `0x04100570` = 1392 x 1040,
-    /// matching both the dimension write on [`IDX_DIMENSIONS`] and the captured
+    /// matching both the dimension write on [`REG_STILL_SIZE`] and the captured
     /// frame size. `0x100c` returns the same pair. **[confirmed]**
     ///
     /// An earlier revision guessed `0x1004` here; the bench readout showed it
     /// holds `0x00080004`, so it is something else.
-    pub(super) const IDX_CAPABILITY_DIMENSIONS: u16 = 0x1000;
+    pub(super) const IDX_CAPABILITY_DIMENSIONS: u16 = REG_MAX_SIZE;
 
     /// `0x1014` is a device **state code**, not bit depth. The same camera read
     /// `0x0c` on 2026-08-05 and `0x05` on 2026-08-06 after a driver change, and
@@ -204,26 +310,17 @@ mod protocol {
     pub(super) const REG_TRAILER_A_VALUE: u32 = 0x12;
     pub(super) const REG_TRAILER_B: u16 = 0x027b;
 
+    /// `LUCAM_STILL_TRANSFER_SIZE`, written before enabling a still stream when
+    /// the camera advertises `LUCAM_FLAGS_TRANSFERSIZE_SUPPORTED`.
+    pub(super) const REG_STILL_TRANSFER_SIZE: u16 = 0x407c;
+    /// `PAGE_SIZE << VIDEOBUF_LUCAM_PAGE_ALLOC_ORDER` in the SDK: 4096 << 4.
+    pub(super) const SDK_TRANSFER_SIZE: u32 = 0x0001_0000;
+
     /// The post-stop FPGA write, replayed verbatim.
     pub(super) const FPGA_TEARDOWN_ADDR: u16 = 0x0544;
     pub(super) const FPGA_TEARDOWN_DATA: [u8; 5] = [0x22, 0x0f, 0x00, 0xc2, 0x00];
 
-    /// Bulk IN endpoint carrying image data in the working vendor trace. Alt 2
-    /// also exposes `0x82`, but that first bulk-IN pin maps to lifecycle
-    /// register `0x0214` and is not the observed image stream.
-    pub(super) const EP_IMAGE: u8 = 0x86;
     pub(super) const ALT_IDLE: u8 = 0;
-
-    /// Constant leading word of the exposure payload.
-    const EXPOSURE_FLAG: u32 = 0x8000_0000;
-
-    /// Exposure is `[u32 flag][u32 microseconds]`, both little-endian.
-    pub(super) fn exposure(microseconds: u32) -> [u8; 8] {
-        let mut out = [0u8; 8];
-        out[..4].copy_from_slice(&EXPOSURE_FLAG.to_le_bytes());
-        out[4..].copy_from_slice(&microseconds.to_le_bytes());
-        out
-    }
 
     /// Width and height as two little-endian `u16`.
     pub(super) fn dimensions(width: u16, height: u16) -> [u8; 4] {
@@ -250,13 +347,6 @@ mod protocol {
     pub(super) fn opaque8(value: u64) -> [u8; 8] {
         value.to_le_bytes()
     }
-
-    /// Bytes one frame occupies on the wire: 16 bits per pixel over the binned
-    /// dimensions. Confirmed by the captured byte total being an exact
-    /// multiple of this for 1392x1040.
-    pub(super) fn frame_bytes(width: u32, height: u32, x_bin: u16, y_bin: u16) -> usize {
-        (width as usize / x_bin.max(1) as usize) * (height as usize / y_bin.max(1) as usize) * 2
-    }
 }
 
 /// The in-tree third-party package: this crate's own source tree if present
@@ -279,27 +369,29 @@ pub fn usb_vendor_ids() -> Vec<u16> {
 
 /// Whether a `(vid, pid)` is a Lumenera Gel Doc EZ device in either stage.
 /// Used by live USB discovery and the tests.
-#[cfg(feature = "os-usb")]
 fn is_lumenera_candidate(vendor_id: u16, product_id: u16) -> bool {
     matches!(vendor_id, LUMENERA_OEM_VID | LUMENERA_USBIF_VID)
         && matches!(product_id, LOADER_PID | IMAGING_PID)
 }
 
-/// The firmware image the loader selects, by its `bcdDevice` (USB REV) field.
-/// REV_0001 -> img01 was confirmed to boot the real unit; slot 16 is the
-/// documented catch-all for any other selector.
-fn firmware_image_file(selector: u16) -> &'static str {
+/// The firmware image the loader selects, by its exact `bcdDevice` (USB REV).
+fn firmware_image_file(selector: u16) -> Result<&'static str> {
     match selector {
-        0 => "lumenera_fw_img00.hex",
-        1 => "lumenera_fw_img01.hex",
-        _ => "lumenera_fw_img16.hex",
+        0x0000 => Ok("lumenera_fw_img00.hex"),
+        0x0001 => Ok("lumenera_fw_img01.hex"),
+        0x0010 => Ok("lumenera_fw_img10.hex"),
+        0x0018 => Ok("lumenera_fw_img18.hex"),
+        _ => Err(Error::new(
+            ErrorCode::Unsupported,
+            format!("unsupported Lumenera loader firmware selector {selector:#06x}"),
+        )),
     }
 }
 
 /// Intel-HEX text of the image for `selector`: a configured `firmware_dir`
 /// wins, otherwise the copy compiled in by [`crate::bundled_firmware`].
 fn firmware_image_text(selector: u16, firmware_dir: Option<&str>) -> Result<String> {
-    let name = firmware_image_file(selector);
+    let name = firmware_image_file(selector)?;
     if let Some(dir) = firmware_dir {
         let file = std::path::Path::new(dir).join(name);
         if let Ok(text) = std::fs::read_to_string(&file) {
@@ -350,6 +442,10 @@ struct LumeneraUsbIdentity {
 }
 
 impl LumeneraUsbIdentity {
+    fn has_bus_address(&self) -> bool {
+        self.bus_number != 0 || self.device_address != 0
+    }
+
     fn value(&self) -> Value {
         let mut fields = BTreeMap::from([
             ("vendor_id".into(), Value::I64(self.vendor_id as i64)),
@@ -378,6 +474,21 @@ impl LumeneraUsbIdentity {
         }
         Value::Map(fields)
     }
+}
+
+fn configured_serial_identity(probe: &LumeneraProbe) -> Option<LumeneraUsbIdentity> {
+    probe
+        .serial_number
+        .as_ref()
+        .map(|serial| LumeneraUsbIdentity {
+            vendor_id: probe.vendor_id,
+            product_id: probe.product_id,
+            bus_number: 0,
+            device_address: 0,
+            device_version: probe.image_selector,
+            firmware_loaded: probe.firmware_loaded,
+            serial: Some(serial.clone()),
+        })
 }
 
 impl LumeneraProbe {
@@ -503,16 +614,42 @@ impl LumeneraDiscovery {
 }
 
 impl LumeneraProbe {
+    fn config_usb_id(device: &DeviceConfig, key: &str) -> Result<Option<u16>> {
+        match device.properties.get(key) {
+            Some(Value::I64(value)) => u16::try_from(*value).map(Some).map_err(|_| {
+                Error::new(
+                    ErrorCode::InvalidProperty,
+                    format!("Lumenera {key} must be a USB u16 value, got {value}"),
+                )
+            }),
+            Some(_) => Err(Error::new(
+                ErrorCode::InvalidProperty,
+                format!("Lumenera {key} must be an integer USB id"),
+            )),
+            None => Ok(None),
+        }
+    }
+
     fn from_device_config(device: &DeviceConfig) -> Result<Self> {
         let mut probe = Self::fixture();
         if !device.label.is_empty() {
             probe.label = device.label.clone();
         }
-        if let Some(Value::I64(vid)) = device.properties.get("vendor_id") {
-            probe.vendor_id = *vid as u16;
+        if let Some(vid) = Self::config_usb_id(device, "vendor_id")? {
+            probe.vendor_id = vid;
         }
-        if let Some(Value::I64(pid)) = device.properties.get("product_id") {
-            probe.product_id = *pid as u16;
+        if let Some(pid) = Self::config_usb_id(device, "product_id")? {
+            probe.product_id = pid;
+        }
+        if !is_lumenera_candidate(probe.vendor_id, probe.product_id) {
+            return Err(Error::new(
+                ErrorCode::InvalidProperty,
+                format!(
+                    "Lumenera config selects unsupported USB identity {:04x}:{:04x}; \
+                     SDK-supported identities are 5354:809a, 1724:809a, 5354:009a and 1724:009a",
+                    probe.vendor_id, probe.product_id
+                ),
+            ));
         }
         probe.firmware_loaded = probe.product_id == IMAGING_PID;
         if let Some(Value::String(product)) = device.properties.get("product") {
@@ -524,8 +661,8 @@ impl LumeneraProbe {
         if let Some(Value::String(dir)) = device.properties.get("firmware_dir") {
             probe.firmware_dir = Some(dir.clone());
         }
-        if let Some(Value::I64(selector)) = device.properties.get("image_selector") {
-            probe.image_selector = *selector as u16;
+        if let Some(selector) = Self::config_usb_id(device, "image_selector")? {
+            probe.image_selector = selector;
         }
         if let Some(Value::Bool(connect)) = device.properties.get("connect") {
             probe.connect = *connect;
@@ -705,6 +842,7 @@ impl LumeneraCameraDriver {
         self.probe.connect = was;
         outcome?;
         self.probe.product_id = IMAGING_PID;
+        self.probe.firmware_loaded = true;
         Ok(())
     }
 
@@ -727,23 +865,29 @@ impl LumeneraCameraDriver {
         if !self.probe.connect && !self.host_owns_node() {
             return Ok(());
         }
-        let image = firmware_image_text(
-            self.probe.image_selector,
-            self.probe.firmware_dir.as_deref(),
-        )?;
         #[cfg(feature = "os-usb")]
         {
-            live_lumenera::push_firmware(self.probe.vendor_id, self.probe.product_id, &image)?;
+            let serial_identity = configured_serial_identity(&self.probe);
+            let identity = self.probe.usb.as_ref().or(serial_identity.as_ref());
+            let selector = live_lumenera::push_firmware(
+                self.probe.vendor_id,
+                self.probe.product_id,
+                identity,
+                self.probe.firmware_dir.as_deref(),
+            )?;
             // The device detaches and renumerates; give it a moment.
             std::thread::sleep(std::time::Duration::from_millis(1500));
+            self.probe.product_id = IMAGING_PID;
             self.probe.firmware_loaded = true;
-            if let Some(usb) = self.probe.usb.as_mut() {
-                usb.firmware_loaded = true;
-            }
+            self.probe.image_selector = selector;
             Ok(())
         }
         #[cfg(not(feature = "os-usb"))]
         {
+            let image = firmware_image_text(
+                self.probe.image_selector,
+                self.probe.firmware_dir.as_deref(),
+            )?;
             let _ = image;
             Err(Error::new(
                 ErrorCode::Unsupported,
@@ -752,8 +896,10 @@ impl LumeneraCameraDriver {
         }
     }
 
-    fn selected_image(&self) -> &'static str {
+    fn selected_image(&self) -> String {
         firmware_image_file(self.probe.image_selector)
+            .map(str::to_string)
+            .unwrap_or_else(|_| format!("unsupported selector {:#06x}", self.probe.image_selector))
     }
 
     fn descriptor(&self) -> DeviceDescriptor {
@@ -762,11 +908,15 @@ impl LumeneraCameraDriver {
                 "evidence_class".into(),
                 Value::String("reverse engineered".into()),
             ),
-            ("hardware_validated".into(), Value::Bool(false)),
+            ("hardware_validated".into(), Value::Bool(true)),
             ("firmware_download_validated".into(), Value::Bool(true)),
             (
                 "imaging_protocol_status".into(),
                 Value::String(PROTOCOL_STATUS.into()),
+            ),
+            (
+                "source_license".into(),
+                Value::String("GPL-2.0-only; derived from Teledyne lucam GPL SDK driver".into()),
             ),
             (
                 "capture_gate".into(),
@@ -913,17 +1063,6 @@ impl LumeneraCameraDriver {
         }
     }
 
-    #[cfg(feature = "os-usb")]
-    fn capture_plan(&self) -> CapturePlan {
-        CapturePlan {
-            width: SENSOR_WIDTH as u16,
-            height: SENSOR_HEIGHT as u16,
-            x_bin: 1,
-            y_bin: 1,
-            exposure_us: self.probe.exposure_micros(),
-        }
-    }
-
     /// Run one acquisition and hand the frame to the runtime.
     fn capture_frame(
         &mut self,
@@ -932,20 +1071,31 @@ impl LumeneraCameraDriver {
     ) -> Result<Value> {
         #[cfg(feature = "os-usb")]
         {
-            if self.probe.usb.is_some() {
+            let can_open_live =
+                self.probe.usb.is_some() || self.probe.connect || self.probe.firmware_loaded;
+            if can_open_live {
                 // Bring the camera to its imaging stage if it is not there yet.
                 // That it arrives as a firmware loader and renumerates is an
                 // implementation detail of this device, not something a caller
                 // asking for a frame should have to sequence.
                 self.bring_up()?;
-                let plan = self.capture_plan();
                 if self.session.is_none() {
+                    let serial_identity = configured_serial_identity(&self.probe);
+                    let identity = self.probe.usb.as_ref().or(serial_identity.as_ref());
                     self.session = Some(live_imaging::ImagingSession::open(
                         self.probe.vendor_id,
                         IMAGING_PID,
+                        identity,
                         self.probe.firmware_dir.clone(),
                     )?);
                 }
+                let (plan, bit_depth) = {
+                    let session = self.session.as_ref().expect("the session was just opened");
+                    (
+                        session.capture_plan(self.probe.exposure_micros())?,
+                        session.bit_depth().unwrap_or(SENSOR_BITS),
+                    )
+                };
                 let data = match self
                     .session
                     .as_ref()
@@ -978,7 +1128,7 @@ impl LumeneraCameraDriver {
                     buffer: FrameBufferSpec::default(),
                     metadata: BTreeMap::from([
                         ("exposure".into(), Value::TimeInterval(self.probe.exposure)),
-                        ("bit_depth".into(), Value::I64(SENSOR_BITS)),
+                        ("bit_depth".into(), Value::I64(bit_depth)),
                         ("sensor".into(), Value::String(SENSOR_NAME.into())),
                         ("source".into(), Value::String("lumenera-live-usb".into())),
                     ]),
@@ -1232,8 +1382,8 @@ mod live_imaging {
             .filter_map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok())
             .collect()
     }
-    /// One URB's worth of image data; the device streams in 512 KiB chunks.
-    const BULK_CHUNK: usize = 0x80000;
+    /// One SDK partial buffer: `PAGE_SIZE << VIDEOBUF_LUCAM_PAGE_ALLOC_ORDER`.
+    const BULK_CHUNK: usize = SDK_TRANSFER_SIZE as usize;
     /// Headroom over the exposure for readout and transfer.
     const READ_OVERHEAD: Duration = Duration::from_secs(5);
 
@@ -1252,6 +1402,10 @@ mod live_imaging {
         layout: EndpointLayout,
         speed: crate::lumenera_stream::BusSpeed,
         firmware_dir: Option<String>,
+        geometry: Option<crate::lumenera_geometry::Geometry>,
+        sdk_params: std::collections::BTreeMap<u16, LucamProp>,
+        flags: u32,
+        embedded_version: u32,
     }
 
     /// Highest protocol version this driver knows how to speak.
@@ -1261,7 +1415,9 @@ mod live_imaging {
     struct EndpointLayout {
         fpga_out: u8,
         fpga_alt: u8,
-        image_in: u8,
+        video_in: u8,
+        still_in: Option<u8>,
+        stream_count: u8,
         data_alt: u8,
         idle_alt: u8,
     }
@@ -1303,24 +1459,34 @@ mod live_imaging {
                     "Lumenera interface 0 has no bulk OUT endpoint for FPGA programming",
                 )
             })?;
-            let (image_in, data_alt) = in_eps
+            let (video_in, data_alt) = in_eps.first().copied().ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Transport,
+                    "Lumenera interface 0 has no bulk IN endpoint for image data",
+                )
+            })?;
+            let still_in = in_eps
                 .iter()
                 .copied()
-                .find(|(ep, _)| *ep == EP_IMAGE)
-                .or_else(|| in_eps.first().copied())
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::Transport,
-                        "Lumenera interface 0 has no bulk IN endpoint for image data",
-                    )
-                })?;
+                .skip(1)
+                .find(|(_, alt)| *alt == data_alt)
+                .map(|(ep, _)| ep);
             Ok(Self {
                 fpga_out,
                 fpga_alt,
-                image_in,
+                video_in,
+                still_in,
+                stream_count: if still_in.is_some() { 2 } else { 1 },
                 data_alt,
                 idle_alt: ALT_IDLE,
             })
+        }
+
+        fn apply_format_count(&mut self, format_count: u32) {
+            if self.stream_count == 1 && format_count == 2 {
+                self.stream_count = 2;
+                self.still_in = Some(self.video_in);
+            }
         }
 
         fn alt_value(self, alt: crate::lumenera_fpga::AltSetting) -> u8 {
@@ -1330,6 +1496,29 @@ mod live_imaging {
                 A::Fpga => self.fpga_alt,
                 A::Data => self.data_alt,
             }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct LucamProp {
+        flags: u32,
+        value: i32,
+        _min: i32,
+        _max: i32,
+    }
+
+    impl LucamProp {
+        fn from_bytes(bytes: [u8; 16]) -> Self {
+            Self {
+                flags: u32::from_le_bytes(bytes[0..4].try_into().expect("fixed slice")),
+                value: i32::from_le_bytes(bytes[4..8].try_into().expect("fixed slice")),
+                _min: i32::from_le_bytes(bytes[8..12].try_into().expect("fixed slice")),
+                _max: i32::from_le_bytes(bytes[12..16].try_into().expect("fixed slice")),
+            }
+        }
+
+        fn supported(self) -> bool {
+            self.flags >> 31 != 0
         }
     }
 
@@ -1369,6 +1558,7 @@ mod live_imaging {
         pub(super) fn open(
             vendor_id: u16,
             product_id: u16,
+            identity: Option<&super::LumeneraUsbIdentity>,
             firmware_dir: Option<String>,
         ) -> Result<Self> {
             // Granting this process access to the node is the driver's problem,
@@ -1380,17 +1570,76 @@ mod live_imaging {
             // never during passive discovery, which must stay read-only.
             ensure_host_access(vendor_id, product_id);
 
-            let info = nusb::list_devices()
+            let candidates: Vec<_> = nusb::list_devices()
                 .map_err(|error| {
                     Error::new(
                         ErrorCode::Transport,
                         format!("Lumenera USB device listing failed: {error}"),
                     )
                 })?
-                .find(|device| {
+                .filter(|device| {
                     device.vendor_id() == vendor_id && device.product_id() == product_id
                 })
-                .ok_or_else(|| {
+                .collect();
+            let info = if let Some(identity) = identity {
+                if identity.firmware_loaded {
+                    candidates
+                        .into_iter()
+                        .find(|device| {
+                            (!identity.has_bus_address()
+                                || (device.bus_number() == identity.bus_number
+                                    && device.device_address() == identity.device_address))
+                                && identity.serial.as_ref().is_none_or(|serial| {
+                                    device.serial_number() == Some(serial.as_str())
+                                })
+                        })
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorCode::Transport,
+                                format!(
+                                    "Lumenera imaging device {vendor_id:04x}:{product_id:04x} \
+                                     at bus {} addr {} is not present",
+                                    identity.bus_number, identity.device_address
+                                ),
+                            )
+                        })?
+                } else if let Some(serial) = &identity.serial {
+                    candidates
+                        .into_iter()
+                        .find(|device| device.serial_number() == Some(serial.as_str()))
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorCode::Transport,
+                                format!(
+                                    "Lumenera imaging device {vendor_id:04x}:{product_id:04x} \
+                                     with serial {serial} is not present after firmware initialization"
+                                ),
+                            )
+                        })?
+                } else {
+                    let mut iter = candidates.into_iter();
+                    let first = iter.next().ok_or_else(|| {
+                        Error::new(
+                            ErrorCode::Transport,
+                            format!(
+                                "Lumenera imaging device {vendor_id:04x}:{product_id:04x} is not present"
+                            ),
+                        )
+                    })?;
+                    if iter.next().is_some() {
+                        return Err(Error::new(
+                            ErrorCode::Transport,
+                            format!(
+                                "multiple Lumenera imaging devices {vendor_id:04x}:{product_id:04x} \
+                                 are present after firmware initialization; serial number is required"
+                            ),
+                        ));
+                    }
+                    first
+                }
+            } else {
+                let mut iter = candidates.into_iter();
+                let first = iter.next().ok_or_else(|| {
                     Error::new(
                         ErrorCode::Transport,
                         format!(
@@ -1398,12 +1647,24 @@ mod live_imaging {
                         ),
                     )
                 })?;
+                if iter.next().is_some() {
+                    return Err(Error::new(
+                        ErrorCode::Transport,
+                        format!(
+                            "multiple Lumenera imaging devices {vendor_id:04x}:{product_id:04x} \
+                             are present; select a live USB identity or serial number"
+                        ),
+                    ));
+                }
+                first
+            };
             let device = info.open().map_err(|error| {
                 Error::new(
                     ErrorCode::Transport,
                     format!("opening the Lumenera camera failed (WinUSB bound?): {error}"),
                 )
             })?;
+            Self::validate_imaging_descriptor(&device, vendor_id, product_id)?;
             // Re-select the configuration before claiming. The recorded bring-up
             // issues SET_CONFIGURATION(1) and only then finds the pipeline's
             // control register reporting ready; without it the register sits in
@@ -1440,26 +1701,55 @@ mod live_imaging {
                 layout,
                 speed,
                 firmware_dir: firmware_dir.or_else(|| Some(default_firmware_dir())),
+                geometry: None,
+                sdk_params: std::collections::BTreeMap::new(),
+                flags: 0,
+                embedded_version: 0,
             };
-            // Clamped, not trusted: a camera reporting a newer protocol than
-            // this driver implements is spoken to in the newest dialect the
-            // driver actually knows.
-            session.spec_version = session
-                .read_property(crate::lumenera_geometry::REG_SPECIFICATION)
-                .map(u32::from_le_bytes)
-                .unwrap_or(0)
-                .min(MAX_SPEC_VERSION);
-            // The camera answers this capability block on open, before any
-            // configuration. Whether it *requires* the read is unrecorded, so
-            // it is issued in the recorded order and the result discarded:
-            // nothing in the capture path depends on it,
-            // and a camera that refuses the read is left to fail later, on the
-            // operation the caller actually asked for.
-            for index in IDX_CAPABILITY_READS {
-                let _ = session.read_property(index);
-            }
             session.configure_pipeline()?;
             Ok(session)
+        }
+
+        fn validate_imaging_descriptor(
+            device: &nusb::Device,
+            vendor_id: u16,
+            product_id: u16,
+        ) -> Result<()> {
+            let mut configs = device.configurations();
+            let config = configs.next().ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Transport,
+                    format!(
+                        "Lumenera imaging device {vendor_id:04x}:{product_id:04x} has no USB configuration"
+                    ),
+                )
+            })?;
+            if configs.next().is_some() || config.num_interfaces() != 1 {
+                return Err(Error::new(
+                    ErrorCode::Transport,
+                    format!(
+                        "Lumenera imaging device {vendor_id:04x}:{product_id:04x} descriptor shape is not SDK-compatible"
+                    ),
+                ));
+            }
+            let mut interfaces = config.interfaces();
+            let interface = interfaces.next().ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Transport,
+                    format!(
+                        "Lumenera imaging device {vendor_id:04x}:{product_id:04x} has no USB interface"
+                    ),
+                )
+            })?;
+            if interface.interface_number() != 0 || interfaces.next().is_some() {
+                return Err(Error::new(
+                    ErrorCode::Transport,
+                    format!(
+                        "Lumenera imaging device {vendor_id:04x}:{product_id:04x} interface layout is not SDK-compatible"
+                    ),
+                ));
+            }
+            Ok(())
         }
 
         /// Stream the sensor-pipeline configuration image and wait for the
@@ -1496,23 +1786,14 @@ mod live_imaging {
                     }
                 }
             }
+            self.replay_init_sequence()?;
+            self.sdk_registers_init()?;
             // Ask the camera what it is. Sensor geometry is not tabled per
-            // model by design — the vendor driver queries it too — so this is
-            // what makes the driver work on more than the one unit it was
-            // captured from. A camera that disagrees with the compiled-in
-            // constants is reported rather than silently overridden, because
-            // nothing downstream has been taught to handle a changing frame
-            // size yet.
+            // model by design — the vendor driver queries it too — so cache the
+            // active frame size for subsequent capture plans.
             match self.geometry() {
                 Ok(g) => {
-                    if g.width != SENSOR_WIDTH || g.height != SENSOR_HEIGHT {
-                        eprintln!(
-                            "warning: Lumenera reports {}x{} but this driver is built \
-                             around {SENSOR_WIDTH}x{SENSOR_HEIGHT}; capture geometry may \
-                             be wrong",
-                            g.width, g.height
-                        );
-                    }
+                    self.geometry = Some(g);
                 }
                 // Diagnostic only: a camera that will not answer still captures.
                 Err(error) => {
@@ -1521,7 +1802,176 @@ mod live_imaging {
                     }
                 }
             }
-            self.replay_init_sequence()
+            Ok(())
+        }
+
+        fn sdk_registers_init(&mut self) -> Result<()> {
+            // Clamped, not trusted: a camera reporting a newer protocol than
+            // this driver implements is spoken to in the newest dialect the
+            // driver actually knows. The SDK performs these mandatory reads only
+            // after FPGA setup, so keep the same ordering.
+            self.spec_version = self
+                .read_property(crate::lumenera_geometry::REG_SPECIFICATION)
+                .map(u32::from_le_bytes)
+                .map_err(|error| Error {
+                    message: format!(
+                        "Lumenera could not read SDK SPECIFICATION register: {}",
+                        error.message
+                    ),
+                    ..error
+                })?
+                .min(MAX_SPEC_VERSION);
+            self.flags = self
+                .read_property(IDX_FLAGS)
+                .map(u32::from_le_bytes)
+                .map_err(|error| Error {
+                    message: format!(
+                        "Lumenera could not read SDK LUCAM_FLAGS register: {}",
+                        error.message
+                    ),
+                    ..error
+                })?;
+            self.embedded_version = self
+                .read_property(IDX_FIRMFPGA_VERSION)
+                .map(u32::from_le_bytes)
+                .map_err(|error| Error {
+                    message: format!(
+                        "Lumenera could not read SDK FIRMFPGA_VERSION register: {}",
+                        error.message
+                    ),
+                    ..error
+                })?;
+
+            self.property(
+                crate::lumenera_stream::REG_VIDEO_EN,
+                &word(crate::lumenera_stream::VIDEO_REQUEST_ZLP),
+            )?;
+            self.property(crate::lumenera_stream::REG_VIDEO_EN, &word(0))?;
+            self.property(crate::lumenera_stream::REG_TRIGGER_CTRL, &word(0))?;
+
+            // The SDK then refreshes a broader register block. Only a few values
+            // are used by this driver; the rest are read for SDK-equivalent
+            // device state and for later diagnostics.
+            let mut fo_position = None;
+            let mut fo_size = None;
+            let mut fo_color_id = None;
+            let mut fo_tap_configuration = None;
+            let mut fo_subsampling = None;
+            let mut format_count = None;
+
+            for index in IDX_CAPABILITY_READS {
+                if let Ok(value) = self.read_property(index) {
+                    let value = u32::from_le_bytes(value);
+                    if index == IDX_FLAGS {
+                        self.flags = value;
+                    } else if index == REG_FORMAT_COUNT {
+                        format_count = Some(value);
+                    } else if index == REG_FO_POSITION {
+                        fo_position = Some(value);
+                    } else if index == REG_FO_SIZE {
+                        fo_size = Some(value);
+                    } else if index == REG_FO_COLOR_ID {
+                        fo_color_id = Some(value);
+                    } else if index == REG_FO_TAP_CONFIGURATION {
+                        fo_tap_configuration = Some(value);
+                    } else if index == REG_FO_SUBSAMPLING {
+                        fo_subsampling = Some(value);
+                    }
+                }
+            }
+            if let Some(format_count) = format_count {
+                self.layout.apply_format_count(format_count);
+            }
+            if fo_color_id.is_some_and(|cid| cid & 0x0800_0000 != 0)
+                && fo_tap_configuration == Some(0)
+            {
+                fo_tap_configuration = Some(1);
+            }
+            self.copy_fo_defaults_to_still(
+                fo_position,
+                fo_size,
+                fo_color_id,
+                fo_tap_configuration,
+                fo_subsampling,
+            )?;
+            self.sdk_parameter_init()?;
+            Ok(())
+        }
+
+        fn sdk_parameter_init(&mut self) -> Result<()> {
+            let mut params = std::collections::BTreeMap::new();
+            for index in SDK_PARAM_READS {
+                if let Ok(prop) = self.read_param(index) {
+                    params.insert(index, prop);
+                }
+            }
+
+            for (still, fo) in [
+                (REG_STILL_GAIN_BLUE, REG_FO_GAIN_BLUE),
+                (REG_STILL_GAINHDR, REG_FO_GAINHDR),
+                (REG_STILL_GAIN_RED, REG_FO_GAIN_RED),
+                (REG_STILL_GAIN_GREEN1, REG_FO_GAIN_GREEN1),
+                (REG_STILL_GAIN_GREEN2, REG_FO_GAIN_GREEN2),
+                (REG_STILL_GAIN, REG_FO_GAIN),
+                (IDX_EXPOSURE, REG_FO_EXPOSURE),
+            ] {
+                if params.get(&still).is_some_and(|p| p.supported()) {
+                    if let Some(&prop) = params.get(&fo) {
+                        self.write_param(still, prop)?;
+                        params.insert(still, prop);
+                    }
+                }
+            }
+
+            for index in [REG_STILL_STROBE_DELAY, REG_STILL_EXPOSURE_DELAY] {
+                if let Some(mut prop) = params.get(&index).copied() {
+                    if prop.supported() {
+                        prop.flags &= !0xffff;
+                        prop.value = 0;
+                        self.write_param(index, prop)?;
+                        params.insert(index, prop);
+                    }
+                }
+            }
+            self.sdk_params = params;
+            Ok(())
+        }
+
+        fn copy_fo_defaults_to_still(
+            &self,
+            position: Option<u32>,
+            size: Option<u32>,
+            color_id: Option<u32>,
+            tap_configuration: Option<u32>,
+            subsampling: Option<u32>,
+        ) -> Result<()> {
+            let (
+                Some(position),
+                Some(size),
+                Some(color_id),
+                Some(tap_configuration),
+                Some(subsampling),
+            ) = (position, size, color_id, tap_configuration, subsampling)
+            else {
+                return Ok(());
+            };
+
+            self.property(REG_STILL_POSITION, &word(position))?;
+            self.property(REG_STILL_SIZE, &word(size))?;
+            self.property(REG_STILL_SUBSAMPLING, &word(subsampling))?;
+            self.property(REG_STILL_COLOR_ID, &word(color_id))?;
+            self.property(REG_STILL_TAP_CONFIGURATION, &word(tap_configuration))?;
+            let _tap_readback = self
+                .read_property(REG_STILL_TAP_CONFIGURATION)
+                .map(u32::from_le_bytes)
+                .map(|tap| {
+                    if color_id & 0x0800_0000 != 0 && tap == 0 {
+                        1
+                    } else {
+                        tap
+                    }
+                });
+            Ok(())
         }
 
         /// Replay the recorded post-configuration transfers.
@@ -1644,6 +2094,60 @@ mod live_imaging {
             Ok(buffer)
         }
 
+        fn read_param(&self, index: u16) -> Result<LucamProp> {
+            let control = Control {
+                control_type: ControlType::Vendor,
+                recipient: Recipient::Device,
+                request: REQ_PROPERTY,
+                value: 0,
+                index,
+            };
+            let mut buffer = [0u8; 16];
+            let read = self
+                .interface
+                .control_in_blocking(control, &mut buffer, CONTROL_TIMEOUT)
+                .map_err(|error| {
+                    Error::new(
+                        ErrorCode::Transport,
+                        format!("Lumenera parameter read idx={index:#06x} failed: {error}"),
+                    )
+                })?;
+            if read != buffer.len() {
+                return Err(Error::new(
+                    ErrorCode::Transport,
+                    format!(
+                        "Lumenera parameter read idx={index:#06x} short: {read}/{}",
+                        buffer.len()
+                    ),
+                ));
+            }
+            Ok(LucamProp::from_bytes(buffer))
+        }
+
+        fn write_param(&self, index: u16, prop: LucamProp) -> Result<()> {
+            let mut data = [0u8; 8];
+            data[..4].copy_from_slice(&prop.flags.to_le_bytes());
+            data[4..].copy_from_slice(&prop.value.to_le_bytes());
+            self.property(index, &data)
+        }
+
+        fn write_param_value(&self, index: u16, fallback_flags: u32, value: i32) -> Result<()> {
+            let flags = self
+                .sdk_params
+                .get(&index)
+                .map(|prop| (prop.flags & 0xffff_0000) | (fallback_flags & 0x0000_ffff))
+                .unwrap_or(fallback_flags);
+            self.write_param(
+                index,
+                LucamProp {
+                    flags,
+                    value,
+                    _min: 0,
+                    _max: 0,
+                },
+            )
+        }
+
         /// Describe what the camera reports about itself, for a capture that
         /// produced no data. A camera that answers with plausible geometry is
         /// alive and configured — pointing at the bulk pipe; one that answers
@@ -1655,11 +2159,28 @@ mod live_imaging {
         /// Bitstream store, loaded from `firmware_dir` on first use.
         fn bitstream_store(dir: Option<&str>) -> Result<crate::lumenera_fpga::BitstreamStore> {
             let name = "lucam-fpga.lufpga";
-            let path = std::path::Path::new(dir.unwrap_or("data/third_party/lumenera")).join(name);
+            if let Some(dir) = dir {
+                let path = std::path::Path::new(dir).join(name);
+                match crate::lumenera_fpga::BitstreamStore::load(&path) {
+                    Ok(store) => return Ok(store),
+                    Err(configured_error) => {
+                        let fallback = std::path::Path::new(&default_firmware_dir()).join(name);
+                        if fallback != path {
+                            if let Ok(store) = crate::lumenera_fpga::BitstreamStore::load(&fallback)
+                            {
+                                return Ok(store);
+                            }
+                        }
+                        return Err(configured_error);
+                    }
+                }
+            }
+            let path = std::path::Path::new(&default_firmware_dir()).join(name);
             crate::lumenera_fpga::BitstreamStore::load(&path)
         }
 
-        /// Program the FPGA for this camera, per `lucam-protocol-spec.md` §5.2.
+        /// Program the FPGA for this camera, following the GPL SDK's
+        /// `lucam_fpga_setup` USB 2 path.
         ///
         /// `device_id` selects the bitstream set. **Where a camera reports it is
         /// not yet established** — it is the second key of the vendor's FPGA
@@ -1697,8 +2218,45 @@ mod live_imaging {
             crate::lumenera_geometry::query(self)
         }
 
+        pub(super) fn capture_plan(&self, exposure_us: u32) -> Result<CapturePlan> {
+            let (width, height) = self
+                .geometry
+                .as_ref()
+                .map(|g| (g.width, g.height))
+                .unwrap_or((SENSOR_WIDTH, SENSOR_HEIGHT));
+            Ok(CapturePlan {
+                width: u16::try_from(width).map_err(|_| {
+                    Error::new(
+                        ErrorCode::Driver,
+                        format!(
+                            "Lumenera reported a frame width too large for the protocol: {width}"
+                        ),
+                    )
+                })?,
+                height: u16::try_from(height).map_err(|_| {
+                    Error::new(
+                        ErrorCode::Driver,
+                        format!(
+                            "Lumenera reported a frame height too large for the protocol: {height}"
+                        ),
+                    )
+                })?,
+                x_bin: 1,
+                y_bin: 1,
+                exposure_us,
+            })
+        }
+
+        pub(super) fn bit_depth(&self) -> Option<i64> {
+            self.geometry.as_ref()?.bit_depth.map(i64::from)
+        }
+
         fn capability_report(&self) -> String {
-            let mut parts = Vec::new();
+            let mut parts = vec![
+                format!("specification={:#010x}", self.spec_version),
+                format!("flags={:#010x}", self.flags),
+                format!("firmfpga_version={:#010x}", self.embedded_version),
+            ];
             for index in IDX_CAPABILITY_READS {
                 match self.read_property(index) {
                     Ok(value) => {
@@ -1709,6 +2267,8 @@ mod live_imaging {
                                 word & 0xffff,
                                 word >> 16
                             ));
+                        } else if index == IDX_FLAGS {
+                            parts.push(format!("{index:#06x}={word:#010x} (flags)"));
                         } else if index == IDX_CAPABILITY_STATE {
                             parts.push(format!("{index:#06x}={word:#010x} (state)"));
                         } else {
@@ -1721,18 +2281,22 @@ mod live_imaging {
             parts.join(", ")
         }
 
-        fn register(&self, address: u16, value: u32) -> Result<()> {
-            self.write(REQ_REGISTER, address, IDX_REGISTER_DATA, &word(value))
+        fn ext_sensor_register(&self, address: u16, value: u32) -> Result<()> {
+            self.write(REQ_EXT_CMD, address, IDX_EXT_SENSOR_DATA, &word(value))
+        }
+
+        fn ext_command(&self, value: u16, index: u16, data: &[u8]) -> Result<()> {
+            self.write(REQ_EXT_CMD, value, index, data)
         }
 
         /// Registers written on both sides of a capture.
         fn write_tap_registers(&self, include_trailer: bool) -> Result<()> {
             for offset in 0..4u16 {
-                self.register(REG_TAP_FIRST + offset, REG_TAP_VALUE)?;
+                self.ext_sensor_register(REG_TAP_FIRST + offset, REG_TAP_VALUE)?;
             }
             if include_trailer {
-                self.register(REG_TRAILER_A, REG_TRAILER_A_VALUE)?;
-                self.register(REG_TRAILER_B, 0)?;
+                self.ext_sensor_register(REG_TRAILER_A, REG_TRAILER_A_VALUE)?;
+                self.ext_sensor_register(REG_TRAILER_B, 0)?;
             }
             Ok(())
         }
@@ -1740,21 +2304,49 @@ mod live_imaging {
         /// Program geometry and exposure. Ordering follows the capture, including
         /// the repeated format writes.
         fn configure(&self, plan: &CapturePlan) -> Result<()> {
-            self.property(IDX_OPAQUE_0670, &opaque8(0))?;
-            self.write(REQ_REGISTER, 0, IDX_CMD_0F, &[0])?;
+            self.property(REG_SNAPSHOT_SETTING, &opaque8(0))?;
+            self.ext_command(0, IDX_CMD_0F, &[0])?;
 
             for mode in [0u32, 5] {
-                self.property(IDX_FORMAT_MODE, &word(mode))?;
-                self.property(IDX_FORMAT_08, &word(0))?;
-                self.property(IDX_BINNING, &binning(plan.x_bin, plan.y_bin))?;
-                self.property(IDX_DIMENSIONS, &dimensions(plan.width, plan.height))?;
-                self.property(IDX_FORMAT_08, &word(0))?;
+                self.property(REG_STILL_COLOR_ID, &word(mode))?;
+                self.property(REG_STILL_POSITION, &word(0))?;
+                self.property(REG_STILL_SUBSAMPLING, &binning(plan.x_bin, plan.y_bin))?;
+                self.property(REG_STILL_SIZE, &dimensions(plan.width, plan.height))?;
+                self.property(REG_STILL_POSITION, &word(0))?;
+            }
+            self.validate_still_format()?;
+
+            self.write_param_value(REG_STILL_STROBE_DELAY, 0, 0)?;
+            self.write_param_value(IDX_EXPOSURE, 0x8000_0000, plan.exposure_us as i32)?;
+            self.write_param_value(REG_STILL_EXPOSURE_DELAY, 0, 0)?;
+            Ok(())
+        }
+
+        fn validate_still_format(&self) -> Result<()> {
+            if self.flags & FLAG_FORMAT_VALIDATION == 0 && self.spec_version < 2 {
+                return Ok(());
             }
 
-            self.property(IDX_OPAQUE_05A0, &opaque8(0))?;
-            self.property(IDX_EXPOSURE, &exposure(plan.exposure_us))?;
-            self.property(IDX_OPAQUE_0550, &opaque8(0x0000_2800_0000_0000))?;
-            self.property(IDX_OPAQUE_0610, &opaque8(0))?;
+            if self.spec_version >= 2 {
+                let value = u32::from_le_bytes(self.read_property(REG_STILL_VALIDATE)?);
+                if value == 0 {
+                    return Err(Error::new(
+                        ErrorCode::InvalidProperty,
+                        "Lumenera still format validation failed",
+                    ));
+                }
+            } else {
+                self.property(REG_STILL_VALIDATE, &word(0))?;
+            }
+
+            let color_id = u32::from_le_bytes(self.read_property(REG_STILL_COLOR_ID)?);
+            let mut tap_configuration =
+                u32::from_le_bytes(self.read_property(REG_STILL_TAP_CONFIGURATION)?);
+            if color_id & 0x0800_0000 != 0 && tap_configuration == 0 {
+                tap_configuration = 1;
+            }
+            let _ = tap_configuration;
+            let _position = u32::from_le_bytes(self.read_property(REG_STILL_POSITION)?);
             Ok(())
         }
 
@@ -1774,12 +2366,15 @@ mod live_imaging {
                 }
             };
 
-            let expected = frame_bytes(
-                plan.width as u32,
-                plan.height as u32,
-                plan.x_bin,
-                plan.y_bin,
-            );
+            let expected = self
+                .geometry
+                .as_ref()
+                .map(|g| g.frame_bytes(plan.x_bin, plan.y_bin))
+                .unwrap_or_else(|| {
+                    (plan.width as usize / plan.x_bin.max(1) as usize)
+                        * (plan.height as usize / plan.y_bin.max(1) as usize)
+                        * 2
+                });
             self.configure(plan)?;
             lap("configure");
 
@@ -1793,12 +2388,7 @@ mod live_imaging {
 
             // Model-specific teardown the state machine knows nothing about,
             // replayed as captured. Runs whether or not the read succeeded.
-            let _ = self.write(
-                REQ_REGISTER,
-                FPGA_TEARDOWN_ADDR,
-                IDX_FPGA_WRITE,
-                &FPGA_TEARDOWN_DATA,
-            );
+            let _ = self.ext_command(FPGA_TEARDOWN_ADDR, IDX_FPGA_WRITE, &FPGA_TEARDOWN_DATA);
             let _ = self.write_tap_registers(true);
             lap("teardown");
             if timing {
@@ -1846,27 +2436,30 @@ mod live_imaging {
 
             self.write_tap_registers(false)?;
 
-            let mut io = StreamIo::new(self, BULK_CHUNK.min(expected.max(1)));
+            let mut io = StreamIo::new(self, BULK_CHUNK.min(expected.max(1)), expected)?;
             // The protocol version selects the trigger encoding. Software-trigger
             // mode is what the captured camera was in; hardware triggering is a
             // distinct camera state this driver never puts it into.
             let mut stream = Stream::new_still(Stream::DEFAULT_POOL, self.spec_version, false);
 
             stream.acquire(&mut io)?;
-            // Submits the whole pool, then enables, then checks the read-back.
-            stream.start(&mut io)?;
-            // Enabling only arms the camera. Without this it never exposes, and
-            // the read below would wait out its whole deadline for a frame that
-            // was never taken.
-            stream.trigger(&mut io)?;
+            let outcome = (|| {
+                // Submits the whole pool, then enables, then checks the read-back.
+                stream.start(&mut io)?;
+                // Enabling only arms the camera. Without this it never exposes,
+                // and the read below would wait out its whole deadline for a
+                // frame that was never taken.
+                stream.trigger(&mut io)?;
 
-            let deadline =
-                Instant::now() + Duration::from_micros(plan.exposure_us as u64) + READ_OVERHEAD;
-            let outcome = io.drain(expected, deadline);
-            if outcome.is_err() {
-                // A read failure is the class that needs a rebuild, not a retry.
-                stream.note_frame_error(true);
-            }
+                let deadline =
+                    Instant::now() + Duration::from_micros(plan.exposure_us as u64) + READ_OVERHEAD;
+                let outcome = io.drain(expected, deadline);
+                if outcome.is_err() {
+                    // A read failure is the class that needs a rebuild, not a retry.
+                    stream.note_frame_error(true);
+                }
+                outcome
+            })();
 
             let stopped = stream.stop(&mut io, StopKind::Teardown);
             let released = stream.release(&mut io);
@@ -1879,8 +2472,8 @@ mod live_imaging {
 
     // ---- transport adapters -------------------------------------------------
     //
-    // The sequences live in `lumenera_fpga` / `lumenera_stream` / `lumenera_geometry`
-    // so they can be tested without a camera; these bind them to real USB.
+    // The SDK-derived sequences live in `lumenera_fpga` / `lumenera_stream` /
+    // `lumenera_geometry`; these adapters bind them to real USB.
     //
     // Note the request-code naming: this module calls `0x12` REQ_PROPERTY, but
     // it is the vendor's *register* file — the same wire value the specification
@@ -1946,46 +2539,119 @@ mod live_imaging {
         session: &'a ImagingSession,
         queue: nusb::transfer::Queue<RequestBuffer>,
         chunk: usize,
+        expected: usize,
+        scheduled: usize,
+        outstanding: std::collections::VecDeque<usize>,
+        endpoint: u8,
         speed: crate::lumenera_stream::BusSpeed,
     }
 
     impl<'a> StreamIo<'a> {
-        pub(super) fn new(session: &'a ImagingSession, chunk: usize) -> Self {
-            Self {
-                queue: session.interface.bulk_in_queue(session.layout.image_in),
+        pub(super) fn new(
+            session: &'a ImagingSession,
+            chunk: usize,
+            expected: usize,
+        ) -> Result<Self> {
+            let endpoint = session.layout.still_in.ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Transport,
+                    "Lumenera SDK endpoint discovery found no still bulk-IN endpoint",
+                )
+            })?;
+            Ok(Self {
+                queue: session.interface.bulk_in_queue(endpoint),
                 session,
                 chunk,
+                expected,
+                scheduled: 0,
+                outstanding: std::collections::VecDeque::new(),
+                endpoint,
                 speed: session.speed,
-            }
+            })
         }
 
         /// Pull one frame out of the queue, resubmitting as buffers complete.
         pub(super) fn drain(&mut self, expected: usize, deadline: Instant) -> Result<Vec<u8>> {
+            use std::sync::Arc;
+            use std::task::{Context, Poll, Wake, Waker};
+
+            struct DrainWaker;
+            impl Wake for DrainWaker {
+                fn wake(self: Arc<Self>) {}
+            }
+
+            let waker = Waker::from(Arc::new(DrainWaker));
+            let mut cx = Context::from_waker(&waker);
             let mut frame = Vec::with_capacity(expected);
             while frame.len() < expected {
-                if Instant::now() >= deadline {
-                    return Err(Error::new(
-                        ErrorCode::Timeout,
-                        format!(
-                            "Lumenera frame read timed out ({} of {expected} bytes)",
-                            frame.len()
-                        ),
-                    ));
-                }
-                let done = futures_lite::future::block_on(self.queue.next_complete());
+                let done = loop {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        self.queue.cancel_all();
+                        return Err(Error::new(
+                            ErrorCode::Timeout,
+                            format!(
+                                "Lumenera frame read timed out ({} of {expected} bytes)",
+                                frame.len()
+                            ),
+                        ));
+                    }
+                    match self.queue.poll_next(&mut cx) {
+                        Poll::Ready(done) => break done,
+                        Poll::Pending => {
+                            std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+                        }
+                    }
+                };
                 done.status.map_err(|error| {
                     Error::new(
                         ErrorCode::Transport,
                         format!("Lumenera bulk read failed: {error}"),
                     )
                 })?;
-                let take = (expected - frame.len()).min(done.data.len());
-                frame.extend_from_slice(&done.data[..take]);
+                let requested = self.outstanding.pop_front().ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::Driver,
+                        "Lumenera bulk completion arrived with no scheduled request",
+                    )
+                })?;
+                let actual = done.data.len();
+                if actual != requested {
+                    self.queue.cancel_all();
+                    return Err(Error::new(
+                        ErrorCode::Transport,
+                        format!(
+                            "Lumenera bulk read length mismatch: got {actual} bytes for a {requested}-byte request"
+                        ),
+                    ));
+                }
+                let remaining = expected - frame.len();
+                if actual > remaining {
+                    self.queue.cancel_all();
+                    return Err(Error::new(
+                        ErrorCode::Transport,
+                        format!(
+                            "Lumenera bulk read crossed frame boundary: got {actual} bytes with {remaining} expected"
+                        ),
+                    ));
+                }
+                frame.extend_from_slice(&done.data);
                 if frame.len() < expected {
-                    self.queue.submit(RequestBuffer::new(self.chunk));
+                    self.submit_request();
                 }
             }
             Ok(frame)
+        }
+
+        fn submit_request(&mut self) {
+            let remaining = self.expected.saturating_sub(self.scheduled);
+            if remaining == 0 {
+                return;
+            }
+            let request = self.chunk.min(remaining);
+            self.scheduled += request;
+            self.outstanding.push_back(request);
+            self.queue.submit(RequestBuffer::new(request));
         }
     }
 
@@ -1996,8 +2662,17 @@ mod live_imaging {
         fn write_reg(&mut self, index: u16, value: u32) -> Result<()> {
             self.session.property(index, &word(value))
         }
+        fn before_enable(&mut self, mode: crate::lumenera_stream::Mode) -> Result<()> {
+            if matches!(mode, crate::lumenera_stream::Mode::Still { .. })
+                && self.session.flags & FLAG_TRANSFER_SIZE_SUPPORTED != 0
+            {
+                self.session
+                    .property(REG_STILL_TRANSFER_SIZE, &word(SDK_TRANSFER_SIZE))?;
+            }
+            Ok(())
+        }
         fn ext_cmd(&mut self, sub: u8) -> Result<()> {
-            self.session.write(REQ_REGISTER, 0, sub as u16, &[])
+            self.session.write(REQ_EXT_CMD, 0, sub as u16, &[])
         }
         fn set_alt_setting(&mut self, alt: crate::lumenera_fpga::AltSetting) -> Result<()> {
             self.session
@@ -2011,7 +2686,7 @@ mod live_imaging {
                 })
         }
         fn submit(&mut self, _slot: usize) -> Result<()> {
-            self.queue.submit(RequestBuffer::new(self.chunk));
+            self.submit_request();
             Ok(())
         }
         fn kill(&mut self, _from: usize, _count: usize) -> Result<()> {
@@ -2019,13 +2694,13 @@ mod live_imaging {
             Ok(())
         }
         fn clear_halt(&mut self) -> Result<()> {
-            let _ = self
-                .session
-                .interface
-                .clear_halt(self.session.layout.image_in);
+            let _ = self.session.interface.clear_halt(self.endpoint);
             Ok(())
         }
-        fn reset_frames(&mut self) {}
+        fn reset_frames(&mut self) {
+            self.scheduled = 0;
+            self.outstanding.clear();
+        }
         fn bus_speed(&self) -> crate::lumenera_stream::BusSpeed {
             self.speed
         }
@@ -2053,20 +2728,47 @@ mod live_lumenera {
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Download `image` (Intel-HEX text, already resolved from the bundled copy
-    /// or from `firmware_dir` by [`super::firmware_image_text`]) to the loader.
-    pub(super) fn push_firmware(vendor_id: u16, product_id: u16, image: &str) -> Result<()> {
-        let records = crate::ez_usb::parse_ihex(image)?;
-
-        let info = nusb::list_devices()
+    /// Download the live loader descriptor's selected image to the loader.
+    pub(super) fn push_firmware(
+        vendor_id: u16,
+        product_id: u16,
+        identity: Option<&LumeneraUsbIdentity>,
+        firmware_dir: Option<&str>,
+    ) -> Result<u16> {
+        let candidates: Vec<_> = nusb::list_devices()
             .map_err(|error| {
                 Error::new(
                     ErrorCode::Transport,
                     format!("Lumenera USB device listing failed: {error}"),
                 )
             })?
-            .find(|device| device.vendor_id() == vendor_id && device.product_id() == product_id)
-            .ok_or_else(|| {
+            .filter(|device| device.vendor_id() == vendor_id && device.product_id() == product_id)
+            .collect();
+        let info = if let Some(identity) = identity {
+            candidates
+                .into_iter()
+                .find(|device| {
+                    (!identity.has_bus_address()
+                        || (device.bus_number() == identity.bus_number
+                            && device.device_address() == identity.device_address))
+                        && identity
+                            .serial
+                            .as_ref()
+                            .is_none_or(|serial| device.serial_number() == Some(serial.as_str()))
+                })
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::Transport,
+                        format!(
+                            "Lumenera loader {vendor_id:04x}:{product_id:04x} at bus {} addr {} \
+                             is not present for firmware download",
+                            identity.bus_number, identity.device_address
+                        ),
+                    )
+                })?
+        } else {
+            let mut iter = candidates.into_iter();
+            let first = iter.next().ok_or_else(|| {
                 Error::new(
                     ErrorCode::Transport,
                     format!(
@@ -2074,12 +2776,27 @@ mod live_lumenera {
                     ),
                 )
             })?;
+            if iter.next().is_some() {
+                return Err(Error::new(
+                    ErrorCode::Transport,
+                    format!(
+                        "multiple Lumenera loaders {vendor_id:04x}:{product_id:04x} are present; \
+                         select a live USB identity or serial number"
+                    ),
+                ));
+            }
+            first
+        };
+        let selector = info.device_version();
+        let image = firmware_image_text(selector, firmware_dir)?;
+        let records = crate::ez_usb::parse_ihex(&image)?;
         let device = info.open().map_err(|error| {
             Error::new(
                 ErrorCode::Transport,
                 format!("opening the Lumenera loader failed (WinUSB bound?): {error}"),
             )
         })?;
+        validate_loader_descriptor(&device, vendor_id, product_id)?;
         // Select the configuration before claiming, exactly as the imaging path
         // does. On Linux and Windows the device is already configured by
         // enumeration and this is a re-assert; on macOS it is not optional. A
@@ -2109,6 +2826,46 @@ mod live_lumenera {
             crate::ez_usb::anchor_write(&interface, record.address, &record.data, TIMEOUT)?;
         }
         crate::ez_usb::hold_8051(&interface, false, TIMEOUT)?;
+        Ok(selector)
+    }
+
+    fn validate_loader_descriptor(
+        device: &nusb::Device,
+        vendor_id: u16,
+        product_id: u16,
+    ) -> Result<()> {
+        let mut configs = device.configurations();
+        let config = configs.next().ok_or_else(|| {
+            Error::new(
+                ErrorCode::Transport,
+                format!(
+                    "Lumenera loader {vendor_id:04x}:{product_id:04x} has no USB configuration"
+                ),
+            )
+        })?;
+        if configs.next().is_some() || config.num_interfaces() != 1 {
+            return Err(Error::new(
+                ErrorCode::Transport,
+                format!(
+                    "Lumenera loader {vendor_id:04x}:{product_id:04x} descriptor shape is not SDK-compatible"
+                ),
+            ));
+        }
+        let mut interfaces = config.interfaces();
+        let interface = interfaces.next().ok_or_else(|| {
+            Error::new(
+                ErrorCode::Transport,
+                format!("Lumenera loader {vendor_id:04x}:{product_id:04x} has no USB interface"),
+            )
+        })?;
+        if interface.interface_number() != 0 || interfaces.next().is_some() {
+            return Err(Error::new(
+                ErrorCode::Transport,
+                format!(
+                    "Lumenera loader {vendor_id:04x}:{product_id:04x} interface layout is not SDK-compatible"
+                ),
+            ));
+        }
         Ok(())
     }
 }

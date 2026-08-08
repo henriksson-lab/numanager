@@ -2,12 +2,14 @@
 name = "numanager-drivers"
 version = "0.1.0"
 edition.workspace = true
+# Default for files without a more specific SPDX header. The Lumenera driver
+# modules are GPL-2.0-only because they are derived from Teledyne's GPL SDK.
 license.workspace = true
 repository.workspace = true
 publish = false
 
 [dependencies]
-zstd = "0.13"
+zstd = { version = "0.13", optional = true }
 numanager-core = { path = "../numanager-core" }
 # WinUSB provisioning is part of the driver crate on Windows, not an add-on: a
 # userspace USB driver there cannot open a device that is not bound to WinUSB,
@@ -34,8 +36,9 @@ sha2 = "0.10"
 numanager-winusb = { path = "../numanager-winusb" }
 
 [features]
-default = []
+default = ["lumenera"]
 egrabber-sdk = []
+lumenera = ["dep:zstd"]
 os-can = ["numanager-core/os-can"]
 os-hid = ["numanager-core/os-hid"]
 os-serial = ["numanager-core/os-serial", "dep:serialport"]

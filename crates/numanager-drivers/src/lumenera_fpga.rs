@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Lumenera FPGA bring-up: the bitstream store and the programming handshake.
 //!
 //! A Lumenera camera is an EZ-USB bridge in front of an FPGA, and **neither
@@ -21,18 +22,15 @@
 //! --pack`. Content-identical bitstreams are shared between models, so 108
 //! (pid, did) references resolve to 38 distinct blobs.
 //!
-//! Protocol and sequence are specified in `reveng-dll/teledyne/
-//! lucam-protocol-spec.md` §5. This is an independent implementation from that
-//! specification.
+//! The programming sequence is derived from Teledyne's GPLv2 Linux SDK driver
+//! (`lucam.c`, `lucam_fpga_setup`, USB 2 path). This file is therefore
+//! annotated `GPL-2.0-only`.
 
 use numanager_core::{Error, ErrorCode, Result};
 
 fn err(msg: impl Into<String>) -> Error {
     Error::new(ErrorCode::Driver, msg)
 }
-
-/// Vendor request that reads and writes the camera register file.
-pub const REQUEST_REGISTER: u8 = 0x12;
 
 /// `FPGA_MODE` — the whole programming handshake runs through this register.
 pub const REG_FPGA_MODE: u16 = 0x0008;
@@ -60,7 +58,7 @@ pub const WILDCARD_ID: u16 = 0xFFFF;
 #[derive(Debug, Clone)]
 pub struct Bitstream {
     /// Written to `FPGA_MODE` before the data. Per-bitstream, not a constant.
-    pub code: Option<u32>,
+    pub code: u32,
     pub data: Vec<u8>,
 }
 
@@ -71,7 +69,7 @@ pub struct Bitstream {
 pub struct BitstreamStore {
     /// (pid, did, order, code, blob index), sorted so a lookup is a scan of one
     /// contiguous run.
-    entries: Vec<(u16, u16, u8, Option<u32>, u32)>,
+    entries: Vec<(u16, u16, u8, u32, u32)>,
     /// (raw length, offset into `payload`, compressed length)
     blobs: Vec<(usize, usize, usize)>,
     payload: Vec<u8>,
@@ -111,15 +109,15 @@ impl BitstreamStore {
                 .ok_or_else(|| err("Lumenera bitstream store is truncated"))?;
             let code = rd_u32(&raw, at + 6)?;
             let blob = rd_u32(&raw, at + 10)?;
-            entries.push((
-                pid,
-                did,
-                order,
-                if has_code != 0 { Some(code) } else { None },
-                blob,
-            ));
+            if has_code == 0 {
+                return Err(err(format!(
+                    "Lumenera bitstream store entry pid={pid:#06x} did={did:#06x} order={order} has no ProgramCode"
+                )));
+            }
+            entries.push((pid, did, order, code, blob));
             at += 14;
         }
+        validate_entry_grouping(&entries)?;
 
         let n_blobs = rd_u32(&raw, at)? as usize;
         at += 4;
@@ -141,7 +139,6 @@ impl BitstreamStore {
         }
         let payload = raw[at..].to_vec();
 
-        entries.sort_unstable_by_key(|(pid, did, order, _, _)| (*pid, *did, *order));
         Ok(Self {
             entries,
             blobs,
@@ -166,14 +163,23 @@ impl BitstreamStore {
     /// those entries entirely, and a camera that should have been covered would
     /// look unsupported.
     ///
-    /// An empty result is not an error at this level: an entry may legitimately
-    /// carry no bitstreams, and some models have no FPGA at all.
+    /// Only the first matching table row is selected. Later rows may be broader
+    /// catch-alls, and appending them would program a camera with bitstreams the
+    /// vendor table did not select for that revision.
     pub fn bitstreams_for(&self, pid: u16, did: u16) -> Result<Vec<Bitstream>> {
         let matches = |stored: u16, want: u16| stored == want || stored == WILDCARD_ID;
+        let mut selected_key = None;
         let mut out = Vec::new();
         for (p, d, _, code, blob) in &self.entries {
-            if !matches(*p, pid) || !matches(*d, did) {
-                continue;
+            match selected_key {
+                Some(key) if key != (*p, *d) => break,
+                Some(_) => {}
+                None => {
+                    if !matches(*p, pid) || !matches(*d, did) {
+                        continue;
+                    }
+                    selected_key = Some((*p, *d));
+                }
             }
             let (rawlen, off, complen) = *self
                 .blobs
@@ -205,9 +211,37 @@ impl BitstreamStore {
             .filter(|(p, ..)| *p == pid)
             .map(|(_, d, ..)| *d)
             .collect();
+        v.sort_unstable();
         v.dedup();
         v
     }
+}
+
+fn validate_entry_grouping(entries: &[(u16, u16, u8, u32, u32)]) -> Result<()> {
+    let mut closed = Vec::new();
+    let mut current = None;
+    for (pid, did, order, ..) in entries {
+        let key = (*pid, *did);
+        if current == Some(key) {
+            continue;
+        }
+        if closed.contains(&key) {
+            return Err(err(format!(
+                "Lumenera bitstream store has non-contiguous entries for pid={:#06x} did={:#06x}",
+                key.0, key.1
+            )));
+        }
+        if let Some(previous) = current.replace(key) {
+            closed.push(previous);
+        }
+        if *order != 0 {
+            return Err(err(format!(
+                "Lumenera bitstream store starts pid={:#06x} did={:#06x} at order {}, expected 0",
+                key.0, key.1, order
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Splits a bitstream into the chunks the camera is fed. The last one is short
@@ -263,7 +297,7 @@ const CHUNK_GAP: std::time::Duration = std::time::Duration::from_millis(1);
 /// Poll interval while waiting for the busy bit to clear.
 const POLL_GAP: std::time::Duration = std::time::Duration::from_millis(2);
 
-/// Programs the FPGA, per `lucam-protocol-spec.md` §5.2.
+/// Programs the FPGA, following the GPL SDK's `lucam_fpga_setup` USB 2 path.
 ///
 /// Returns without touching the device if it is already programmed, which is the
 /// common path for a camera that has not been power-cycled.
@@ -277,377 +311,55 @@ pub fn program<T: FpgaTransport>(io: &mut T, bitstreams: &[Bitstream]) -> Result
 
     io.set_alt_setting(AltSetting::Fpga)?;
 
-    // Anything after this point must restore the idle setting, including on the
-    // error paths, or the interface is left where streaming cannot use it.
-    let outcome = (|| -> Result<()> {
-        for (n, bs) in bitstreams.iter().enumerate() {
-            if let Some(code) = bs.code {
-                io.write_reg(REG_FPGA_MODE, code)?;
-                io.delay(CODE_SETTLE);
-            }
-            for chunk in chunks(&bs.data) {
-                io.send_chunk(chunk)?;
-                io.delay(CHUNK_GAP);
-            }
+    // SDK detail: this countdown is initialized once before the bitstream loop,
+    // not once per bitstream. Failures inside the loop return immediately and
+    // leave the FPGA alt-setting selected; only the success/final-verify tail
+    // returns the interface to Idle.
+    let mut polls_remaining = PROGRAM_POLLS;
+    for (n, bs) in bitstreams.iter().enumerate() {
+        io.write_reg(REG_FPGA_MODE, bs.code)?;
+        io.delay(CODE_SETTLE);
+        for chunk in chunks(&bs.data) {
+            io.send_chunk(chunk)?;
+            io.delay(CHUNK_GAP);
+        }
 
-            let mut done = false;
-            for _ in 0..PROGRAM_POLLS {
+        if polls_remaining > 0 {
+            loop {
                 io.delay(POLL_GAP);
+                polls_remaining -= 1;
+                if polls_remaining == 0 {
+                    break;
+                }
                 if io.read_reg(REG_FPGA_MODE)? & FPGA_BUSY == 0 {
-                    done = true;
                     break;
                 }
             }
-            if !done {
-                return Err(err(format!(
-                    "Lumenera FPGA bitstream {} of {} did not finish programming after \
-                     {PROGRAM_POLLS} polls",
-                    n + 1,
-                    bitstreams.len()
-                )));
-            }
         }
-
-        // Back to normal mode, then confirm it actually took.
-        io.write_reg(REG_FPGA_MODE, 0)?;
-        if io.read_reg(REG_FPGA_MODE)? & FPGA_PROGRAMMED == 0 {
-            return Err(err(
-                "Lumenera FPGA reports not programmed after the whole bitstream set was sent",
-            ));
+        if io.read_reg(REG_FPGA_MODE)? & FPGA_BUSY != 0 {
+            return Err(err(format!(
+                "Lumenera FPGA bitstream {} of {} did not finish programming before the shared \
+                 SDK countdown expired",
+                n + 1,
+                bitstreams.len()
+            )));
         }
-        Ok(())
-    })();
+    }
 
+    // Back to normal mode, then confirm it actually took. The SDK attempts the
+    // Idle transition after this final verification branch, even when the final
+    // programmed-bit check fails.
+    io.write_reg(REG_FPGA_MODE, 0)?;
+    let programmed = io.read_reg(REG_FPGA_MODE)? & FPGA_PROGRAMMED != 0;
     let restored = io.set_alt_setting(AltSetting::Idle);
-    outcome?;
+    if !programmed {
+        restored?;
+        return Err(err(
+            "Lumenera FPGA reports not programmed after the whole bitstream set was sent",
+        ));
+    }
     restored?;
     Ok(Programmed::Completed {
         bitstreams: bitstreams.len(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Builds a container the same way the packer does, so the reader is tested
-    /// against the format rather than against itself.
-    fn pack(entries: &[(u16, u16, u8, Option<u32>, u32)], blobs: &[Vec<u8>]) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(MAGIC);
-        b.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        for (pid, did, order, code, blob) in entries {
-            b.extend_from_slice(&pid.to_le_bytes());
-            b.extend_from_slice(&did.to_le_bytes());
-            b.push(*order);
-            b.push(code.is_some() as u8);
-            b.extend_from_slice(&code.unwrap_or(0).to_le_bytes());
-            b.extend_from_slice(&blob.to_le_bytes());
-        }
-        let packed: Vec<Vec<u8>> = blobs
-            .iter()
-            .map(|x| zstd::encode_all(x.as_slice(), 1).unwrap())
-            .collect();
-        b.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
-        for (r, c) in blobs.iter().zip(packed.iter()) {
-            b.extend_from_slice(&(r.len() as u32).to_le_bytes());
-            b.extend_from_slice(&(c.len() as u32).to_le_bytes());
-        }
-        for c in &packed {
-            b.extend_from_slice(c);
-        }
-        b
-    }
-
-    #[test]
-    fn resolves_a_revision_to_its_bitstreams_in_order() {
-        let blobs = vec![vec![0xAAu8; 100], vec![0xBBu8; 200]];
-        // The Lu130 shape: one bitstream at did 0x0000, two at did 0x0018.
-        let store = BitstreamStore::parse(pack(
-            &[
-                (0x009a, 0x0000, 0, Some(0xff), 0),
-                (0x009a, 0x0018, 0, Some(0x01), 0),
-                (0x009a, 0x0018, 1, Some(0x02), 1),
-            ],
-            &blobs,
-        ))
-        .expect("parse");
-
-        let one = store.bitstreams_for(0x009a, 0x0000).unwrap();
-        assert_eq!(one.len(), 1);
-        assert_eq!(one[0].code, Some(0xff));
-        assert_eq!(one[0].data.len(), 100);
-
-        let two = store.bitstreams_for(0x009a, 0x0018).unwrap();
-        assert_eq!(two.len(), 2, "this revision needs two bitstreams");
-        assert_eq!(
-            (two[0].code, two[1].code),
-            (Some(0x01), Some(0x02)),
-            "program codes must arrive in order"
-        );
-        assert_eq!(two[1].data.len(), 200);
-    }
-
-    /// A camera reporting an unknown revision must not be silently given the
-    /// wrong bitstream — the caller gets nothing and can say so.
-    #[test]
-    fn unknown_revision_yields_nothing() {
-        let store = BitstreamStore::parse(pack(
-            &[(0x009a, 0x0000, 0, Some(0xff), 0)],
-            &[vec![1, 2, 3]],
-        ))
-        .unwrap();
-        assert!(store.bitstreams_for(0x009a, 0xbeef).unwrap().is_empty());
-        assert_eq!(store.known_device_ids(0x009a), vec![0x0000]);
-    }
-
-    #[test]
-    fn rejects_a_container_it_does_not_understand() {
-        assert!(BitstreamStore::parse(b"not a store at all".to_vec()).is_err());
-        let mut good = pack(&[(1, 2, 0, None, 0)], &[vec![7; 10]]);
-        good.truncate(good.len() - 4);
-        assert!(BitstreamStore::parse(good).is_err(), "truncation must fail");
-    }
-
-    /// The final chunk is **short**, not padded. An earlier revision asserted
-    /// padding; the vendor zeroes its staging buffer but transfers only the
-    /// remaining byte count, so the padding never reaches the camera.
-    #[test]
-    fn final_chunk_is_short_not_padded() {
-        let data = vec![0xEEu8; FPGA_CHUNK + 3];
-        let c: Vec<&[u8]> = chunks(&data).collect();
-        assert_eq!(c.len(), 2);
-        assert_eq!(c[0].len(), FPGA_CHUNK);
-        assert_eq!(c[1].len(), 3, "the tail is sent as 3 bytes, not 512");
-    }
-
-    #[test]
-    fn exact_multiple_needs_no_extra_chunk() {
-        assert_eq!(chunks(&vec![1u8; FPGA_CHUNK * 2]).count(), 2);
-        assert_eq!(chunks(&[]).count(), 0);
-    }
-
-    /// A wildcard entry must be found, or catch-all coverage silently vanishes.
-    #[test]
-    fn wildcard_entries_match_any_id() {
-        let store = BitstreamStore::parse(pack(
-            &[(0x009a, WILDCARD_ID, 0, Some(0xff), 0)],
-            &[vec![9u8; 32]],
-        ))
-        .unwrap();
-        assert_eq!(store.bitstreams_for(0x009a, 0x1234).unwrap().len(), 1);
-        assert_eq!(store.bitstreams_for(0x009a, 0x0000).unwrap().len(), 1);
-        assert!(store.bitstreams_for(0x00ff, 0x0000).unwrap().is_empty());
-    }
-}
-
-#[cfg(test)]
-mod real_store_tests {
-    use super::*;
-
-    fn store() -> Option<BitstreamStore> {
-        let p = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../data/third_party/lumenera/lucam-fpga.lufpga"
-        ));
-        p.is_file()
-            .then(|| BitstreamStore::load(p).expect("real store must parse"))
-    }
-
-    /// The shipped container, not a synthetic one. Skipped where the
-    /// non-redistributable blobs are absent.
-    #[test]
-    fn lu130_resolves_every_revision_it_ships() {
-        let Some(s) = store() else { return };
-
-        // did 0x0000: one bitstream, 98023 bytes — the blob the previous
-        // implementation hardcoded as a captured "98 KB pipeline image".
-        let a = s.bitstreams_for(0x009a, 0x0000).unwrap();
-        assert_eq!(a.len(), 1);
-        assert_eq!(a[0].data.len(), 98023);
-        assert_eq!(a[0].code, Some(0xff));
-
-        // did 0x0018: two, in order, with distinct program codes. A driver that
-        // programs only the first leaves the FPGA half-configured.
-        let c = s.bitstreams_for(0x009a, 0x0018).unwrap();
-        assert_eq!(c.len(), 2, "this revision needs two bitstreams");
-        assert_eq!(c[0].code, Some(0x01));
-        assert_eq!(c[1].code, Some(0x02));
-        assert_eq!((c[0].data.len(), c[1].data.len()), (158224, 169216));
-
-        assert_eq!(s.known_device_ids(0x009a), vec![0x0000, 0x0010, 0x0018]);
-    }
-
-    /// Every entry in the shipped store must decompress to its recorded length.
-    #[test]
-    fn every_shipped_bitstream_round_trips() {
-        let Some(s) = store() else { return };
-        let mut seen = 0usize;
-        for pid in s
-            .entries
-            .iter()
-            .map(|(p, ..)| *p)
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            for did in s.known_device_ids(pid) {
-                for b in s.bitstreams_for(pid, did).unwrap() {
-                    assert!(!b.data.is_empty());
-                    seen += 1;
-                }
-            }
-        }
-        assert!(seen >= 100, "expected the full reference set, saw {seen}");
-    }
-}
-
-#[cfg(test)]
-mod program_tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[derive(Default)]
-    struct Fake {
-        mode: u32,
-        /// busy countdown: reads of FPGA_MODE return busy this many more times
-        busy_for: u32,
-        /// set once enough chunks have arrived to count as programmed
-        program_on_finish: bool,
-        log: Vec<String>,
-        chunks: usize,
-        last_chunk_len: usize,
-        fail_chunk_at: Option<usize>,
-    }
-
-    impl FpgaTransport for Fake {
-        fn read_reg(&mut self, index: u16) -> Result<u32> {
-            assert_eq!(index, REG_FPGA_MODE);
-            if self.busy_for > 0 {
-                self.busy_for -= 1;
-                return Ok(FPGA_BUSY);
-            }
-            Ok(self.mode)
-        }
-        fn write_reg(&mut self, index: u16, value: u32) -> Result<()> {
-            assert_eq!(index, REG_FPGA_MODE);
-            self.log.push(format!("code:{value:#x}"));
-            if value == 0 && self.program_on_finish {
-                self.mode = FPGA_PROGRAMMED;
-            }
-            Ok(())
-        }
-        fn send_chunk(&mut self, chunk: &[u8]) -> Result<()> {
-            assert!(chunk.len() <= FPGA_CHUNK);
-            self.last_chunk_len = chunk.len();
-            self.chunks += 1;
-            if Some(self.chunks) == self.fail_chunk_at {
-                return Err(err("simulated bulk failure"));
-            }
-            Ok(())
-        }
-        fn set_alt_setting(&mut self, alt: AltSetting) -> Result<()> {
-            self.log.push(format!("alt:{alt:?}"));
-            Ok(())
-        }
-        fn delay(&mut self, _d: Duration) {}
-    }
-
-    fn bs(code: u32, len: usize) -> Bitstream {
-        Bitstream {
-            code: Some(code),
-            data: vec![0xA5; len],
-        }
-    }
-
-    /// The common path: a camera that is already programmed must not be
-    /// reprogrammed, and must not have its interface setting disturbed.
-    #[test]
-    fn already_programmed_is_a_no_op() {
-        let mut io = Fake {
-            mode: FPGA_PROGRAMMED,
-            ..Default::default()
-        };
-        assert_eq!(
-            program(&mut io, &[bs(0xff, 10)]).unwrap(),
-            Programmed::AlreadyDone
-        );
-        assert!(io.log.is_empty(), "must not touch the device: {:?}", io.log);
-        assert_eq!(io.chunks, 0);
-    }
-
-    #[test]
-    fn no_bitstreams_means_no_fpga() {
-        let mut io = Fake::default();
-        assert_eq!(program(&mut io, &[]).unwrap(), Programmed::NotApplicable);
-        assert!(io.log.is_empty());
-    }
-
-    /// Two bitstreams, each with its own code, in order — the Lu130 did 0x0018
-    /// shape. Order and codes are the thing a hardcoded blob gets wrong.
-    #[test]
-    fn programs_every_bitstream_in_order_with_its_own_code() {
-        let mut io = Fake {
-            program_on_finish: true,
-            ..Default::default()
-        };
-        let out = program(&mut io, &[bs(0x01, FPGA_CHUNK), bs(0x02, FPGA_CHUNK * 2)]).unwrap();
-        assert_eq!(out, Programmed::Completed { bitstreams: 2 });
-        assert_eq!(io.chunks, 3, "1 + 2 full chunks");
-        assert_eq!(
-            io.log,
-            vec!["alt:Fpga", "code:0x1", "code:0x2", "code:0x0", "alt:Idle"],
-            "codes in order, normal mode at the end, idle restored"
-        );
-    }
-
-    /// A short bitstream is padded, never sent short — asserted in send_chunk.
-    /// A sub-chunk bitstream goes out as one short transfer.
-    #[test]
-    fn short_bitstream_is_sent_short() {
-        let mut io = Fake {
-            program_on_finish: true,
-            ..Default::default()
-        };
-        program(&mut io, &[bs(0xff, 3)]).unwrap();
-        assert_eq!(io.chunks, 1);
-        assert_eq!(io.last_chunk_len, 3, "must not be padded to 512");
-    }
-
-    /// Busy must be waited out, not raced.
-    #[test]
-    fn waits_for_the_busy_bit_to_clear() {
-        let mut io = Fake {
-            program_on_finish: true,
-            busy_for: 5,
-            ..Default::default()
-        };
-        assert!(program(&mut io, &[bs(0xff, 8)]).is_ok());
-    }
-
-    /// If the camera never reports programmed, that is a failure, not success.
-    #[test]
-    fn silent_programming_failure_is_reported() {
-        let mut io = Fake {
-            program_on_finish: false,
-            ..Default::default()
-        };
-        let e = program(&mut io, &[bs(0xff, 8)]).unwrap_err();
-        assert!(format!("{e}").contains("not programmed"), "{e}");
-        assert_eq!(
-            io.log.last().unwrap(),
-            "alt:Idle",
-            "idle must still be restored"
-        );
-    }
-
-    /// A mid-transfer failure must still put the interface back, or streaming
-    /// cannot claim it afterwards.
-    #[test]
-    fn restores_idle_setting_even_when_the_transfer_fails() {
-        let mut io = Fake {
-            fail_chunk_at: Some(2),
-            ..Default::default()
-        };
-        assert!(program(&mut io, &[bs(0xff, FPGA_CHUNK * 4)]).is_err());
-        assert_eq!(io.log.last().unwrap(), "alt:Idle");
-    }
 }

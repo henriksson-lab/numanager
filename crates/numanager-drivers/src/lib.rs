@@ -21,10 +21,14 @@ pub mod genicam;
 pub mod gige_vision;
 pub mod hamilton_mvp;
 pub mod lumencor;
+#[cfg(feature = "lumenera")]
 pub mod lumenera;
-pub mod lumenera_fpga;
-pub mod lumenera_geometry;
-pub mod lumenera_stream;
+#[cfg(feature = "lumenera")]
+mod lumenera_fpga;
+#[cfg(feature = "lumenera")]
+mod lumenera_geometry;
+#[cfg(feature = "lumenera")]
+mod lumenera_stream;
 pub mod marzhauser;
 pub mod mcl;
 pub mod mightex_bls;
@@ -1276,6 +1280,7 @@ pub fn register_builtin_discovery(
     register_config!(hamilton_mvp::HamiltonMvpDiscovery::from_config);
     register_config!(lumencor::LumencorSpectraDiscovery::from_config);
     register_config!(lumencor::LumencorCiaDiscovery::from_config);
+    #[cfg(feature = "lumenera")]
     register_config!(lumenera::LumeneraDiscovery::from_config);
     register_config!(marzhauser::MarzhauserDiscovery::from_config);
     register_config!(mcl::MclDiscovery::from_config);
